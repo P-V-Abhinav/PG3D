@@ -56,11 +56,18 @@ def _build_xarm7_gripper_colored_urdf() -> str:
     assets_dir = Path(__file__).resolve().parent / "assets"
     dst = assets_dir / "xarm7_with_gripper_colored.urdf"
 
+    # Ensure the meshes symlink exists so relative paths in the URDF resolve for mplib.
     meshes_link = assets_dir / "meshes"
     target_dir = str(xarm7_dir / "meshes")
+    
+    # If the symlink exists but points to the wrong place (e.g. copied from another machine),
+    # or is broken, delete it and recreate it.
     if meshes_link.is_symlink():
-        if os.readlink(str(meshes_link)) != target_dir:
+        import os
+        current_target = os.readlink(str(meshes_link))
+        if current_target != target_dir:
             meshes_link.unlink()
+    
     if not meshes_link.exists() and not meshes_link.is_symlink():
         os.symlink(target_dir, str(meshes_link))
 
