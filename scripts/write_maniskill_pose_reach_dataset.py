@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             script_dir = str(Path(__file__).parent.resolve())
             ray.init(num_cpus=args.num_workers, ignore_reinit_error=True)
 
-            @ray.remote(num_cpus=1)
+            @ray.remote(num_cpus=1, num_gpus=0.05)
             class PlanningWorker:
                 def __init__(self, script_dir_path, env_id_val, env_kwargs_dict):
                     import sys
