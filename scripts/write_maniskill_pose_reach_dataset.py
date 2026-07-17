@@ -1015,7 +1015,7 @@ def _collect_multimodal_episodes(
             print(f"[seed {seed}] rejected: no reachable start sample", flush=True)
             return []
         start_qpos, start_tcp_pose, start_metadata = start_sample
-        if args.random_orientation:
+        if random_orientation:
             # Option C: Sample a random approach vector pointing generally downwards.
             # Downward is [0, 0, -1] in world space.
             # We sample a direction within a cone of say 60 degrees from downward.
