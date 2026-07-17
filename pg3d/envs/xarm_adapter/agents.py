@@ -321,8 +321,8 @@ class XArm7Gripper(BaseAgent):
     # known-failing curved seeds from 0/10 to 10/10 with peak |qvel| ~5.5 rad/s.
     # force_limit is provably irrelevant here (identical results 50 -> 20000) so it is
     # left at the no-gripper default.
-    arm_stiffness = 5000
-    arm_damping = [5, 5, 5, 5, 5, 5, 5]
+    arm_stiffness = 2000
+    arm_damping = [100, 100, 100, 100, 100, 100, 100]
     arm_friction = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
     arm_force_limit = 100
 

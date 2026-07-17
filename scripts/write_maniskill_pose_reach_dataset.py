@@ -726,6 +726,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-failures", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("artifacts/pg3d_reach_balanced.zarr"))
     parser.add_argument("--overwrite", action="store_true", help="replace existing output zarr")
+    parser.add_argument("--random-orientation", action="store_true", help="Option C: fully randomize TCP approach angle (within a cone) instead of using discrete modes")
     parser.add_argument("--append", action="store_true", help="append to existing output zarr")
     args = parser.parse_args(argv)
     if args.seed_start is None:
@@ -1012,11 +1013,49 @@ def _collect_multimodal_episodes(
             print(f"[seed {seed}] rejected: no reachable start sample", flush=True)
             return []
         start_qpos, start_tcp_pose, start_metadata = start_sample
-        target_orientations = {
-            "downward": np.array([0.0000, 1.0000, 0.0000, 0.0000], dtype=np.float32),
-            "horizontal_front": np.array([0.0000, 0.7071, 0.0000, -0.7071], dtype=np.float32),
-            "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32)
-        }
+        if args.random_orientation:
+            # Option C: Sample a random approach vector pointing generally downwards.
+            # Downward is [0, 0, -1] in world space.
+            # We sample a direction within a cone of say 60 degrees from downward.
+            phi = rng.uniform(0, 2 * np.pi)
+            costheta = rng.uniform(np.cos(np.radians(60)), 1.0)
+            theta = np.arccos(costheta)
+            
+            x = np.sin(theta) * np.cos(phi)
+            y = np.sin(theta) * np.sin(phi)
+            z = np.cos(theta)
+            
+            # The sampled vector (x,y,z) is relative to the +Z axis. We want it relative to -Z (downward).
+            # We can construct a rotation matrix that rotates [0, 0, 1] to [x, y, z],
+            # and apply it to a base downward orientation.
+            # Or easier: just use scipy.spatial.transform.Rotation
+            from scipy.spatial.transform import Rotation
+            
+            # The default gripper pointing downward has Z-axis pointing up from the fingers.
+            # Wait, downward approach means the gripper's +Z (or -Z) points down. 
+            # In Maniskill, downward for xarm/panda usually means quaternion [0, 1, 0, 0].
+            base_rot = Rotation.from_quat([0, 1, 0, 0])
+            
+            # Rotate this base orientation by a random axis-angle where axis is in XY plane
+            # to tilt it up to 60 degrees.
+            tilt_axis = np.array([np.cos(phi), np.sin(phi), 0.0])
+            tilt_rot = Rotation.from_rotvec(tilt_axis * theta)
+            
+            final_rot = tilt_rot * base_rot
+            ori_quat = final_rot.as_quat().astype(np.float32)
+            
+            # Reorder from scipy (x,y,z,w) to Sapien (w,x,y,z)
+            ori_quat_sapien = np.array([ori_quat[3], ori_quat[0], ori_quat[1], ori_quat[2]], dtype=np.float32)
+            
+            target_orientations = {
+                "random": ori_quat_sapien
+            }
+        else:
+            target_orientations = {
+                "downward": np.array([0.0000, 1.0000, 0.0000, 0.0000], dtype=np.float32),
+                "horizontal_front": np.array([0.0000, 0.7071, 0.0000, -0.7071], dtype=np.float32),
+                "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32)
+            }
 
         print(
             f"[seed {seed}] start accepted after attempt={start_metadata.get('attempt')} "
