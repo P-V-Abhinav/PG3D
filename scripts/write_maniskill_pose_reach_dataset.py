@@ -76,9 +76,12 @@ def main(argv: list[str] | None = None) -> int:
         import mani_skill
         import mani_skill.envs  # noqa: F401
         import sapien
-        from mani_skill.examples.motionplanning.panda.motionplanner import (
-            PandaArmMotionPlanningSolver,
-        )
+        if args.robot_uid == "xarm7_gripper":
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7GripperMotionPlanningSolver as MotionPlannerCls
+            from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs as register_envs
+        else:
+            from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver as MotionPlannerCls
+            from pg3d.envs.maniskill_adapter import register_pg3d_reach_envs as register_envs
     except Exception as exc:
         print(
             f"Failed to import ManiSkill motion-planning stack: {type(exc).__name__}: {exc}",
@@ -91,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    register_pg3d_reach_envs()
+    register_envs()
     crop_config = PointCloudCropConfig(
         bounds=np.asarray(args.workspace_bounds),
         num_points=args.num_points,
@@ -124,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         collect_kwargs = dict(
+            robot_uid=args.robot_uid,
             env_id=args.env_id,
             action_mode=args.action_mode,
             crop_config=crop_config,
@@ -210,20 +214,29 @@ def main(argv: list[str] | None = None) -> int:
                         sys.path.append(script_dir_path)
                     import gymnasium as gym
                     import mani_skill.envs  # noqa: F401
-                    from pg3d.envs.maniskill_adapter import register_pg3d_reach_envs
-                    register_pg3d_reach_envs()
+                    if env_kwargs_dict.get("robot_uids") == "xarm7_gripper":
+                        from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
+                        register_pg3d_xarm7_gripper_reach_envs()
+                    else:
+                        from pg3d.envs.maniskill_adapter import register_pg3d_reach_envs
+                        register_pg3d_reach_envs()
                     self.env = gym.make(env_id_val, **env_kwargs_dict)
                 
                 def generate(self, seed_val, kwargs_dict):
                     import sapien
-                    from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver
+                    if kwargs_dict.get("robot_uid") == "xarm7_gripper":
+                        from pg3d.envs.xarm_adapter.motionplanner import XArm7GripperMotionPlanningSolver as WorkerPlannerCls
+                    else:
+                        from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver as WorkerPlannerCls
                     import write_maniskill_pose_reach_dataset as module
+                    kw = dict(kwargs_dict)
+                    kw.pop("robot_uid", None)
                     return seed_val, module._collect_multimodal_episodes(
                         env=self.env,
                         seed=seed_val,
                         sapien=sapien,
-                        planner_cls=PandaArmMotionPlanningSolver,
-                        **kwargs_dict
+                        planner_cls=WorkerPlannerCls,
+                        **kw
                     )
             
             workers = [PlanningWorker.remote(script_dir, args.env_id, env_kwargs) for _ in range(args.num_workers)]
@@ -260,12 +273,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"collected={len(episodes)}/{args.num_demos}",
                     flush=True,
                 )
+                kw = dict(collect_kwargs)
+                kw.pop("robot_uid", None)
                 new_episodes = _collect_multimodal_episodes(
                     env=env,
                     seed=seed,
                     sapien=sapien,
-                    planner_cls=PandaArmMotionPlanningSolver,
-                    **collect_kwargs
+                    planner_cls=MotionPlannerCls,
+                    **kw
                 )
                 process_new_episodes(seed, new_episodes)
     except Exception as exc:
@@ -333,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             "smooth_trajectory": args.smooth_trajectory,
             "curved_paths": args.curved_paths,
             "curvature_std": args.curvature_std,
-            "planner": "PandaArmMotionPlanningSolver.move_to_pose_with_screw",
+            "planner": "MotionPlannerCls.move_to_pose_with_screw",
             "trajectory_family_geometry": [
                 {
                     "name": spec.name,
