@@ -167,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             curvature_std=args.curvature_std,
             verbose_waypoints=args.verbose_waypoints,
             viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
+            random_orientation=args.random_orientation,
         )
 
         def process_new_episodes(seed_val, new_episodes_list):
@@ -944,6 +945,7 @@ def _collect_multimodal_episodes(
     curvature_std: float = 0.10,
     verbose_waypoints: bool = False,
     viewer_step_delay: float = 0.0,
+    random_orientation: bool = False,
 ) -> list[ReachEpisodeData]:
     obs, info = env.reset(seed=seed, options={"reconfigure": True})
     _render_viewer_frame(env, viewer_step_delay)
