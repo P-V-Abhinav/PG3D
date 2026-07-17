@@ -123,72 +123,60 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     try:
-        env = gym.make(args.env_id, **env_kwargs)
-        attempt = 0
-        while len(episodes) < args.num_demos and attempt < args.max_attempts:
-            seed = args.seed_start + attempt
-            attempt += 1
-            print(
-                f"[seed {seed}] reset {attempt}/{args.max_attempts}; "
-                f"collected={len(episodes)}/{args.num_demos}",
-                flush=True,
-            )
-            new_episodes = _collect_multimodal_episodes(
-                env=env,
-                seed=seed,
-                env_id=args.env_id,
-                action_mode=args.action_mode,
-                crop_config=crop_config,
-                max_steps=args.max_steps_per_demo,
-                hold_steps=args.hold_steps,
-                settle_steps=args.settle_steps,
-                gripper_open=args.gripper_open,
-                sapien=sapien,
-                planner_cls=PandaArmMotionPlanningSolver,
-                variants_per_reset=args.trajectory_variants_per_reset,
-                waypoint_attempts=args.waypoint_attempts,
-                min_base_clearance=args.min_base_clearance,
-                table_margin=args.table_margin,
-                waypoint_xy_noise=args.waypoint_xy_noise,
-                waypoint_z_noise=args.waypoint_z_noise,
-                lateral_z_offset=args.lateral_z_offset,
-                vertical_lateral_offset=args.vertical_lateral_offset,
-                min_curve_offset=args.min_curve_offset,
-                max_joint_step=args.max_joint_step,
-                max_joint_accel=args.max_joint_accel,
-                max_raw_plan_multiplier=args.max_raw_plan_multiplier,
-                progress_interval=args.progress_interval,
-                min_feasible_families=args.min_feasible_families,
-                randomize_start=args.randomize_start,
-                start_bounds=_start_workspace_bounds(
-                    args.env_id,
-                    args.start_bounds,
-                    reach_workspace_bounds=args.reach_workspace_bounds,
-                ),
+        collect_kwargs = dict(
+            env_id=args.env_id,
+            action_mode=args.action_mode,
+            crop_config=crop_config,
+            max_steps=args.max_steps_per_demo,
+            hold_steps=args.hold_steps,
+            settle_steps=args.settle_steps,
+            gripper_open=args.gripper_open,
+            variants_per_reset=args.trajectory_variants_per_reset,
+            waypoint_attempts=args.waypoint_attempts,
+            min_base_clearance=args.min_base_clearance,
+            table_margin=args.table_margin,
+            waypoint_xy_noise=args.waypoint_xy_noise,
+            waypoint_z_noise=args.waypoint_z_noise,
+            lateral_z_offset=args.lateral_z_offset,
+            vertical_lateral_offset=args.vertical_lateral_offset,
+            min_curve_offset=args.min_curve_offset,
+            max_joint_step=args.max_joint_step,
+            max_joint_accel=args.max_joint_accel,
+            max_raw_plan_multiplier=args.max_raw_plan_multiplier,
+            progress_interval=args.progress_interval,
+            min_feasible_families=args.min_feasible_families,
+            randomize_start=args.randomize_start,
+            start_bounds=_start_workspace_bounds(
+                args.env_id,
+                args.start_bounds,
                 reach_workspace_bounds=args.reach_workspace_bounds,
-                start_sample_attempts=args.start_sample_attempts,
-                min_start_goal_distance=args.min_start_goal_distance,
-                acceptance_success_distance=args.acceptance_success_distance,
-                saliency_config=_point_cloud_saliency_config(args),
-                require_complete_variant_set=not args.allow_partial_variant_sets,
-                suppress_planner_output=not args.show_planner_output,
-                smooth_trajectory=args.smooth_trajectory,
-                curved_paths=args.curved_paths,
-                curvature_std=args.curvature_std,
-                verbose_waypoints=args.verbose_waypoints,
-                viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
-            )
-            if not new_episodes:
-                print(f"[seed {seed}] skipped: no complete feasible variant set", flush=True)
-                skipped.append({"seed": seed, "reason": "planner_failed_or_empty"})
-                continue
-            for episode in new_episodes:
+            ),
+            reach_workspace_bounds=args.reach_workspace_bounds,
+            start_sample_attempts=args.start_sample_attempts,
+            min_start_goal_distance=args.min_start_goal_distance,
+            acceptance_success_distance=args.acceptance_success_distance,
+            saliency_config=_point_cloud_saliency_config(args),
+            require_complete_variant_set=not args.allow_partial_variant_sets,
+            suppress_planner_output=not args.show_planner_output,
+            smooth_trajectory=args.smooth_trajectory,
+            curved_paths=args.curved_paths,
+            curvature_std=args.curvature_std,
+            verbose_waypoints=args.verbose_waypoints,
+            viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
+        )
+
+        def process_new_episodes(seed_val, new_episodes_list):
+            if not new_episodes_list:
+                print(f"[seed {seed_val}] skipped: no complete feasible variant set", flush=True)
+                skipped.append({"seed": seed_val, "reason": "planner_failed_or_empty"})
+                return
+            for episode in new_episodes_list:
                 if len(episodes) >= args.num_demos:
                     break
                 if not args.keep_failures and not bool(episode.metadata.get("success", False)):
                     skipped.append(
                         {
-                            "seed": seed,
+                            "seed": seed_val,
                             "reason": "unsuccessful_replay",
                             "trajectory_family": episode.metadata.get("trajectory_family"),
                             "final_distance": episode.metadata.get("final_distance"),
@@ -198,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                 episodes.append(episode)
                 print(
                     "demo "
-                    f"{len(episodes)}/{args.num_demos}: seed={seed} "
+                    f"{len(episodes)}/{args.num_demos}: seed={seed_val} "
                     f"variant={episode.metadata.get('trajectory_family')} "
                     f"steps={episode.state.shape[0]} "
                     f"hold={episode.metadata.get('hold_steps_recorded')} "
@@ -206,6 +194,78 @@ def main(argv: list[str] | None = None) -> int:
                     f"final_distance={episode.metadata.get('final_distance'):.4f}",
                     flush=True,
                 )
+
+        if args.num_workers > 0:
+            import ray
+            from ray.util.actor_pool import ActorPool
+            from pathlib import Path
+            script_dir = str(Path(__file__).parent.resolve())
+            ray.init(num_cpus=args.num_workers, ignore_reinit_error=True)
+
+            @ray.remote(num_cpus=1)
+            class PlanningWorker:
+                def __init__(self, script_dir_path, env_id_val, env_kwargs_dict):
+                    import sys
+                    if script_dir_path not in sys.path:
+                        sys.path.append(script_dir_path)
+                    import gymnasium as gym
+                    import mani_skill.envs  # noqa: F401
+                    self.env = gym.make(env_id_val, **env_kwargs_dict)
+                
+                def generate(self, seed_val, kwargs_dict):
+                    import sapien
+                    from mani_skill.examples.motionplanning.panda.motionplanner import PandaArmMotionPlanningSolver
+                    import write_maniskill_pose_reach_dataset as module
+                    return seed_val, module._collect_multimodal_episodes(
+                        env=self.env,
+                        seed=seed_val,
+                        sapien=sapien,
+                        planner_cls=PandaArmMotionPlanningSolver,
+                        **kwargs_dict
+                    )
+            
+            workers = [PlanningWorker.remote(script_dir, args.env_id, env_kwargs) for _ in range(args.num_workers)]
+            pool = ActorPool(workers)
+            
+            attempt = 0
+            pending = 0
+            while pending < args.num_workers * 2 and attempt < args.max_attempts:
+                seed = args.seed_start + attempt
+                pool.submit(lambda w, s: w.generate.remote(s, collect_kwargs), seed)
+                attempt += 1
+                pending += 1
+                
+            while pending > 0 and len(episodes) < args.num_demos:
+                seed, new_episodes = pool.get_next_unordered()
+                pending -= 1
+                process_new_episodes(seed, new_episodes)
+                
+                while pending < args.num_workers * 2 and attempt < args.max_attempts and len(episodes) < args.num_demos:
+                    next_seed = args.seed_start + attempt
+                    pool.submit(lambda w, s: w.generate.remote(s, collect_kwargs), next_seed)
+                    attempt += 1
+                    pending += 1
+            
+            ray.shutdown()
+        else:
+            env = gym.make(args.env_id, **env_kwargs)
+            attempt = 0
+            while len(episodes) < args.num_demos and attempt < args.max_attempts:
+                seed = args.seed_start + attempt
+                attempt += 1
+                print(
+                    f"[seed {seed}] reset {attempt}/{args.max_attempts}; "
+                    f"collected={len(episodes)}/{args.num_demos}",
+                    flush=True,
+                )
+                new_episodes = _collect_multimodal_episodes(
+                    env=env,
+                    seed=seed,
+                    sapien=sapien,
+                    planner_cls=PandaArmMotionPlanningSolver,
+                    **collect_kwargs
+                )
+                process_new_episodes(seed, new_episodes)
     except Exception as exc:
         print(f"Failed to write reach dataset: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -324,6 +384,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--env-id", default="PG3DReach-BalancedWorkspace-v0")
     parser.add_argument("--num-demos", type=int, default=4800)
+    parser.add_argument("--num-workers", type=int, default=0, help="number of Ray worker processes to spawn (0 for sequential execution)")
     parser.add_argument("--max-attempts", type=int, default=500)
     parser.add_argument("--seed-start", type=int, default=None)
     parser.add_argument("--obs-mode", default="pointcloud", choices=["pointcloud"])
@@ -662,6 +723,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.reach_workspace_bounds, dtype=np.float32
         ).reshape(3, 2)
     args.action_mode = _action_mode(args.action_mode)
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
     if args.hold_steps < 0:
         raise ValueError("--hold-steps must be non-negative")
     if args.settle_steps < 0:
