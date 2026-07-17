@@ -210,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
                         sys.path.append(script_dir_path)
                     import gymnasium as gym
                     import mani_skill.envs  # noqa: F401
+                    from pg3d.envs.maniskill_adapter import register_pg3d_reach_envs
+                    register_pg3d_reach_envs()
                     self.env = gym.make(env_id_val, **env_kwargs_dict)
                 
                 def generate(self, seed_val, kwargs_dict):
