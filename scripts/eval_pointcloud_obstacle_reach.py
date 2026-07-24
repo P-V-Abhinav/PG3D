@@ -139,6 +139,7 @@ class PointCloudCollisionConstraint:
     weight: float = 100.0
     constraint_type: str = "pointcloud_collision"
     name: str = "pointcloud_collision"
+    region: Any = None
 
     def cost(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> dict[str, float]:
         if self.obstacle_points.size == 0:
@@ -421,9 +422,14 @@ def main(argv: list[str] | None = None) -> int:
     timings_path = args.output_dir / "timings.jsonl"
     timing_written = 0
     rng = np.random.default_rng(args.seed)
+    def _custom_env_id(env_id: str) -> str:
+        if "XArm7" in env_id:
+            return "PG3DReach-XArm7-RealObstacle-v0"
+        return "PG3DReach-RealObstacle-v0"
+
     try:
         sim_env = gym.make(
-            str(metadata["env_id"]),
+            _custom_env_id(str(metadata["env_id"])),
             **_env_kwargs(
                 metadata,
                 render_mode="rgb_array" if args.video else None,
@@ -431,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         ghost_env = gym.make(
-            str(metadata["env_id"]),
+            _custom_env_id(str(metadata["env_id"])),
             **_env_kwargs(metadata, render_mode=None, max_episode_steps=args.max_episode_steps),
         )
         adapter = DP3ChunkPolicyAdapter(
@@ -3279,6 +3285,7 @@ def _env_kwargs(
     return env_kwargs
 
 
+
 def _video_env_factory(
     gym: Any,
     *,
@@ -3291,7 +3298,11 @@ def _video_env_factory(
     env_kwargs = _env_kwargs(metadata, render_mode="rgb_array", max_episode_steps=max_episode_steps)
 
     def factory() -> Any:
-        return gym.make(str(metadata["env_id"]), **env_kwargs)
+        def _custom_env_id(env_id: str) -> str:
+            if "XArm7" in env_id:
+                return "PG3DReach-XArm7-RealObstacle-v0"
+            return "PG3DReach-RealObstacle-v0"
+        return gym.make(_custom_env_id(str(metadata["env_id"])), **env_kwargs)
 
     return factory
 
@@ -3301,19 +3312,27 @@ def _maybe_create_overlay_video_env(
     video_env_factory: Callable[[], Any] | None,
     spec: RolloutSpec,
     constraints: list[Any],
-    color: tuple[float, float, float],
-    alpha: float,
+    color: tuple[float, float, float, float] = (1.0, 0.0, 1.0, 0.2),
+    alpha: float = 0.2,
 ) -> Any | None:
+    """Create a shadow environment for rendering constraint overlays.
+
+    Attempts to extract AvoidRegion shapes and update their rendering materials.
+    Returns the initialized shadow environment, or None if the environment factory
+    is missing or if the constraints cannot be rendered (falling back to plain video).
+    """
     if video_env_factory is None:
         return None
-    video_env = None
     try:
+        # Require all constraints to have a renderable region
+        if not all(getattr(c, "region", None) is not None for c in constraints):
+            return None
         video_env = video_env_factory()
         video_env.reset(seed=spec.seed, options={"reconfigure": True})
         _add_constraint_overlay_actors(
             video_env,
             constraints=constraints,
-            color=color,
+            color=(color[0], color[1], color[2]),
             alpha=alpha,
         )
         return video_env
