@@ -116,6 +116,11 @@ class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
                 "target": [-0.30, 0.00, 0.40],
                 "fov_deg": 70.0,
             },
+            "cam_back": {
+                "eye":    [-1.50, 0.00, 0.85],
+                "target": [-0.50, 0.00, 0.40],
+                "fov_deg": 60.0,
+            },
         }
         
         for name, config in cams.items():
@@ -205,6 +210,11 @@ class PG3DReachRealConeObstacleEnv(PG3DReachXArm7Env):
                 "eye":    [0.20, 0.00, 1.20],
                 "target": [-0.30, 0.00, 0.40],
                 "fov_deg": 70.0,
+            },
+            "cam_back": {
+                "eye":    [-1.50, 0.00, 0.85],
+                "target": [-0.50, 0.00, 0.40],
+                "fov_deg": 60.0,
             },
         }
         
