@@ -429,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
                         post_success_steps=args.post_success_steps,
                         planning_horizon_chunks=args.planning_horizon_chunks,
                         execution_horizon_chunks=args.execution_horizon_chunks,
+                        action_ema_alpha=args.action_ema_alpha,
                         geometry_mode=args.geometry_mode,
                         k_schedule=tuple(args.k_schedule),
                         gripper_open=args.gripper_open,
@@ -621,6 +622,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--post-success-steps", type=int, default=16)
     parser.add_argument("--planning-horizon-chunks", type=int, default=1)
     parser.add_argument("--execution-horizon-chunks", type=int, default=1)
+    parser.add_argument("--action-ema-alpha", type=float, default=1.0, help="EMA smoothing factor for actions. 1.0 = no smoothing.")
     parser.add_argument("--geometry-mode", choices=["fast", "exact"], default="fast")
     parser.add_argument("--k-schedule", type=int, nargs="+", default=[16, 32, 64])
     parser.add_argument("--policy-batch-size", type=int, default=64)
@@ -997,6 +999,7 @@ def run_eval_episode(
     post_success_steps: int,
     planning_horizon_chunks: int,
     execution_horizon_chunks: int,
+    action_ema_alpha: float,
     geometry_mode: GeometryMode,
     k_schedule: tuple[int, ...],
     gripper_open: float,
@@ -1047,6 +1050,7 @@ def run_eval_episode(
     )
     path = EpisodePath()
     _append_path(path, sim_entry)
+    ema_sim_action: np.ndarray | None = None
     timeline = [sim_entry.copy()]
     _write_step_trace(
         step_traces_file,
@@ -1158,8 +1162,12 @@ def run_eval_episode(
                     high=getattr(sim_env.action_space, "high", None),
                     gripper_open=gripper_open,
                 )
+                if ema_sim_action is None or action_ema_alpha >= 1.0:
+                    ema_sim_action = sim_action
+                else:
+                    ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
                 with timer.time("sim_step", method=method):
-                    sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(sim_action)
+                    sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
                 steps += 1
                 with timer.time("observation_adapt_crop", source="step"):
                     sim_entry = rollout_observation_entry(
@@ -2247,6 +2255,7 @@ def _collect_candidate_paths(
                 crop_config=crop_config,
                 max_steps=max_steps,
                 goal_thresh=goal_thresh,
+                action_ema_alpha=args.action_ema_alpha,
                 gripper_open=float(args.gripper_open),
                 zarr_context=zarr_context,
             )
@@ -2637,6 +2646,7 @@ def _rollout_base_candidate_path(
     crop_config: PointCloudCropConfig,
     max_steps: int,
     goal_thresh: float,
+    action_ema_alpha: float,
     gripper_open: float,
     zarr_context: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, bool]:
@@ -2651,6 +2661,7 @@ def _rollout_base_candidate_path(
     tcp_path = [np.asarray(entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]]
     success = _bool_info(info, "success")
     steps = 0
+    ema_sim_action: np.ndarray | None = None
     while steps < max_steps and not success:
         chunk = adapter.sample_action_chunks(obs_window, k=1)[0]
         steps_to_execute = min(int(adapter.policy.n_action_steps), chunk.horizon, max_steps - steps)
@@ -2664,7 +2675,11 @@ def _rollout_base_candidate_path(
                 high=getattr(env.action_space, "high", None),
                 gripper_open=gripper_open,
             )
-            obs, _reward, terminated, truncated, info = env.step(sim_action)
+            if ema_sim_action is None or action_ema_alpha >= 1.0:
+                ema_sim_action = sim_action
+            else:
+                ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
+            obs, _reward, terminated, truncated, info = env.step(ema_sim_action)
             steps += 1
             entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
             obs_window = append_obs_window(
