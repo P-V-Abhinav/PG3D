@@ -53,9 +53,9 @@ from mani_skill.utils.structs.pose import Pose
 class PG3DReachRealObstacleEnv(PG3DReachEnv):
     def _load_scene(self, options: dict[str, Any]) -> None:
         super()._load_scene(options)
-        self.obstacle = actors.build_cube(
+        self.obstacle = actors.build_box(
             self.scene,
-            half_size=[0.03, 0.03, 0.15],
+            half_sizes=[0.03, 0.03, 0.15],
             color=[0.0, 0.0, 1.0, 1.0],
             name="obstacle",
             body_type="static",
