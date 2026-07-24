@@ -177,6 +177,27 @@ class PointCloudCollisionConstraint:
 
     def to_json(self) -> dict[str, Any]:
         return {"type": self.constraint_type, "obstacle_points_count": int(self.obstacle_points.shape[0])}
+
+
+def _farthest_point_sample(points: np.ndarray, n_samples: int) -> np.ndarray:
+    """Farthest Point Sampling: greedily pick the most spread-out subset of points.
+
+    Unlike uniform random sampling (which can cluster near one camera view),
+    FPS ensures the selected points cover the full spatial extent of the obstacle,
+    making collision checks more robust for arbitrarily shaped objects.
+    """
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.shape[0] <= n_samples:
+        return pts
+    selected_indices: list[int] = [0]
+    min_dists = np.full(pts.shape[0], np.inf, dtype=np.float32)
+    for _ in range(n_samples - 1):
+        last = pts[selected_indices[-1]]
+        dists = np.linalg.norm(pts - last, axis=1).astype(np.float32)
+        min_dists = np.minimum(min_dists, dists)
+        selected_indices.append(int(np.argmax(min_dists)))
+    return pts[np.array(selected_indices, dtype=np.int64)]
+
 from scripts.compare_world_model_rollout import (
     entry_to_world_model_observation,
     world_model_entry_from_rollout_step,
@@ -2168,23 +2189,49 @@ def _constraints_for_episode(
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
     scene_points = np.asarray(entry["point_cloud"], dtype=np.float32).reshape(-1, 3)
     robot_mask = np.asarray(entry["robot_mask"], dtype=bool).reshape(-1)
-    valid_mask = np.asarray(entry.get("point_valid_mask", np.ones(len(robot_mask), dtype=bool)), dtype=bool).reshape(-1)
+    valid_mask = np.asarray(
+        entry.get("point_valid_mask", np.ones(len(robot_mask), dtype=bool)),
+        dtype=bool,
+    ).reshape(-1)
 
-    # Filter 1: keep only valid (non-padded) points
-    env_points = scene_points[valid_mask & ~robot_mask]
+    # Diagnostic: how many points at each stage
+    n_total = int(scene_points.shape[0])
+    n_valid = int(valid_mask.sum())
+    n_robot = int((valid_mask & robot_mask).sum())
+    n_env_valid = int((valid_mask & ~robot_mask).sum())
 
-    # Filter 2: remove floor/table points (z < 0.02m)
-    env_points = env_points[env_points[:, 2] > 0.02]
+    # Filter: remove robot points.
+    # NOTE: We intentionally do NOT filter by valid_mask here.
+    # The workspace bounding box in crop_point_cloud (z:[0.0,1.1], x:[-0.9,0.7],
+    # y:[-0.6,0.6]) can already clip the floor/table, so z<0.02 is redundant.
+    # We also skip valid_mask because sparse or edge obstacle points may survive
+    # the bounding box crop but get zero-padded in the valid_mask slots. Using
+    # only robot_mask lets us recover those points. Zero-valued padded positions
+    # (xyz=[0,0,0]) are filtered out below via a non-zero norm check.
+    env_points = scene_points[~robot_mask]
 
-    # Filter 3: remove goal marker points (within 3cm of target_position)
+    # Filter: remove zero-padded placeholder points (norm effectively 0)
+    norms = np.linalg.norm(env_points, axis=1)
+    env_points = env_points[norms > 1e-3]
+
+    # Filter: remove goal marker points (within 3cm of target_position)
     target = np.asarray(entry["target_position"], dtype=np.float32).reshape(3)
     dists_to_target = np.linalg.norm(env_points - target, axis=1)
     obstacle_points = env_points[dists_to_target > 0.03]
 
+    # Apply Farthest Point Sampling to get maximally spread representative points.
+    # FPS ensures the collision checker sees the full spatial extent of the obstacle
+    # rather than a cluster of nearby points from a single camera view.
+    max_obstacle_pts = 256
+    if obstacle_points.shape[0] > max_obstacle_pts:
+        obstacle_points = _farthest_point_sample(obstacle_points, max_obstacle_pts)
+
     print(
-        f"[{spec.output_index}] PointCloudCollisionConstraint: "
-        f"total_pts={scene_points.shape[0]} env_pts={env_points.shape[0]} "
-        f"obstacle_pts={obstacle_points.shape[0]} (after removing robot/floor/goal)",
+        f"[{spec.output_index}] PointCloudCollisionConstraint diagnostics: "
+        f"total={n_total} valid={n_valid} valid_robot={n_robot} valid_env={n_env_valid} | "
+        f"all_env(no robot_mask)={int(scene_points[~robot_mask].shape[0])} "
+        f"after_zero_filter={int(env_points.shape[0])} "
+        f"after_goal_filter={int(obstacle_points.shape[0])} (obstacle points, post-FPS)",
         flush=True,
     )
 
