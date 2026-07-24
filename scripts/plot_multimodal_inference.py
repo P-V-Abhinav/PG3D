@@ -9,6 +9,7 @@ import numpy as np
 # We import the rollout logic directly so we don't have to duplicate the setup
 from rollout_dp3_reach_policy import (
     parse_args,
+    resolve_checkpoint_path,
     load_reach_metadata,
     select_device,
     load_reach_policy_from_checkpoint,

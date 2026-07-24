@@ -143,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                     post_success_steps=args.post_success_steps,
                     gripper_open=args.gripper_open,
                     video_fps=args.video_fps,
+                    action_ema_alpha=args.action_ema_alpha,
                     metrics_file=metrics_file,
                     trajectory_family_id=trajectory_family_id,
                     trajectory_family_count=trajectory_family_count,
@@ -212,6 +213,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "defaults to shallow_direct id 10 when available"
         ),
     )
+    parser.add_argument(
+        "--action-ema-alpha",
+        type=float,
+        default=1.0,
+        help="EMA smoothing factor for actions. 1.0 = no smoothing, 0.1 = heavy smoothing.",
+    )
     parser.add_argument("--allow-failure", action="store_true")
     args = parser.parse_args(argv)
     if args.episodes <= 0:
@@ -239,6 +246,7 @@ def run_policy_rollout(
     post_success_steps: int,
     gripper_open: float,
     video_fps: int,
+    action_ema_alpha: float,
     metrics_file: Any | None,
     video_path: Path | None = None,
     write_rerun: bool = True,
@@ -260,6 +268,8 @@ def run_policy_rollout(
     action_norms: list[float] = []
     post_success_action_norms: list[float] = []
     post_success_distances: list[float] = []
+    
+    ema_sim_action: np.ndarray | None = None
 
     while steps < max_steps:
         with torch.no_grad():
@@ -285,7 +295,11 @@ def run_policy_rollout(
                 high=getattr(env.action_space, "high", None),
                 gripper_open=gripper_open,
             )
-            obs, reward, terminated, truncated, info = env.step(sim_action)
+            if ema_sim_action is None or action_ema_alpha >= 1.0:
+                ema_sim_action = sim_action
+            else:
+                ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
+            obs, reward, terminated, truncated, info = env.step(ema_sim_action)
             steps += 1
             frames.append(_frame_to_numpy(env.render()))
             entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
