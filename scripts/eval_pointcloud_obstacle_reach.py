@@ -169,7 +169,7 @@ def _create_cone_obj(filepath: str, radius: float = 0.05, height: float = 0.40, 
     return filepath
 
 @register_env("PG3DReach-RealConeObstacle-v0", max_episode_steps=100)
-class PG3DReachRealConeObstacleEnv(PG3DReachXArm7Env):
+class PG3DReachRealConeObstacleEnv(PG3DReachXArm7GripperEnv):
     def _load_scene(self, options: dict[str, Any] | None) -> None:
         super()._load_scene(options)
         
