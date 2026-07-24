@@ -48,6 +48,7 @@ from pg3d.envs.maniskill_adapter.reach_env import PG3DReachEnv
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.building import actors
 from mani_skill.utils.structs.pose import Pose
+from mani_skill.utils import sapien_utils
 
 @register_env("PG3DReach-RealObstacle-v0", max_episode_steps=100)
 class PG3DReachRealObstacleEnv(PG3DReachEnv):
