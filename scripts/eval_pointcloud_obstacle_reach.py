@@ -58,7 +58,7 @@ class PG3DReachRealObstacleEnv(PG3DReachEnv):
             half_sizes=[0.03, 0.03, 0.15],
             color=[0.0, 0.0, 1.0, 1.0],
             name="obstacle",
-            body_type="static",
+            body_type="kinematic",
         )
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
@@ -82,7 +82,7 @@ class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
             half_sizes=[0.03, 0.03, 0.15],
             color=[0.0, 0.0, 1.0, 1.0],
             name="obstacle",
-            body_type="static",
+            body_type="kinematic",
         )
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:

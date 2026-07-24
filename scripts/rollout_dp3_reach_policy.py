@@ -402,6 +402,17 @@ def rollout_observation_entry(
     crop_config: PointCloudCropConfig,
 ) -> dict[str, np.ndarray | bool | float]:
     adapted = adapt_observation(obs, info=info, env=env, task_name=_env_task_name(env))
+    
+    # DEBUG: print the raw pointcloud shape and bounds
+    raw_pts = adapted.point_cloud
+    if raw_pts.shape[0] > 0:
+        raw_min = raw_pts.min(axis=0)
+        raw_max = raw_pts.max(axis=0)
+    else:
+        raw_min = raw_max = np.zeros(3)
+    
+    print(f"[DEBUG] raw_pointcloud shape: {raw_pts.shape}, min: {raw_min.tolist()}, max: {raw_max.tolist()}, bounds: {crop_config.bounds.tolist()}", flush=True)
+
     cropped = crop_point_cloud(
         adapted.point_cloud,
         robot_mask=adapted.robot_mask,
