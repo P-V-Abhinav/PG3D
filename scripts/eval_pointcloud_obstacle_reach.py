@@ -131,6 +131,10 @@ from pg3d.world_model.compositor import compose_robot_cloud, static_scene_from_r
 from scipy.spatial.distance import cdist
 from pg3d.constraints.core import SceneContext
 
+class DummyRegion:
+    def signed_distance(self, points: np.ndarray) -> np.ndarray:
+        return np.full(points.shape[:-1], 1000.0, dtype=np.float32)
+
 @dataclass
 class PointCloudCollisionConstraint:
     obstacle_points: np.ndarray
@@ -139,7 +143,9 @@ class PointCloudCollisionConstraint:
     weight: float = 100.0
     constraint_type: str = "pointcloud_collision"
     name: str = "pointcloud_collision"
-    region: Any = None
+    
+    def __post_init__(self):
+        self.region = DummyRegion()
 
     def cost(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> dict[str, float]:
         if self.obstacle_points.size == 0:
