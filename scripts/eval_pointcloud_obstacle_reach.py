@@ -386,9 +386,14 @@ def main(argv: list[str] | None = None) -> int:
     
     # Overriding the metadata crop config to guarantee we see the environment
     # 1. Expand X bounds to include the entire positive X workspace where the table/goal is
-    # 2. Force robot_point_fraction to 0.25 so the environment (table/obstacle) is not discarded
+    # 2. Raise the minimum Z bound from -0.02 to 0.005. The table surface in ManiSkill
+    #    is exactly at Z=0.0. By grazing just 5mm above the table, we perfectly filter
+    #    out all table points. Since the obstacle extends up to Z=0.30, it remains fully visible.
+    # 3. Force robot_point_fraction to 0.25 so the robot gets 256 points, and the environment
+    #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
+    new_bounds[2, 0] = 0.005                       # Filter out the table at Z=0.0
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
