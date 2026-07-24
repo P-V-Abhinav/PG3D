@@ -428,14 +428,9 @@ def main(argv: list[str] | None = None) -> int:
     timings_path = args.output_dir / "timings.jsonl"
     timing_written = 0
     rng = np.random.default_rng(args.seed)
-    def _custom_env_id(env_id: str) -> str:
-        if "XArm7" in env_id:
-            return "PG3DReach-XArm7-RealObstacle-v0"
-        return "PG3DReach-RealObstacle-v0"
-
     try:
         sim_env = gym.make(
-            _custom_env_id(str(metadata["env_id"])),
+            str(metadata["env_id"]),
             **_env_kwargs(
                 metadata,
                 render_mode="rgb_array" if args.video else None,
@@ -443,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         ghost_env = gym.make(
-            _custom_env_id(str(metadata["env_id"])),
+            str(metadata["env_id"]),
             **_env_kwargs(metadata, render_mode=None, max_episode_steps=args.max_episode_steps),
         )
         adapter = DP3ChunkPolicyAdapter(
@@ -2158,31 +2153,47 @@ def _constraints_for_episode(
         obs, info = _reset_to_zarr_episode(env, rollout_seed=spec.seed, zarr_context=zarr_context)
     else:
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
-    
-    # Extract point cloud for dynamic collision checking
+
+    # --- Generalizable point cloud extraction for dynamic collision detection ---
+    # We take ONE zero-action step after env.reset() to force ManiSkill's
+    # renderer to re-render the scene AFTER the obstacle has been teleported to
+    # its final pose by _initialize_episode. Without this step, the camera
+    # observation returned by env.reset() reflects the pre-teleport pose
+    # (obstacle at [0,0,0], below the floor), yielding 0 visible obstacle points.
+    # With this step, the camera PCD faithfully captures the obstacle at its
+    # true location, regardless of its shape, size, or geometry.
+    zero_action = np.zeros(env.action_space.shape, dtype=np.float32)
+    obs, _, _, _, info = env.step(zero_action)
+
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
     scene_points = np.asarray(entry["point_cloud"], dtype=np.float32).reshape(-1, 3)
     robot_mask = np.asarray(entry["robot_mask"], dtype=bool).reshape(-1)
-    
-    # Filter 1: Remove robot points
-    env_points = scene_points[~robot_mask]
-    
-    # Filter 2: Remove table points (z < 0.02)
+    valid_mask = np.asarray(entry.get("point_valid_mask", np.ones(len(robot_mask), dtype=bool)), dtype=bool).reshape(-1)
+
+    # Filter 1: keep only valid (non-padded) points
+    env_points = scene_points[valid_mask & ~robot_mask]
+
+    # Filter 2: remove floor/table points (z < 0.02m)
     env_points = env_points[env_points[:, 2] > 0.02]
-    
-    # Filter 3: Remove goal points (within 3cm of target_position)
+
+    # Filter 3: remove goal marker points (within 3cm of target_position)
     target = np.asarray(entry["target_position"], dtype=np.float32).reshape(3)
     dists_to_target = np.linalg.norm(env_points - target, axis=1)
     obstacle_points = env_points[dists_to_target > 0.03]
 
-    print(f"[{spec.output_index}] PointCloudCollisionConstraint initialized with {obstacle_points.shape[0]} obstacle points.", flush=True)
+    print(
+        f"[{spec.output_index}] PointCloudCollisionConstraint: "
+        f"total_pts={scene_points.shape[0]} env_pts={env_points.shape[0]} "
+        f"obstacle_pts={obstacle_points.shape[0]} (after removing robot/floor/goal)",
+        flush=True,
+    )
 
     constraint = PointCloudCollisionConstraint(
         obstacle_points=obstacle_points,
         margin=float(args.avoid_margin),
         weight=float(args.avoid_weight),
         name="pointcloud_obstacle_avoid_region",
-        target=args.constraint_target
+        target=args.constraint_target,
     )
     return [constraint], None
 
