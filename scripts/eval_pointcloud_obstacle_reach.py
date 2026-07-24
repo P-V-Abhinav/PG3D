@@ -179,7 +179,7 @@ class PG3DReachRealConeObstacleEnv(PG3DReachXArm7GripperEnv):
         builder = self.scene.create_actor_builder()
         # In SAPIEN/ManiSkill, convex collision from file is supported
         builder.add_convex_collision_from_file(obj_path)
-        builder.add_visual_from_file(obj_path, color=[1.0, 0.5, 0.0, 1.0])
+        builder.add_visual_from_file(obj_path)
         self.obstacle = builder.build_kinematic("obstacle")
         
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
