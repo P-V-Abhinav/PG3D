@@ -93,6 +93,41 @@ class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
             mid_pos = (start_pos + goal_pos) / 2.0
             mid_pos[:, 2] = 0.15
             self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
+
+    @property
+    def _default_sensor_configs(self) -> list[CameraConfig]:
+        configs = super()._default_sensor_configs
+        
+        cams = {
+            "cam_front_left": {
+                "eye":    [-0.5, 1.65, 0.85],
+                "target": [-0.5, -0.0, 0.40],
+                "fov_deg": 60.0,
+            },
+            "cam_side_right": {
+                "eye":    [-0.5,  -1.65, 0.85],
+                "target": [-0.5, -0.05, 0.40],
+                "fov_deg": 60.0,
+            },
+            "cam_overhead": {
+                "eye":    [0.20, 0.00, 1.20],
+                "target": [-0.30, 0.00, 0.40],
+                "fov_deg": 70.0,
+            },
+        }
+        
+        for name, config in cams.items():
+            pose = sapien_utils.look_at(eye=config["eye"], target=config["target"])
+            configs.append(
+                CameraConfig(
+                    name, 
+                    pose, 
+                    128, 128, 
+                    float(np.deg2rad(config["fov_deg"])), 
+                    0.1, 10.0
+                )
+            )
+        return configs
 from pg3d.eval import (
     AvoidOverlayConfig,
     EpisodePath,
