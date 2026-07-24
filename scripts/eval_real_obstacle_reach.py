@@ -71,6 +71,28 @@ class PG3DReachRealObstacleEnv(PG3DReachEnv):
             self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
 
 from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
+from pg3d.envs.xarm_adapter.reach_env import PG3DReachXArm7GripperEnv
+
+@register_env("PG3DReach-XArm7-RealObstacle-v0", max_episode_steps=100)
+class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
+    def _load_scene(self, options: dict[str, Any]) -> None:
+        super()._load_scene(options)
+        self.obstacle = actors.build_box(
+            self.scene,
+            half_sizes=[0.03, 0.03, 0.15],
+            color=[0.0, 0.0, 1.0, 1.0],
+            name="obstacle",
+            body_type="static",
+        )
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
+        super()._initialize_episode(env_idx, options)
+        with torch.device(self.device):
+            start_pos = self.agent.tcp_pose.p
+            goal_pos = self.goal_site.pose.p
+            mid_pos = (start_pos + goal_pos) / 2.0
+            mid_pos[:, 2] = 0.15
+            self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
 from pg3d.eval import (
     AvoidOverlayConfig,
     EpisodePath,
@@ -274,7 +296,10 @@ def main(argv: list[str] | None = None) -> int:
     register_pg3d_reach_envs()
     register_pg3d_xarm7_gripper_reach_envs()
     metadata = load_reach_metadata(args.dataset)
-    metadata["env_id"] = "PG3DReach-RealObstacle-v0"
+    if "XArm7" in str(metadata.get("env_id", "")):
+        metadata["env_id"] = "PG3DReach-XArm7-RealObstacle-v0"
+    else:
+        metadata["env_id"] = "PG3DReach-RealObstacle-v0"
     device = select_device(args.device)
     _seed_torch(args.seed)
     timer = TimingRecorder(
