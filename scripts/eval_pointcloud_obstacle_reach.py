@@ -519,7 +519,9 @@ def main(argv: list[str] | None = None) -> int:
     register_pg3d_reach_envs()
     register_pg3d_xarm7_gripper_reach_envs()
     metadata = load_reach_metadata(args.dataset)
-    if "XArm7" in str(metadata.get("env_id", "")):
+    if args.env_id_override is not None:
+        metadata["env_id"] = args.env_id_override
+    elif "XArm7" in str(metadata.get("env_id", "")):
         metadata["env_id"] = "PG3DReach-XArm7-RealObstacle-v0"
     else:
         metadata["env_id"] = "PG3DReach-RealObstacle-v0"
@@ -847,6 +849,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--episode-indices", type=int, nargs="+", default=None)
+    parser.add_argument("--env-id-override", type=str, default=None, help="Force a specific environment ID for the evaluation")
     parser.add_argument(
         "--episode-indices-file",
         type=Path,
