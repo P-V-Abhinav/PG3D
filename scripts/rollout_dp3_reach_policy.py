@@ -99,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     metadata = load_reach_metadata(args.dataset)
+    if args.env_id_override is not None:
+        metadata["env_id"] = args.env_id_override
     dataset_episode_seeds = [
         int(episode["seed"]) for episode in metadata.get("episodes", []) if "seed" in episode
     ]
@@ -198,6 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", choices=["dataset", "fresh"], default="dataset")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--episode-indices", type=int, nargs="+", default=None)
+    parser.add_argument("--env-id-override", type=str, default=None, help="Force a specific environment ID for the rollout")
     parser.add_argument("--seed-start", type=int, default=10000)
     parser.add_argument("--max-steps", type=int, default=150)
     parser.add_argument("--replan-stride", type=int, default=None)
