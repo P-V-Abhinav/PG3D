@@ -383,6 +383,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     action_mode = _action_mode(str(metadata.get("action_mode", "abs_joint")))
     crop_config = crop_config_from_metadata(metadata)
+    
+    # Overriding the metadata crop config to guarantee we see the environment
+    # 1. Expand X bounds to include the entire positive X workspace where the table/goal is
+    # 2. Force robot_point_fraction to 0.25 so the environment (table/obstacle) is not discarded
+    new_bounds = crop_config.bounds.copy()
+    new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
+    crop_config = PointCloudCropConfig(
+        bounds=new_bounds,
+        num_points=crop_config.num_points,
+        robot_point_fraction=0.25,
+    )
+    
     goal_thresh = (
         float(args.goal_thresh)
         if args.goal_thresh is not None
