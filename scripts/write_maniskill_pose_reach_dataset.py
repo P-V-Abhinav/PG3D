@@ -168,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             verbose_waypoints=args.verbose_waypoints,
             viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
             random_orientation=args.random_orientation,
+            orientation_mode=args.orientation_mode,
         )
 
         def process_new_episodes(seed_val, new_episodes_list):
@@ -515,6 +516,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "by default, incomplete seed/start groups are skipped so datasets do not silently "
             "miss e.g. downward_arc for a seed"
         ),
+    )
+    parser.add_argument(
+        "--orientation-mode",
+        default="all",
+        choices=["all", "downward", "pitch_30", "pitch_45", "pitch_60", "horizontal_front"],
+        help="Generate data for a specific orientation mode, or all of them."
     )
     parser.add_argument(
         "--show-planner-output",
@@ -946,6 +953,7 @@ def _collect_multimodal_episodes(
     verbose_waypoints: bool = False,
     viewer_step_delay: float = 0.0,
     random_orientation: bool = False,
+    orientation_mode: str = "all",
 ) -> list[ReachEpisodeData]:
     obs, info = env.reset(seed=seed, options={"reconfigure": True})
     _render_viewer_frame(env, viewer_step_delay)
@@ -1053,11 +1061,17 @@ def _collect_multimodal_episodes(
                 "random": ori_quat_sapien
             }
         else:
-            target_orientations = {
+            all_orientations = {
                 "downward": np.array([0.0000, 1.0000, 0.0000, 0.0000], dtype=np.float32),
+                "pitch_30": np.array([0.0000, 0.9659, 0.0000, -0.2588], dtype=np.float32),
+                "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32),
+                "pitch_60": np.array([0.0000, 0.8660, 0.0000, -0.5000], dtype=np.float32),
                 "horizontal_front": np.array([0.0000, 0.7071, 0.0000, -0.7071], dtype=np.float32),
-                "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32)
             }
+            if orientation_mode == "all":
+                target_orientations = all_orientations
+            else:
+                target_orientations = {orientation_mode: all_orientations[orientation_mode]}
 
         print(
             f"[seed {seed}] start accepted after attempt={start_metadata.get('attempt')} "
