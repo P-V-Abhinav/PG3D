@@ -160,6 +160,7 @@ def crop_point_cloud(
     if cropped_indices.size > config.num_points:
         cropped_indices = _downsample_with_robot_quota(
             cropped_indices,
+            points=points,
             robot_mask=source_robot_mask,
             num_points=config.num_points,
             robot_point_fraction=config.robot_point_fraction,
@@ -184,6 +185,7 @@ def crop_point_cloud(
 def _downsample_with_robot_quota(
     indices: Array,
     *,
+    points: Array,
     robot_mask: Array,
     num_points: int,
     robot_point_fraction: float,
@@ -193,30 +195,57 @@ def _downsample_with_robot_quota(
     target_robot = min(robot_indices.size, int(np.ceil(num_points * robot_point_fraction)))
     target_scene = min(scene_indices.size, num_points - target_robot)
     target_robot = min(robot_indices.size, num_points - target_scene)
-    selected = np.concatenate(
-        [
-            _linspace_select(robot_indices, target_robot),
-            _linspace_select(scene_indices, target_scene),
-        ],
-        axis=0,
-    )
+    
+    selected_robot = _fps_select(points, robot_indices, target_robot)
+    selected_scene = _fps_select(points, scene_indices, target_scene)
+    
+    selected = np.concatenate([selected_robot, selected_scene], axis=0)
+    
     if selected.size < num_points:
         remaining = np.setdiff1d(indices, selected, assume_unique=True)
-        selected = np.concatenate(
-            [selected, _linspace_select(remaining, num_points - selected.size)],
-            axis=0,
-        )
+        # For the remaining padding, random choice is fast and sufficient since 
+        # the main structure is already captured by FPS.
+        if remaining.size > 0:
+            count = num_points - selected.size
+            if remaining.size <= count:
+                extra = remaining
+            else:
+                extra = np.random.choice(remaining, count, replace=False)
+            selected = np.concatenate([selected, extra], axis=0)
+            
     return np.sort(selected.astype(np.int64, copy=False))
 
 
-def _linspace_select(values: Array, count: int) -> Array:
-    values = np.asarray(values, dtype=np.int64)
-    if count <= 0 or values.size == 0:
+def _fps_select(points: Array, indices: Array, count: int) -> Array:
+    """Farthest Point Sampling (FPS) over a subset of indices."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if count <= 0 or indices.size == 0:
         return np.zeros((0,), dtype=np.int64)
-    if values.size <= count:
-        return values.astype(np.int64, copy=True)
-    selected = np.linspace(0, values.size - 1, count)
-    return values[np.rint(selected).astype(np.int64)]
+    if indices.size <= count:
+        return indices.astype(np.int64, copy=True)
+        
+    subset_points = points[indices]
+    N = subset_points.shape[0]
+    
+    selected = np.zeros(count, dtype=np.int64)
+    distances = np.full(N, np.inf, dtype=np.float32)
+    
+    # Start with a random point (or first point)
+    farthest = 0
+    for i in range(count):
+        selected[i] = farthest
+        current_point = subset_points[farthest]
+        
+        # Compute distances from current point to all other points
+        dist_sq = np.sum((subset_points - current_point) ** 2, axis=1)
+        
+        # Update minimum distances
+        distances = np.minimum(distances, dist_sq)
+        
+        # Find the next farthest point
+        farthest = int(np.argmax(distances))
+        
+    return indices[selected]
 
 
 def observation_to_dataset_row(

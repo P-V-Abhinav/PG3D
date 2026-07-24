@@ -188,9 +188,14 @@ class PointCloudCollisionConstraint:
         if self.obstacle_points.size == 0:
             return {self.name: 0.0}
             
-        # Extract robot points
+        # Extract robot points — one cloud per timestep, all concatenated.
+        # This checks every future timestep in the action chunk simultaneously.
         if self.target == "eef":
             points = rollout.eef_path
+            # Also use per-step clouds if available for richer coverage.
+            clouds = [cloud for cloud in rollout.robot_point_clouds if cloud.size]
+            if clouds:
+                points = np.concatenate([points] + clouds, axis=0)
         elif self.target == "robot":
             clouds = [cloud for cloud in rollout.robot_point_clouds if cloud.size]
             if not clouds:
@@ -199,17 +204,28 @@ class PointCloudCollisionConstraint:
         else:
             return {self.name: 0.0}
             
+        # Compute minimum distance from every robot point to any obstacle point.
         dists = cdist(points, self.obstacle_points)
-        min_dists = np.min(dists, axis=1)
+        min_dists = np.min(dists, axis=1)          # shape: [N_robot_points]
         violation = np.maximum(self.margin - min_dists, 0.0)
+        
+        # Use BOTH max and mean violation:
+        # - max_violation: catches the single worst penetration (hard safety)
+        # - mean_violation: penalizes trajectories that skim close across many steps
         max_violation = float(np.max(violation)) if violation.size else 0.0
+        mean_violation = float(np.mean(violation)) if violation.size else 0.0
+        
+        # Combined cost: max dominates (hard boundary) + mean adds proportional penalty.
+        combined_cost = float(self.weight) * (max_violation + 0.5 * mean_violation)
         
         return {
-            self.name: float(self.weight) * max_violation,
+            self.name: combined_cost,
             f"{self.name}/max_violation": max_violation,
+            f"{self.name}/mean_violation": mean_violation,
         }
 
     def satisfied(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> bool:
+        # A rollout is only feasible if the WORST robot point is inside the margin.
         return self.cost(rollout, scene).get(f"{self.name}/max_violation", 0.0) <= 1e-6
 
     def to_json(self) -> dict[str, Any]:
@@ -872,7 +888,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--avoid-radius", type=float, default=0.08)
     parser.add_argument("--avoid-min-radius", type=float, default=0.025)
-    parser.add_argument("--avoid-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--avoid-margin",
+        type=float,
+        default=0.12,
+        help="Minimum clearance (metres) the robot must keep from obstacle point cloud. Default 0.12m = 12cm.",
+    )
     parser.add_argument("--avoid-weight", type=float, default=1.0)
     parser.add_argument(
         "--avoid-shape",
