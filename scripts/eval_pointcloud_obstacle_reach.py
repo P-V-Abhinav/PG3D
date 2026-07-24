@@ -3540,11 +3540,7 @@ def _video_env_factory(
     env_kwargs = _env_kwargs(metadata, render_mode="rgb_array", max_episode_steps=max_episode_steps)
 
     def factory() -> Any:
-        def _custom_env_id(env_id: str) -> str:
-            if "XArm7" in env_id:
-                return "PG3DReach-XArm7-RealObstacle-v0"
-            return "PG3DReach-RealObstacle-v0"
-        return gym.make(_custom_env_id(str(metadata["env_id"])), **env_kwargs)
+        return gym.make(str(metadata["env_id"]), **env_kwargs)
 
     return factory
 
