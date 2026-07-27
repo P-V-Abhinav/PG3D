@@ -166,3 +166,98 @@ class PG3DReachRealConeObstacleEnv(PG3DReachXArm7GripperEnv):
     @property
     def _default_sensor_configs(self) -> list[CameraConfig]:
         return _build_obstacle_cameras(super()._default_sensor_configs)
+
+
+# ---------------------------------------------------------------------------
+# Mixed Obstacles (Cone, Box, Sphere) with Random Scattering
+# ---------------------------------------------------------------------------
+@register_env("PG3DReach-RealMixedObstacle-v0", max_episode_steps=100)
+class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
+    def _load_scene(self, options: dict[str, Any] | None) -> None:
+        super()._load_scene(options)
+        
+        # 1. Box
+        self.box_obs = actors.build_box(
+            self.scene, half_sizes=[0.03, 0.03, 0.15],
+            color=[0.0, 0.0, 1.0, 1.0], name="obs_box", body_type="kinematic"
+        )
+        
+        # 2. Cone
+        obj_path = "/tmp/tall_cone.obj"
+        _create_cone_obj(obj_path, radius=0.06, height=0.45)
+        b_cone = self.scene.create_actor_builder()
+        b_cone.add_convex_collision_from_file(obj_path)
+        b_cone.add_visual_from_file(obj_path)
+        self.cone_obs = b_cone.build_kinematic("obs_cone")
+        
+        # 3. Sphere
+        self.sphere_obs = actors.build_sphere(
+            self.scene, radius=0.04,
+            color=[1.0, 0.5, 0.0, 1.0], name="obs_sphere", body_type="kinematic"
+        )
+        
+        self.obstacles = [self.box_obs, self.cone_obs, self.sphere_obs]
+        
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
+        super()._initialize_episode(env_idx, options)
+        with torch.device(self.device):
+            # We want deterministic placement per episode based on np.random which is seeded
+            # The base env seeds np.random in `reset(seed=...)` or `_initialize_episode`.
+            # We will use torch random state or np.random. 
+            # In mani_skill, `self._episode_seed` is available to seed RNGs deterministically.
+            rng = np.random.default_rng(self._episode_seed)
+            
+            start_pos = self.agent.tcp_pose.p[0].cpu().numpy()
+            goal_pos = self.goal_site.pose.p[0].cpu().numpy()
+            mid_pos = (start_pos + goal_pos) / 2.0
+            
+            # Select which obstacle is the primary one in the middle
+            obs_indices = [0, 1, 2]
+            rng.shuffle(obs_indices)
+            primary_idx = obs_indices[0]
+            clutter_indices = obs_indices[1:]
+            
+            # Z offsets for centering based on object type
+            # Box is 30cm tall, so center is 0.15. Cone is 45cm tall, center 0.225. Sphere r=4cm, center=0.04
+            z_offsets = [0.15, 0.225, 0.04]
+            
+            # Place primary obstacle
+            p_pos = mid_pos.copy()
+            p_pos[2] = z_offsets[primary_idx]
+            
+            # To set poses in batched environments (tensor), we need (1, 3) arrays
+            def set_pose_batched(actor, pos_np):
+                pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+                actor.set_pose(Pose.create_from_pq(pos_t))
+                
+            set_pose_batched(self.obstacles[primary_idx], p_pos)
+            
+            placed_positions = [start_pos[:2], goal_pos[:2], p_pos[:2]]
+            
+            # Place clutter
+            for idx in clutter_indices:
+                placed = False
+                for _ in range(100):
+                    # Table roughly spans X: [-0.2, 0.2], Y: [-0.4, 0.4] around base.
+                    # Base is at origin. Let's sample X in [0.1, 0.6], Y in [-0.4, 0.4] to be in front.
+                    sx = rng.uniform(0.1, 0.6)
+                    sy = rng.uniform(-0.4, 0.4)
+                    cand = np.array([sx, sy])
+                    
+                    # Check distances
+                    dists = [np.linalg.norm(cand - p) for p in placed_positions]
+                    # Must be at least 15cm from start/goal, and 10cm from other obstacles
+                    if dists[0] > 0.15 and dists[1] > 0.15 and all(d > 0.10 for d in dists[2:]):
+                        pos = np.array([sx, sy, z_offsets[idx]])
+                        set_pose_batched(self.obstacles[idx], pos)
+                        placed_positions.append(cand)
+                        placed = True
+                        break
+                
+                # Fallback if we couldn't place it safely (e.g., hide it under table)
+                if not placed:
+                    set_pose_batched(self.obstacles[idx], np.array([0, 0, -1.0]))
+
+    @property
+    def _default_sensor_configs(self) -> list[CameraConfig]:
+        return _build_obstacle_cameras(super()._default_sensor_configs)

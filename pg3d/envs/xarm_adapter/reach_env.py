@@ -178,6 +178,31 @@ class PG3DReachXArm7GripperEnv(PG3DReachXArm7Env):
     where the gripper body is needed for sim-to-real point-cloud fidelity.
     """
 
+    def _setup_sensors(self, options: dict | None = None) -> None:
+        super()._setup_sensors(options)
+        
+        # Add wrist camera directly to the environment's instantiated sensors
+        from mani_skill.sensors.camera import CameraConfig, Camera
+        import sapien
+        
+        # 87 degrees FOV matching RealSense D455 depth camera.
+        # SAPIEN Camera looks along +X axis.
+        pose = sapien.Pose([0.05, 0, 0]) # 5cm ahead of TCP
+        wrist_cam_config = CameraConfig(
+            "cam_wrist",
+            pose=pose,
+            width=128,
+            height=128,
+            fov=float(np.deg2rad(87)),
+            near=0.1,
+            far=10.0,
+            mount=self.agent.robot.links_map["link_tcp"]
+        )
+        self._sensor_configs["cam_wrist"] = wrist_cam_config
+        self._sensors["cam_wrist"] = Camera(wrist_cam_config, self.scene, articulation=self.agent.robot)
+        self.scene.sensors = self._sensors
+
+
     SUPPORTED_ROBOTS = ["xarm7_gripper"]
 
     def __init__(self, *args: Any, robot_uids: str = "xarm7_gripper", **kwargs: Any) -> None:

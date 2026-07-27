@@ -86,6 +86,7 @@ class GhostRenderWorker:
             from pg3d.envs.xarm_adapter.obstacle_envs import (  # noqa: F401
                 PG3DReachXArm7RealObstacleEnv,
                 PG3DReachRealConeObstacleEnv,
+                PG3DReachRealMixedObstacleEnv,
             )
         except Exception:
             pass
