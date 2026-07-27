@@ -414,7 +414,7 @@ def rollout_observation_entry(
     else:
         raw_min = raw_max = np.zeros(3)
     
-    print(f"[DEBUG] raw_pointcloud shape: {raw_pts.shape}, min: {raw_min.tolist()}, max: {raw_max.tolist()}, bounds: {crop_config.bounds.tolist()}", flush=True)
+    # print(f"[DEBUG] raw_pointcloud shape: {raw_pts.shape}, min: {raw_min.tolist()}, max: {raw_max.tolist()}, bounds: {crop_config.bounds.tolist()}", flush=True)
 
     cropped = crop_point_cloud(
         adapted.point_cloud,

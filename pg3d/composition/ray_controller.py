@@ -162,7 +162,7 @@ class GhostRenderWorker:
             RobotState,
             SimGroundTruth,
         )
-        from pg3d.world_model.chunks import ActionMode
+        from pg3d.world_model.types import ActionMode
 
         # ---- Set robot point budget ----------------------------------------
         if task.get("max_robot_points") is not None:
