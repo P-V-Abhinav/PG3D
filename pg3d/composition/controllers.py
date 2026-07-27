@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
 
@@ -37,6 +38,11 @@ class BaseController:
         score_weights: ScoreWeights | None = None,
         smoothness_order: int = 2,
         directional_sign: int = 0,
+        # Optional Ray actor pool for parallel candidate scoring.
+        # When set, _sample_and_score fans out to the pool instead of the
+        # serial for-loop.  All rejection/reranking logic is unchanged.
+        parallel_pool: Any | None = None,
+        parallel_task_name: str = "unknown",
     ) -> None:
         self.policy = policy
         self.world_model = world_model
@@ -49,6 +55,8 @@ class BaseController:
         if directional_sign not in {-1, 0, 1}:
             raise ValueError("directional_sign must be -1, 0, or 1")
         self.directional_sign = directional_sign
+        self.parallel_pool = parallel_pool
+        self.parallel_task_name = parallel_task_name
 
     def select(
         self,
@@ -67,6 +75,35 @@ class BaseController:
         start_index: int,
         rng: np.random.Generator | None,
     ) -> list[CandidateDiagnostics]:
+        # -------------------------------------------------------------------
+        # PARALLEL PATH: delegate to Ray actor pool when one is configured.
+        # The returned list[CandidateDiagnostics] is identical in structure
+        # to the serial path — RejectionController / RerankingController
+        # never need to know which path was taken.
+        # -------------------------------------------------------------------
+        if self.parallel_pool is not None:
+            obstacle_points, collision_margin, collision_weight, constraint_name = (
+                _extract_pointcloud_constraint(self.constraints)
+            )
+            from pg3d.composition.ray_controller import parallel_sample_and_score
+            return parallel_sample_and_score(
+                self.parallel_pool,
+                self,
+                controller_input,
+                attempted_k=attempted_k,
+                start_index=start_index,
+                rng=rng,
+                obstacle_points=obstacle_points,
+                collision_margin=collision_margin,
+                collision_weight=collision_weight,
+                collision_constraint_name=constraint_name,
+                max_robot_points=_extract_max_robot_points(controller_input),
+                task_name=self.parallel_task_name,
+            )
+
+        # -------------------------------------------------------------------
+        # SERIAL PATH (default, completely unchanged)
+        # -------------------------------------------------------------------
         policy_input = controller_input.input_for_policy()
         chunks = self.policy.sample_action_chunks(policy_input, k=attempted_k, rng=rng)
         if not chunks:
@@ -258,3 +295,45 @@ def _unique_cost_key(costs: dict[str, float], key: str) -> str:
     while f"{key}#{suffix}" in costs:
         suffix += 1
     return f"{key}#{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the parallel path
+# ---------------------------------------------------------------------------
+
+def _extract_pointcloud_constraint(
+    constraints: list[Constraint],
+) -> tuple[np.ndarray, float, float, str]:
+    """
+    Find the first PointCloudCollisionConstraint in the constraint list and
+    return (obstacle_points, margin, weight, constraint_name).
+    Falls back to an empty point cloud if none is found.
+    """
+    for c in constraints:
+        if hasattr(c, "obstacle_points"):
+            return (
+                np.asarray(c.obstacle_points, dtype=np.float32),
+                float(getattr(c, "margin", 0.12)),
+                float(getattr(c, "weight", 100.0)),
+                str(getattr(c, "name", "pointcloud_obstacle_avoid_region")),
+            )
+    return (
+        np.zeros((0, 3), dtype=np.float32),
+        0.12,
+        100.0,
+        "pointcloud_obstacle_avoid_region",
+    )
+
+
+def _extract_max_robot_points(controller_input: Any) -> int | None:
+    """
+    Extract the robot point budget from the observation's robot_mask so that
+    each worker can match the same point count as the main-process provider.
+    Returns None when match_current_robot_points is disabled.
+    """
+    obs = controller_input.observation
+    robot_mask = getattr(obs, "robot_mask", None)
+    if robot_mask is None:
+        return None
+    count = int(np.count_nonzero(robot_mask))
+    return count if count > 0 else None

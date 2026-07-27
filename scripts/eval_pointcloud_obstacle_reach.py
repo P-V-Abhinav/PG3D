@@ -72,164 +72,14 @@ class PG3DReachRealObstacleEnv(PG3DReachEnv):
             mid_pos[:, 2] = 0.15
             self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
 
-from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
-from pg3d.envs.xarm_adapter.reach_env import PG3DReachXArm7GripperEnv
+# xArm7 obstacle environments are defined in a standalone module so that
+# Ray worker processes can import them without pulling in this entire script.
+from pg3d.envs.xarm_adapter.obstacle_envs import (
+    PG3DReachXArm7RealObstacleEnv,  # noqa: F401 — registers PG3DReach-XArm7-RealObstacle-v0
+    PG3DReachRealConeObstacleEnv,   # noqa: F401 — registers PG3DReach-RealConeObstacle-v0
+    _create_cone_obj,
+)
 
-@register_env("PG3DReach-XArm7-RealObstacle-v0", max_episode_steps=100)
-class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
-    def _load_scene(self, options: dict[str, Any]) -> None:
-        super()._load_scene(options)
-        self.obstacle = actors.build_box(
-            self.scene,
-            half_sizes=[0.03, 0.03, 0.15],
-            color=[0.0, 0.0, 1.0, 1.0],
-            name="obstacle",
-            body_type="kinematic",
-        )
-
-    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
-        super()._initialize_episode(env_idx, options)
-        with torch.device(self.device):
-            start_pos = self.agent.tcp_pose.p
-            goal_pos = self.goal_site.pose.p
-            mid_pos = (start_pos + goal_pos) / 2.0
-            mid_pos[:, 2] = 0.15
-            self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
-
-    @property
-    def _default_sensor_configs(self) -> list[CameraConfig]:
-        configs = super()._default_sensor_configs
-        
-        cams = {
-            "cam_front_left": {
-                "eye":    [-0.5, 1.65, 0.85],
-                "target": [-0.5, -0.0, 0.40],
-                "fov_deg": 60.0,
-            },
-            "cam_side_right": {
-                "eye":    [-0.5,  -1.65, 0.85],
-                "target": [-0.5, -0.05, 0.40],
-                "fov_deg": 60.0,
-            },
-            "cam_overhead": {
-                "eye":    [0.20, 0.00, 1.20],
-                "target": [-0.30, 0.00, 0.40],
-                "fov_deg": 70.0,
-            },
-            "cam_back": {
-                "eye":    [-1.50, 0.00, 0.85],
-                "target": [-0.50, 0.00, 0.40],
-                "fov_deg": 60.0,
-            },
-        }
-        
-        for name, config in cams.items():
-            pose = sapien_utils.look_at(eye=config["eye"], target=config["target"])
-            configs.append(
-                CameraConfig(
-                    name, 
-                    pose, 
-                    128, 128, 
-                    float(np.deg2rad(config["fov_deg"])), 
-                    0.1, 10.0
-                )
-            )
-        return configs
-
-import os
-
-def _create_cone_obj(filepath: str, radius: float = 0.05, height: float = 0.40, segments: int = 32):
-    """Generates a simple 3D cone OBJ file."""
-    if os.path.exists(filepath):
-        return filepath
-        
-    with open(filepath, 'w') as f:
-        # Top vertex
-        f.write(f"v 0 0 {height/2}\n")
-        # Bottom center
-        f.write(f"v 0 0 {-height/2}\n")
-        # Bottom ring
-        for i in range(segments):
-            angle = 2.0 * np.pi * i / segments
-            x = radius * np.cos(angle)
-            y = radius * np.sin(angle)
-            f.write(f"v {x} {y} {-height/2}\n")
-            
-        # Top faces
-        for i in range(segments):
-            curr = i + 3
-            next_idx = 3 if i == segments - 1 else i + 4
-            f.write(f"f 1 {curr} {next_idx}\n")
-            
-        # Bottom faces
-        for i in range(segments):
-            curr = i + 3
-            next_idx = 3 if i == segments - 1 else i + 4
-            f.write(f"f 2 {next_idx} {curr}\n")
-    return filepath
-
-@register_env("PG3DReach-RealConeObstacle-v0", max_episode_steps=100)
-class PG3DReachRealConeObstacleEnv(PG3DReachXArm7GripperEnv):
-    def _load_scene(self, options: dict[str, Any] | None) -> None:
-        super()._load_scene(options)
-        
-        obj_path = "/tmp/tall_cone.obj"
-        _create_cone_obj(obj_path, radius=0.06, height=0.45)
-        
-        builder = self.scene.create_actor_builder()
-        # In SAPIEN/ManiSkill, convex collision from file is supported
-        builder.add_convex_collision_from_file(obj_path)
-        builder.add_visual_from_file(obj_path)
-        self.obstacle = builder.build_kinematic("obstacle")
-        
-    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
-        super()._initialize_episode(env_idx, options)
-        with torch.device(self.device):
-            start_pos = self.agent.tcp_pose.p
-            goal_pos = self.goal_site.pose.p
-            mid_pos = (start_pos + goal_pos) / 2.0
-            mid_pos[:, 2] = 0.225  # Center of a 0.45m tall cone is at 0.225
-            self.obstacle.set_pose(Pose.create_from_pq(mid_pos))
-
-    @property
-    def _default_sensor_configs(self) -> list[CameraConfig]:
-        configs = super()._default_sensor_configs
-        
-        cams = {
-            "cam_front_left": {
-                "eye":    [-0.5, 1.65, 0.85],
-                "target": [-0.5, -0.0, 0.40],
-                "fov_deg": 60.0,
-            },
-            "cam_side_right": {
-                "eye":    [-0.5,  -1.65, 0.85],
-                "target": [-0.5, -0.05, 0.40],
-                "fov_deg": 60.0,
-            },
-            "cam_overhead": {
-                "eye":    [0.20, 0.00, 1.20],
-                "target": [-0.30, 0.00, 0.40],
-                "fov_deg": 70.0,
-            },
-            "cam_back": {
-                "eye":    [-1.50, 0.00, 0.85],
-                "target": [-0.50, 0.00, 0.40],
-                "fov_deg": 60.0,
-            },
-        }
-        
-        for name, config in cams.items():
-            pose = sapien_utils.look_at(eye=config["eye"], target=config["target"])
-            configs.append(
-                CameraConfig(
-                    name, 
-                    pose, 
-                    128, 128, 
-                    float(np.deg2rad(config["fov_deg"])), 
-                    0.1, 10.0
-                )
-            )
-        return configs
 from pg3d.eval import (
     AvoidOverlayConfig,
     EpisodePath,
@@ -614,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
     run = _init_wandb(args, metadata=metadata, checkpoint_path=checkpoint_path)
     sim_env: Any | None = None
     ghost_env: Any | None = None
+    parallel_pool: Any | None = None
     rows: list[dict[str, Any]] = []
     metrics_path = args.output_dir / "metrics.jsonl"
     decisions_path = args.output_dir / "decisions.jsonl"
@@ -634,6 +485,24 @@ def main(argv: list[str] | None = None) -> int:
             str(metadata["env_id"]),
             **_env_kwargs(metadata, render_mode=None, max_episode_steps=args.max_episode_steps),
         )
+        # Build Ray actor pool for parallel candidate scoring (if requested).
+        if getattr(args, "parallel_candidates", 0) > 0:
+            from pg3d.composition.ray_controller import build_ray_actor_pool
+            _ghost_kwargs = _env_kwargs(
+                metadata, render_mode=None, max_episode_steps=args.max_episode_steps
+            )
+            parallel_pool = build_ray_actor_pool(
+                n_workers=args.parallel_candidates,
+                env_id=str(metadata["env_id"]),
+                env_kwargs=_ghost_kwargs,
+                crop_bounds=crop_config.bounds,
+                task_name=_env_task_name_from_id(str(metadata["env_id"])),
+            )
+            print(
+                f"[parallel] Ray actor pool ready: {args.parallel_candidates} workers "
+                f"for env_id={metadata['env_id']}",
+                flush=True,
+            )
         adapter = DP3ChunkPolicyAdapter(
             policy,
             action_mode=action_mode,
@@ -719,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
                         robot_clearance_metric=args.robot_clearance_metric,
                         robot_clearance_stride=args.robot_clearance_stride,
                         zarr_context=zarr_context,
+                        parallel_pool=parallel_pool,
                     )
                     rows.append(row)
                     with timer.time("json_write", artifact="metrics"):
@@ -760,6 +630,13 @@ def main(argv: list[str] | None = None) -> int:
             sim_env.close()
         if ghost_env is not None:
             ghost_env.close()
+        if parallel_pool is not None:
+            try:
+                import ray
+                ray.shutdown()
+                print("[parallel] Ray shutdown complete.", flush=True)
+            except Exception:
+                pass
 
     summary = {
         "checkpoint": str(checkpoint_path),
@@ -893,6 +770,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-ema-alpha", type=float, default=1.0, help="EMA smoothing factor for actions. 1.0 = no smoothing.")
     parser.add_argument("--geometry-mode", choices=["fast", "exact"], default="fast")
     parser.add_argument("--k-schedule", type=int, nargs="+", default=[16, 32, 64])
+    parser.add_argument(
+        "--parallel-candidates",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of Ray worker processes to use for parallel candidate scoring. "
+            "0 (default) = serial evaluation (existing behaviour, unchanged). "
+            "Recommended: match the first value in --k-schedule "
+            "(e.g. --k-schedule 16 32 64 --parallel-candidates 16). "
+            "Each worker owns one independent SAPIEN ghost env and one CPU core. "
+            "Spectre has 48 cores; 16 workers is a safe default."
+        ),
+    )
     parser.add_argument("--policy-batch-size", type=int, default=64)
     parser.add_argument("--goal-thresh", type=float, default=None)
     parser.add_argument(
@@ -1290,6 +1181,7 @@ def run_eval_episode(
     robot_clearance_metric: bool = False,
     robot_clearance_stride: int = 4,
     zarr_context: dict[str, Any] | None = None,
+    parallel_pool: Any | None = None,
 ) -> dict[str, Any]:
     # Defensive copy: obstacle_spawning appends to `constraints` as the episode
     # progresses, and the caller reuses the same initial list/pending_spawn across
@@ -1361,6 +1253,31 @@ def run_eval_episode(
         if method != "base":
             world_model = GeometricWorldModel(provider)
 
+    # ---- Broadcast reset to Ray parallel workers (if pool is active) --------
+    if parallel_pool is not None and method != "base":
+        # Read obstacle position from the live sim env so workers can mirror it.
+        _obstacle_xyz: list[float] | None = None
+        _unwrapped = getattr(sim_env, "unwrapped", sim_env)
+        if hasattr(_unwrapped, "obstacle"):
+            try:
+                import torch as _torch
+                _obs_p = _unwrapped.obstacle.pose.p
+                if hasattr(_obs_p, "detach"):
+                    _obs_p = _obs_p.detach().cpu().numpy()
+                _obs_p = np.asarray(_obs_p).flatten()
+                _obstacle_xyz = _obs_p[:3].tolist()
+            except Exception:
+                pass
+        
+        import ray
+        # parallel_pool._idle_actors is the list of GhostRenderWorker actors
+        refs = [
+            actor.reset_episode.remote(spec.seed, _obstacle_xyz)
+            for actor in parallel_pool._idle_actors
+        ]
+        ray.get(refs)  # Block until all workers have reset
+
+
     steps = 0
     replans = 0
     first_success_step: int | None = None
@@ -1392,6 +1309,7 @@ def run_eval_episode(
                 match_current_robot_points=match_current_robot_points,
                 rng=rng,
                 timer=timer,
+                parallel_pool=parallel_pool,
             )
             replans += 1
             if decision.result is not None:
@@ -1599,6 +1517,7 @@ def _select_decision(
     match_current_robot_points: bool,
     rng: np.random.Generator,
     timer: TimingRecorder,
+    parallel_pool: Any | None = None,
 ) -> EvalDecisionSummary:
     if method == "base":
         chunk = adapter.sample_action_chunks(obs_window, k=1, rng=rng)[0]
@@ -1629,6 +1548,8 @@ def _select_decision(
                 world_model=world_model,
                 constraints=constraints,
                 k_schedule=k_schedule,
+                parallel_pool=parallel_pool,
+                parallel_task_name=getattr(provider, "task_name", "unknown") if provider else "unknown",
             ).select(controller_input, rng=rng)
     else:
         result = _select_multichunk(
@@ -2395,7 +2316,12 @@ def _constraints_for_episode(
     # Filter: remove goal marker points (within 3cm of target_position)
     target = np.asarray(entry["target_position"], dtype=np.float32).reshape(3)
     dists_to_target = np.linalg.norm(env_points - target, axis=1)
-    obstacle_points = env_points[dists_to_target > 0.03]
+    
+    # Filter: remove start marker points (red sphere, within 3cm of start TCP)
+    start_pos = np.asarray(entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
+    dists_to_start = np.linalg.norm(env_points - start_pos, axis=1)
+    
+    obstacle_points = env_points[(dists_to_target > 0.03) & (dists_to_start > 0.03)]
 
     # Apply Farthest Point Sampling to get maximally spread representative points.
     # FPS ensures the collision checker sees the full spatial extent of the obstacle
@@ -3777,6 +3703,11 @@ def _env_task_name(env: Any) -> str:
     unwrapped = getattr(env, "unwrapped", env)
     spec = getattr(unwrapped, "spec", None)
     return str(getattr(spec, "id", "unknown"))
+
+
+def _env_task_name_from_id(env_id: str) -> str:
+    """Derive a task name string from an env id without needing a live env."""
+    return env_id
 
 
 def _artifact_selection_summary(

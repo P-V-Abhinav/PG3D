@@ -396,6 +396,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-rollout-post-success-steps", type=int, default=8)
     parser.add_argument("--checkpoint-rollout-seed-start", type=int, default=10000)
     parser.add_argument("--checkpoint-rollout-fps", type=int, default=10)
+    parser.add_argument("--env-id-override", type=str, default=None, help="Force a specific environment ID for the rollout")
+    parser.add_argument("--checkpoint-rollout-ema-alpha", type=float, default=0.6, help="EMA smoothing factor for rollout actions")
     args = parser.parse_args(argv)
     if args.pad_after is None:
         args.pad_after = args.n_action_steps - 1
@@ -812,6 +814,7 @@ def _log_checkpoint_rollouts(
                     post_success_steps=args.checkpoint_rollout_post_success_steps,
                     gripper_open=0.04,
                     video_fps=args.checkpoint_rollout_fps,
+                    action_ema_alpha=args.checkpoint_rollout_ema_alpha,
                     metrics_file=None,
                     video_path=video_path,
                     write_rerun=False,
@@ -922,11 +925,13 @@ def _checkpoint_rollout_metadata_and_specs(
         select_random_dataset_rollout_specs,
     )
 
-    metadata = (
+    metadata = dict(
         load_reach_metadata(args.checkpoint_rollout_dataset)
         if args.checkpoint_rollout_dataset is not None
         else train_dataset.metadata
     )
+    if args.env_id_override is not None:
+        metadata["env_id"] = args.env_id_override
     dataset_episode_seeds = [
         int(episode["seed"]) for episode in metadata.get("episodes", []) if "seed" in episode
     ]
