@@ -40,6 +40,7 @@ from pg3d.envs.maniskill_adapter import (
     ManiSkillGhostPandaGeometryProvider,
     register_pg3d_reach_envs,
 )
+from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
 from pg3d.envs.maniskill_adapter.dataset import (
     PointCloudCropConfig,
     load_reach_metadata,
