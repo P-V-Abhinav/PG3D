@@ -44,7 +44,7 @@ from pg3d.composition.scoring import (
 # ---------------------------------------------------------------------------
 # Ray remote actor — one per CPU core, owns one SAPIEN ghost env
 # ---------------------------------------------------------------------------
-@ray.remote(num_cpus=1, num_gpus=0)
+@ray.remote(num_cpus=1, num_gpus=0.05)
 class GhostRenderWorker:
     """
     Persistent Ray actor that wraps one SAPIEN ghost env.
