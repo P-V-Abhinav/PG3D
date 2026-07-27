@@ -211,28 +211,39 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
             goal_pos = self.goal_site.pose.p[0].cpu().numpy()
             mid_pos = (start_pos + goal_pos) / 2.0
             
-            # Select which obstacle is the primary one in the middle
-            obs_indices = [0, 1, 2]
-            rng.shuffle(obs_indices)
-            primary_idx = obs_indices[0]
-            clutter_indices = obs_indices[1:]
-            
             # Z offsets for centering based on object type
             # Box is 30cm tall, so center is 0.15. Cone is 45cm tall, center 0.225. Sphere r=4cm, center=0.04
             z_offsets = [0.15, 0.225, 0.04]
-            
-            # Place primary obstacle
-            p_pos = mid_pos.copy()
-            p_pos[2] = z_offsets[primary_idx]
             
             # To set poses in batched environments (tensor), we need (1, 3) arrays
             def set_pose_batched(actor, pos_np):
                 pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
                 actor.set_pose(Pose.create_from_pq(pos_t))
-                
-            set_pose_batched(self.obstacles[primary_idx], p_pos)
             
-            placed_positions = [start_pos[:2], goal_pos[:2], p_pos[:2]]
+            # Place both Box (0) and Cone (1) in the middle, spaced apart perpendicularly
+            vec = goal_pos[:2] - start_pos[:2]
+            length = np.linalg.norm(vec)
+            if length > 1e-4:
+                perp = np.array([-vec[1], vec[0]]) / length
+            else:
+                perp = np.array([1.0, 0.0])
+                
+            spacing = 0.08  # 8cm offset from center for each
+            
+            p_box = mid_pos.copy()
+            p_box[:2] += perp * spacing
+            p_box[2] = z_offsets[0]
+            set_pose_batched(self.obstacles[0], p_box)
+            
+            p_cone = mid_pos.copy()
+            p_cone[:2] -= perp * spacing
+            p_cone[2] = z_offsets[1]
+            set_pose_batched(self.obstacles[1], p_cone)
+            
+            placed_positions = [start_pos[:2], goal_pos[:2], p_box[:2], p_cone[:2]]
+            
+            # Scatter Sphere (2)
+            clutter_indices = [2]
             
             # Place clutter
             for idx in clutter_indices:
