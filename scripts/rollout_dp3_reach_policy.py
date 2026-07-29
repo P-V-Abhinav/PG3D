@@ -110,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         episodes=args.episodes,
         episode_indices=args.episode_indices,
         seed_start=args.seed_start,
+        repeat_seed=args.repeat_seed,
     )
     if not specs:
         raise RuntimeError("no rollout episodes selected")
@@ -221,6 +222,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="EMA smoothing factor for actions. 1.0 = no smoothing, 0.1 = heavy smoothing.",
+    )
+    parser.add_argument(
+        "--repeat-seed",
+        action="store_true",
+        help="Repeat the same seed_start for all requested fresh rollout episodes.",
     )
     parser.add_argument("--allow-failure", action="store_true")
     args = parser.parse_args(argv)
@@ -564,6 +570,7 @@ def select_rollout_specs(
     episodes: int,
     episode_indices: list[int] | None = None,
     seed_start: int = 10000,
+    repeat_seed: bool = False,
 ) -> list[RolloutSpec]:
     """Select dataset or fresh rollout seeds, skipping training seeds for fresh rollouts."""
     if episodes <= 0:
@@ -572,9 +579,12 @@ def select_rollout_specs(
         if episode_indices is None:
             episode_indices = list(range(min(episodes, len(dataset_episode_seeds))))
         specs = []
-        for output_idx, dataset_idx in enumerate(episode_indices):
+        for output_idx, raw_idx in enumerate(episode_indices):
+            dataset_idx = raw_idx
+            if dataset_idx not in range(len(dataset_episode_seeds)) and dataset_idx in dataset_episode_seeds:
+                dataset_idx = dataset_episode_seeds.index(dataset_idx)
             if dataset_idx < 0 or dataset_idx >= len(dataset_episode_seeds):
-                raise IndexError(f"dataset episode index {dataset_idx} is out of range")
+                raise IndexError(f"dataset episode index or seed {raw_idx} is out of range")
             specs.append(
                 RolloutSpec(
                     output_index=output_idx,
@@ -585,11 +595,19 @@ def select_rollout_specs(
             )
         return specs
     if source == "fresh":
-        if episode_indices is not None:
-            raise ValueError("--episode-indices is only valid with --source dataset")
-        training_seeds = set(dataset_episode_seeds)
         specs = []
+        if repeat_seed:
+            for output_idx in range(episodes):
+                specs.append(
+                    RolloutSpec(
+                        output_index=output_idx,
+                        seed=seed_start,
+                        source="fresh",
+                    )
+                )
+            return specs
         candidate = seed_start
+        training_seeds = set(dataset_episode_seeds)
         while len(specs) < episodes:
             if candidate not in training_seeds:
                 specs.append(

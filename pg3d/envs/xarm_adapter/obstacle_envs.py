@@ -272,3 +272,84 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
     @property
     def _default_sensor_configs(self) -> list[CameraConfig]:
         return _build_obstacle_cameras(super()._default_sensor_configs)
+
+
+# ---------------------------------------------------------------------------
+# Cluttered Kitchen Environment (YCB Objects)
+# ---------------------------------------------------------------------------
+@register_env("PG3DReach-RealKitchen-v0", max_episode_steps=100)
+class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
+    def _load_scene(self, options: dict[str, Any] | None) -> None:
+        super()._load_scene(options)
+        
+        self.ycb_objects = []
+        model_ids = ["025_mug", "024_bowl", "019_pitcher", "006_mustard_bottle", "009_gelatin_box"]
+        
+        # Try to import build_actor_ycb from different possible locations in ManiSkill 3
+        try:
+            from mani_skill.utils.building.actors import build_ycb
+            build_fn = build_ycb
+        except ImportError:
+            try:
+                from mani_skill.utils.ycb_utils import build_actor_ycb
+                build_fn = build_actor_ycb
+            except ImportError:
+                # Fallback
+                def build_fn(model_id, scene, name, body_type):
+                    pass 
+
+        for i, model_id in enumerate(model_ids):
+            try:
+                if build_fn.__name__ == "build_actor_ycb":
+                    builder, _ = build_fn(model_id, self.scene)
+                    builder.set_scene_idxs(None) # applies to all scenes
+                    actor = builder.build_kinematic(name=f"{model_id}_{i}")
+                else:
+                    actor = build_fn(self.scene, model_id, name=f"{model_id}_{i}", body_type="kinematic")
+                self.ycb_objects.append(actor)
+            except Exception as e:
+                print(f"[PG3DReachRealKitchenEnv] Failed to load YCB {model_id}: {e}")
+                actor = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.1], color=[1, 0, 0, 1], name=f"fallback_{i}", body_type="kinematic")
+                self.ycb_objects.append(actor)
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
+        super()._initialize_episode(env_idx, options)
+        with torch.device(self.device):
+            rng = np.random.default_rng(self._episode_seed)
+            
+            start_pos = self.agent.tcp_pose.p[0].cpu().numpy()
+            goal_pos = self.goal_site.pose.p[0].cpu().numpy()
+            
+            def set_pose_batched(actor, pos_np, q_np):
+                pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+                q_t = torch.tensor(q_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+                actor.set_pose(Pose.create_from_pq(p=pos_t, q=q_t))
+            
+            placed_positions = [start_pos[:2], goal_pos[:2]]
+            
+            for i, actor in enumerate(self.ycb_objects):
+                placed = False
+                for _ in range(200):
+                    # Table roughly spans X: [0.1, 0.6], Y: [-0.4, 0.4] around base.
+                    sx = rng.uniform(0.1, 0.55)
+                    sy = rng.uniform(-0.35, 0.35)
+                    cand = np.array([sx, sy])
+                    
+                    dists = [np.linalg.norm(cand - p) for p in placed_positions]
+                    # Must be at least 12cm from start/goal, and 10cm from other obstacles
+                    if dists[0] > 0.12 and dists[1] > 0.12 and all(d > 0.10 for d in dists[2:]):
+                        theta = rng.uniform(0, 2 * np.pi)
+                        q = [np.cos(theta/2), 0, 0, np.sin(theta/2)]
+                        
+                        pos = np.array([sx, sy, 0.05])
+                        set_pose_batched(actor, pos, q)
+                        placed_positions.append(cand)
+                        placed = True
+                        break
+                
+                if not placed:
+                    set_pose_batched(actor, np.array([0, 0, -1.0]), [1, 0, 0, 0])
+
+    @property
+    def _default_sensor_configs(self) -> list[CameraConfig]:
+        return _build_obstacle_cameras(super()._default_sensor_configs)

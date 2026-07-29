@@ -79,6 +79,7 @@ from pg3d.envs.xarm_adapter.obstacle_envs import (
     PG3DReachXArm7RealObstacleEnv,  # noqa: F401 — registers PG3DReach-XArm7-RealObstacle-v0
     PG3DReachRealConeObstacleEnv,   # noqa: F401 — registers PG3DReach-RealConeObstacle-v0
     PG3DReachRealMixedObstacleEnv,  # noqa: F401 — registers PG3DReach-RealMixedObstacle-v0
+    PG3DReachRealKitchenEnv,        # noqa: F401 — registers PG3DReach-RealKitchen-v0
     _create_cone_obj,
 )
 

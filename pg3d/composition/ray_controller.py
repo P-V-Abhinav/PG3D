@@ -87,6 +87,7 @@ class GhostRenderWorker:
                 PG3DReachXArm7RealObstacleEnv,
                 PG3DReachRealConeObstacleEnv,
                 PG3DReachRealMixedObstacleEnv,
+                PG3DReachRealKitchenEnv,
             )
         except Exception:
             pass
