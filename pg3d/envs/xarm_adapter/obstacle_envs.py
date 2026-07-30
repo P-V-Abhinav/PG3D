@@ -285,27 +285,12 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
         self.ycb_objects = []
         model_ids = ["025_mug", "024_bowl", "019_pitcher", "006_mustard_bottle", "009_gelatin_box"]
         
-        # Try to import build_actor_ycb from different possible locations in ManiSkill 3
-        try:
-            from mani_skill.utils.building.actors import build_ycb
-            build_fn = build_ycb
-        except ImportError:
-            try:
-                from mani_skill.utils.ycb_utils import build_actor_ycb
-                build_fn = build_actor_ycb
-            except ImportError:
-                # Fallback
-                def build_fn(model_id, scene, name, body_type):
-                    pass 
-
         for i, model_id in enumerate(model_ids):
             try:
-                if build_fn.__name__ == "build_actor_ycb":
-                    builder, _ = build_fn(model_id, self.scene)
-                    builder.set_scene_idxs(None) # applies to all scenes
-                    actor = builder.build_kinematic(name=f"{model_id}_{i}")
-                else:
-                    actor = build_fn(self.scene, model_id, name=f"{model_id}_{i}", body_type="kinematic")
+                # ManiSkill 3 standard asset loading
+                builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
+                builder.set_scene_idxs(None) # applies to all scenes
+                actor = builder.build_kinematic(name=f"{model_id}_{i}")
                 self.ycb_objects.append(actor)
             except Exception as e:
                 print(f"[PG3DReachRealKitchenEnv] Failed to load YCB {model_id}: {e}")
