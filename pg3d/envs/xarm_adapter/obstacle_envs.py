@@ -283,7 +283,8 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
         super()._load_scene(options)
         
         self.ycb_objects = []
-        model_ids = ["025_mug", "024_bowl", "019_pitcher", "006_mustard_bottle", "009_gelatin_box"]
+        # Swapped 019_pitcher for 005_tomato_soup_can as the pitcher is not in the default ManiSkill YCB subset
+        model_ids = ["025_mug", "024_bowl", "005_tomato_soup_can", "006_mustard_bottle", "009_gelatin_box"]
         
         for i, model_id in enumerate(model_ids):
             try:
