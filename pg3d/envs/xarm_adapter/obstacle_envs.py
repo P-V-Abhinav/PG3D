@@ -305,6 +305,11 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
             start_pos = self.agent.tcp_pose.p[0].cpu().numpy()
             goal_pos = self.goal_site.pose.p[0].cpu().numpy()
             
+            # Lower the goal position so it is amidst the clutter but not touching the ground
+            goal_pos[2] = 0.08  # 8cm above the table
+            goal_pos_t = torch.tensor(goal_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
+            self.goal_site.set_pose(Pose.create_from_pq(p=goal_pos_t))
+            
             def set_pose_batched(actor, pos_np, q_np):
                 pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
                 q_t = torch.tensor(q_np, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -315,14 +320,16 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
             for i, actor in enumerate(self.ycb_objects):
                 placed = False
                 for _ in range(200):
-                    # Table roughly spans X: [0.1, 0.6], Y: [-0.4, 0.4] around base.
-                    sx = rng.uniform(0.1, 0.55)
-                    sy = rng.uniform(-0.35, 0.35)
+                    # Obstacles placed closely around the goal to obstruct the direct path
+                    angle = rng.uniform(0, 2 * np.pi)
+                    rad = rng.uniform(0.08, 0.25)  # 8cm to 25cm radius around the goal
+                    sx = goal_pos[0] + rad * np.cos(angle)
+                    sy = goal_pos[1] + rad * np.sin(angle)
                     cand = np.array([sx, sy])
                     
                     dists = [np.linalg.norm(cand - p) for p in placed_positions]
-                    # Must be at least 12cm from start/goal, and 10cm from other obstacles
-                    if dists[0] > 0.12 and dists[1] > 0.12 and all(d > 0.10 for d in dists[2:]):
+                    # Ensure it doesn't overlap the start (12cm), is very close to goal but not overlapping (8cm), and doesn't overlap other clutter (10cm)
+                    if dists[0] > 0.12 and dists[1] > 0.08 and all(d > 0.10 for d in dists[2:]):
                         theta = rng.uniform(0, 2 * np.pi)
                         q = [np.cos(theta/2), 0, 0, np.sin(theta/2)]
                         
