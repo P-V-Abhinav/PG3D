@@ -48,10 +48,6 @@ from pg3d.envs.maniskill_adapter.dataset import (
     load_reach_metadata,
 )
 from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
-try:
-    from pg3d.envs.maniskill_adapter.obstacle_envs import PG3DReachPandaRealMixedObstacleEnv
-except ImportError:
-    pass
 from pg3d.envs.xarm_adapter.obstacle_envs import (  # noqa: F401 — registers envs
     PG3DReachRealMixedObstacleEnv,
     PG3DReachXArm7RealObstacleEnv,
@@ -378,7 +374,7 @@ def run_nullspace_rollout(
     if frames:
         video_stem = f"episode_{spec.output_index:03d}_seed{spec.seed}_posture{posture_mode}"
         video_path = output_dir / (video_stem + ".mp4")
-        save_video(video_path, frames, fps=video_fps)
+        save_video(frames, video_path, fps=video_fps)
 
     return {
         "episode": spec.output_index,
@@ -407,8 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     register_pg3d_xarm7_gripper_reach_envs()
 
     metadata = load_reach_metadata(args.dataset)
-    # Always override to the mixed obstacle XArm7 env
-    env_id = args.env_id_override or "PG3DReach-RealMixedObstacle-v0"
+    env_id = args.env_id_override or metadata.get("env_id", "PG3DReach-XArm7-Gripper-Workspace-v0")
     metadata["env_id"] = env_id
 
     device = select_device(args.device)
