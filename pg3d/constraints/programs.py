@@ -20,6 +20,61 @@ SmoothnessTarget = Literal["q", "eef"]
 
 
 @dataclass(frozen=True)
+class JointPostureConstraint:
+    """Soft joint posture target over the rollout."""
+
+    target_q: Array
+    eval_timestep: str = "all"
+    weight: float = 1.0
+    name: str = "joint_posture"
+    constraint_type: str = "joint_posture"
+
+    def __post_init__(self) -> None:
+        target = as_float_array(self.target_q, name="target_q", ndim=1)
+        object.__setattr__(self, "target_q", target)
+        if self.eval_timestep not in {"all", "final", "midpoint"}:
+            raise ValueError("eval_timestep must be 'all', 'final', or 'midpoint'")
+        _validate_nonnegative(self.weight, "weight")
+
+    def cost(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> dict[str, float]:
+        q = np.asarray(rollout.q, dtype=np.float32)
+        if q.size == 0:
+            return {self.name: 0.0, f"{self.name}/mse": 0.0}
+            
+        if self.eval_timestep == "final":
+            q_eval = q[-1:]
+        elif self.eval_timestep == "midpoint":
+            q_eval = q[q.shape[0] // 2 : q.shape[0] // 2 + 1]
+        else: # all
+            q_eval = q
+
+        target = self.target_q.reshape(1, -1)
+        dof = min(q_eval.shape[1], target.shape[1])
+        mse = float(np.mean((q_eval[:, :dof] - target[:, :dof]) ** 2))
+        
+        return {
+            self.name: float(self.weight) * mse,
+            f"{self.name}/mse": mse,
+        }
+
+    def satisfied(
+        self,
+        rollout: ImaginedRollout,
+        scene: SceneContext | None = None,
+    ) -> bool:
+        return True
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "type": self.constraint_type,
+            "target_q": self.target_q.tolist(),
+            "eval_timestep": self.eval_timestep,
+            "weight": self.weight,
+            "name": self.name,
+        }
+
+
+@dataclass(frozen=True)
 class CartesianPoseConstraint:
     """Soft Cartesian pose target over the whole rollout."""
 
@@ -432,6 +487,7 @@ def constraint_from_json(
     | SmoothnessCost
     | CartesianPoseConstraint
     | CylinderPassageConstraint
+    | JointPostureConstraint
 ):
     """Load a constraint from a JSON-safe config."""
     constraint_type = config.get("type")
@@ -489,6 +545,13 @@ def constraint_from_json(
             weight=float(config.get("weight", 1.0)),
             name=str(config.get("name", "cylinder_passage")),
         )
+    if constraint_type == "joint_posture":
+        return JointPostureConstraint(
+            target_q=config["target_q"],
+            eval_timestep=str(config.get("eval_timestep", "all")),
+            weight=float(config.get("weight", 1.0)),
+            name=str(config.get("name", "joint_posture")),
+        )
     raise ValueError(f"unknown constraint type {constraint_type!r}")
 
 
@@ -499,6 +562,7 @@ def constraints_to_json(
         | SmoothnessCost
         | CartesianPoseConstraint
         | CylinderPassageConstraint
+        | JointPostureConstraint
     ],
 ) -> list[dict[str, Any]]:
     """Serialize a list of constraints."""
@@ -513,6 +577,7 @@ def constraints_from_json(
     | SmoothnessCost
     | CartesianPoseConstraint
     | CylinderPassageConstraint
+    | JointPostureConstraint
 ]:
     """Deserialize a list of constraints."""
     return [constraint_from_json(config) for config in configs]

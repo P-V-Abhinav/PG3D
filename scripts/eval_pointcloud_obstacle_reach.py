@@ -35,6 +35,7 @@ from pg3d.constraints import (
     CartesianPoseConstraint,
     RectRegion2D,
     SphereRegion,
+    JointPostureConstraint,
 )
 from pg3d.envs.maniskill_adapter import (
     ManiSkillGhostPandaGeometryProvider,
@@ -852,10 +853,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(sphere/box) penalizing the EEF/robot for entering it. 'projection' is the "
             "no-overflight analog: a 2-D tabletop rectangle that penalizes the XY "
             "projection of the EEF/robot for passing over it, regardless of height z. "
-            "Projection placement reuses the candidate_midpath logic; pass "
+            "projection placement reuses the candidate_midpath logic; pass "
             "--constraint-placement candidate_midpath. 'cartesian_pose' samples one "
             "EEF pose from the selected dataset episode's saved /data/tcp_pose trajectory."
         ),
+    )
+    parser.add_argument(
+        "--posture-target-joints",
+        type=float,
+        nargs=7,
+        default=None,
+        help="Target 7-DOF joint configuration for posture steering.",
+    )
+    parser.add_argument(
+        "--posture-weight",
+        type=float,
+        default=1.0,
+        help="Weight for the joint posture constraint cost.",
+    )
+    parser.add_argument(
+        "--posture-eval-timestep",
+        choices=["all", "final", "midpoint"],
+        default="all",
+        help="Which timesteps to evaluate the posture target on.",
     )
     parser.add_argument(
         "--cartesian-pose-path-fraction",
@@ -2349,7 +2369,17 @@ def _constraints_for_episode(
         name="pointcloud_obstacle_avoid_region",
         target=args.constraint_target,
     )
-    return [constraint], None
+    
+    constraints = [constraint]
+    if getattr(args, "posture_target_joints", None) is not None:
+        posture_constraint = JointPostureConstraint(
+            target_q=np.array(args.posture_target_joints, dtype=np.float32),
+            weight=float(args.posture_weight),
+            eval_timestep=args.posture_eval_timestep,
+        )
+        constraints.append(posture_constraint)
+
+    return constraints, None
 
 
 def _precomputed_constraint_path(constraints_dir: Path, spec: RolloutSpec) -> Path:

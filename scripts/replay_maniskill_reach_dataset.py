@@ -94,13 +94,23 @@ def main(argv: list[str] | None = None) -> int:
                         f"--episode-indices entry {i + 1} out of range "
                         f"(dataset has {len(episode_ends)} episodes)"
                     )
+        elif args.episode_range is not None:
+            start_ep, end_ep = args.episode_range
+            start_ep = max(0, start_ep)
+            end_ep = min(len(episode_ends), end_ep)
+            episode_indices = list(range(start_ep, end_ep))
+        elif args.end_episode is not None:
+            start_ep = max(0, args.start_episode)
+            end_ep = min(len(episode_ends), args.end_episode)
+            episode_indices = list(range(start_ep, end_ep))
         else:
+            start_ep = max(0, args.start_episode)
             max_episodes = (
                 len(episode_ends)
                 if args.episodes is None
-                else min(args.episodes, len(episode_ends))
+                else min(start_ep + args.episodes, len(episode_ends))
             )
-            episode_indices = list(range(max_episodes))
+            episode_indices = list(range(start_ep, max_episodes))
         if args.video_dir is not None:
             args.video_dir.mkdir(parents=True, exist_ok=True)
         if args.rerun_dir is not None:
@@ -178,7 +188,17 @@ def main(argv: list[str] | None = None) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a pg3d ManiSkill reach Zarr dataset.")
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=None, help="Number of episodes to replay.")
+    parser.add_argument("--start-episode", type=int, default=0, help="0-indexed starting episode (default: 0).")
+    parser.add_argument("--end-episode", type=int, default=None, help="0-indexed ending episode (exclusive).")
+    parser.add_argument(
+        "--episode-range",
+        type=int,
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help="0-indexed episode range [START, END) to replay, e.g. --episode-range 10 20.",
+    )
     parser.add_argument(
         "--episode-indices",
         type=int,
