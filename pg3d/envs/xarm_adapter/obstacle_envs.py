@@ -283,8 +283,11 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
         super()._load_scene(options)
         
         self.ycb_objects = []
-        # Swapped 019_pitcher for 005_tomato_soup_can as the pitcher is not in the default ManiSkill YCB subset
-        model_ids = ["025_mug", "024_bowl", "005_tomato_soup_can", "006_mustard_bottle", "009_gelatin_box"]
+        # Added 5 more complex/large YCB objects to heavily increase OOD clutter
+        model_ids = [
+            "025_mug", "024_bowl", "005_tomato_soup_can", "006_mustard_bottle", "009_gelatin_box",
+            "003_cracker_box", "004_sugar_box", "010_potted_meat_can", "011_banana", "021_bleach_cleanser"
+        ]
         
         for i, model_id in enumerate(model_ids):
             try:
@@ -320,17 +323,18 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
             
             for i, actor in enumerate(self.ycb_objects):
                 placed = False
-                for _ in range(200):
+                for _ in range(500):
                     # Obstacles placed closely around the goal to obstruct the direct path
+                    # Expanded max radius to 35cm to fit all 10 objects
                     angle = rng.uniform(0, 2 * np.pi)
-                    rad = rng.uniform(0.08, 0.25)  # 8cm to 25cm radius around the goal
+                    rad = rng.uniform(0.08, 0.35) 
                     sx = goal_pos[0] + rad * np.cos(angle)
                     sy = goal_pos[1] + rad * np.sin(angle)
                     cand = np.array([sx, sy])
                     
                     dists = [np.linalg.norm(cand - p) for p in placed_positions]
-                    # Ensure it doesn't overlap the start (12cm), is very close to goal but not overlapping (8cm), and doesn't overlap other clutter (10cm)
-                    if dists[0] > 0.12 and dists[1] > 0.08 and all(d > 0.10 for d in dists[2:]):
+                    # Ensure it doesn't overlap the start (12cm), is very close to goal but not overlapping (8cm), and doesn't overlap other clutter (9cm)
+                    if dists[0] > 0.12 and dists[1] > 0.08 and all(d > 0.09 for d in dists[2:]):
                         theta = rng.uniform(0, 2 * np.pi)
                         q = [np.cos(theta/2), 0, 0, np.sin(theta/2)]
                         
