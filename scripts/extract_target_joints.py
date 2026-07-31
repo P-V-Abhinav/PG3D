@@ -19,36 +19,45 @@ def main() -> int:
         print(f"Failed to open dataset {args.dataset}: {exc}")
         return 1
     
-    metadata_json = root.attrs.get("metadata")
-    if metadata_json:
-        metadata = json.loads(metadata_json)
-        episodes = metadata.get("episodes", [])
-        if not (0 <= args.episode < len(episodes)):
-            print(f"Episode {args.episode} is out of bounds (dataset has {len(episodes)} episodes).")
-            return 1
+    if "meta" not in root or "episode_ends" not in root["meta"]:
+        print("Dataset missing meta/episode_ends array.")
+        return 1
+        
+    episode_ends = np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
+    if not (0 <= args.episode < len(episode_ends)):
+        print(f"Episode {args.episode} is out of bounds (dataset has {len(episode_ends)} episodes).")
+        return 1
+        
+    start = 0 if args.episode == 0 else int(episode_ends[args.episode - 1])
+    end = int(episode_ends[args.episode])
+    horizon = end - start
     
-    episode_group = root.get(f"episode_{args.episode:06d}")
-    if episode_group is None:
-        print(f"Could not find episode_{args.episode:06d} in dataset.")
+    if horizon <= 0:
+        print(f"Episode {args.episode} is empty.")
+        return 1
+        
+    data = root["data"]
+    # Check possible joint state array keys
+    joint_array = None
+    key_used = None
+    for key in ["state", "qpos", "sim_action", "action"]:
+        if key in data:
+            joint_array = data[key]
+            key_used = key
+            break
+            
+    if joint_array is None:
+        print(f"Could not find joint data (state, qpos, sim_action, action) in data/")
         return 1
 
-    try:
-        qpos = np.asarray(episode_group["data"]["qpos"])
-    except KeyError:
-        print("Could not find data/qpos in the episode.")
-        return 1
-
-    horizon = qpos.shape[0]
-    if horizon == 0:
-        print("Trajectory is empty.")
-        return 1
+    target_offset = int(round(args.fraction * (horizon - 1)))
+    abs_idx = start + target_offset
+    joint_data = np.asarray(joint_array[abs_idx])
     
-    target_idx = int(round(args.fraction * (horizon - 1)))
-    # XArm7 reach tasks typically use the first 7 joints for the arm
-    target_joints = qpos[target_idx, :7]
+    # XArm7 reach tasks use 7 joints for the arm
+    target_joints = joint_data[:7]
     
-    print(f"Extracted joints from episode {args.episode} at timestep {target_idx}/{horizon-1} (fraction {args.fraction}):")
-    # Output the joints as a space-separated string suitable for CLI arguments
+    print(f"Extracted joints from episode {args.episode} (slice {start}:{end}, offset {target_offset}/{horizon-1}, key '{key_used}'):")
     print(" ".join(f"{j:.6f}" for j in target_joints))
     
     return 0
