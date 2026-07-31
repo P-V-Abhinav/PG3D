@@ -51,6 +51,12 @@ class PG3DReachPandaRealMixedObstacleEnv(PG3DReachEnv):
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
         with torch.device(self.device):
+            # --- Fixed high and forward goal ---
+            fixed_goal_t = torch.tensor([[0.15, 0.0, 0.45]], dtype=torch.float32, device=self.device)
+            if len(env_idx) > 1:
+                fixed_goal_t = fixed_goal_t.repeat(len(env_idx), 1)
+            self.goal_site.set_pose(Pose.create_from_pq(fixed_goal_t))
+            
             rng = np.random.default_rng(self._episode_seed)
             
             start_pos = self.agent.tcp_pose.p[0].cpu().numpy()
