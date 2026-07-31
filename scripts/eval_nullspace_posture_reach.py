@@ -378,7 +378,7 @@ def run_nullspace_rollout(
     if frames:
         video_stem = f"episode_{spec.output_index:03d}_seed{spec.seed}_posture{posture_mode}"
         video_path = output_dir / (video_stem + ".mp4")
-        save_video(frames, video_path, fps=video_fps)
+        save_video(video_path, frames, fps=video_fps)
 
     return {
         "episode": spec.output_index,
