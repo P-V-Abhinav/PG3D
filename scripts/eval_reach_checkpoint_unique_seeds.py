@@ -800,10 +800,12 @@ def _reset_to_zarr_episode(
     if getattr(unwrapped, "obstacle", None) is not None:
         mid_pos = (start[0, :3] + target[0, :3]) / 2.0
         # Preserve original Z height from initialization
-        mid_pos[2] = unwrapped.obstacle.pose.p[2]
-        if hasattr(unwrapped.obstacle.pose.p, "detach"):
-            mid_pos[2] = unwrapped.obstacle.pose.p.detach().cpu().numpy()[2]
-        unwrapped.obstacle.set_pose(Pose.create_from_pq(mid_pos))
+        p = unwrapped.obstacle.pose.p
+        if hasattr(p, "detach"):
+            p = p.detach().cpu().numpy()
+        p = np.asarray(p).reshape(-1)
+        mid_pos[2] = p[2]
+        unwrapped.obstacle.set_pose(Pose.create_from_pq(mid_pos.reshape(1, 3)))
     info = unwrapped.get_info()
     obs = unwrapped.get_obs(info)
     return obs, info
