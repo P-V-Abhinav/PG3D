@@ -2306,6 +2306,10 @@ def _constraints_for_episode(
     # With this step, the camera PCD faithfully captures the obstacle at its
     # true location, regardless of its shape, size, or geometry.
     zero_action = np.zeros(env.action_space.shape, dtype=np.float32)
+    if action_mode == "abs_joint":
+        current_qpos = env.unwrapped.agent.robot.get_qpos()
+        dof_to_copy = min(len(current_qpos), len(zero_action))
+        zero_action[:dof_to_copy] = current_qpos[:dof_to_copy]
     obs, _, _, _, info = env.step(zero_action)
 
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
