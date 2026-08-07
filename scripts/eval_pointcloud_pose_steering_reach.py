@@ -2297,6 +2297,25 @@ def _constraints_for_episode(
     else:
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
 
+    # --- Banana Goal Override ---
+    # Dynamically find the banana in the kitchen environment and move the goal marker 5cm above it.
+    # This overrides the policy's target so it actively reaches for the banana.
+    unwrapped = env.unwrapped
+    if "Kitchen" in getattr(unwrapped, "__class__").__name__ or hasattr(unwrapped, "ycb_objects"):
+        import torch
+        from mani_skill.utils.structs.pose import Pose
+        for actor in unwrapped.scene.get_all_actors():
+            if "banana" in actor.name.lower():
+                try:
+                    # Move goal 5cm above banana center
+                    banana_p = actor.pose.p.clone()
+                    banana_p[0, 2] += 0.05
+                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=banana_p))
+                    print(f"[{spec.output_index}] Banana Goal Override: Moved goal to {banana_p[0].cpu().numpy().tolist()}")
+                except Exception as e:
+                    print(f"Warning: Failed to override banana goal: {e}")
+                break
+
     # --- Generalizable point cloud extraction for dynamic collision detection ---
     # We take ONE zero-action step after env.reset() to force ManiSkill's
     # renderer to re-render the scene AFTER the obstacle has been teleported to

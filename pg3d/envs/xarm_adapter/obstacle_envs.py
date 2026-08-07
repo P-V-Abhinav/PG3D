@@ -346,16 +346,6 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
                 
                 if not placed:
                     set_pose_batched(actor, np.array([0, 0, -1.0]), [1, 0, 0, 0])
-            
-            # --- CUSTOM MODIFICATION FOR BANANA GRASP TEST ---
-            # Move the policy's goal marker exactly to the banana's position
-            banana_actor = next((a for a in self.ycb_objects if "banana" in a.name), None)
-            if banana_actor is not None:
-                b_pos = banana_actor.pose.p[0].cpu().numpy()
-                # Target a point slightly above the banana's center for grasping
-                new_goal_pos = np.array([b_pos[0], b_pos[1], b_pos[2] + 0.05], dtype=np.float32)
-                new_goal_t = torch.tensor(new_goal_pos, device=self.device).unsqueeze(0)
-                self.goal_site.set_pose(Pose.create_from_pq(p=new_goal_t))
 
     @property
     def _default_sensor_configs(self) -> list[CameraConfig]:
