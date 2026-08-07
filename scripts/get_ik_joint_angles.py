@@ -54,7 +54,8 @@ def get_ik(x, y, z, qw, qx, qy, qz):
     
     if status == "Success":
         # plan is a list/array of joint angles
-        joint_angles = np.array(plan, dtype=np.float32)
+        # plan might have extra dimensions (e.g., shape [1, 7]), so we flatten it to a 1D array of floats
+        joint_angles = np.array(plan, dtype=np.float32).flatten()
         print("✅ IK Solution Found!")
         print("Use the following 7 values for your --posture-target-joints argument:\n")
         
