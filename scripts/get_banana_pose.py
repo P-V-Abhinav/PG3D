@@ -56,8 +56,13 @@ def main():
         
     # 5. Extract and print the pose
     pose = banana_actor.pose
-    pos = pose.p[0].cpu().numpy()  # tensor to numpy
-    quat = pose.q[0].cpu().numpy() # [w, x, y, z]
+    def to_1d_numpy(val):
+        if hasattr(val, 'cpu'):
+            val = val.cpu().numpy()
+        return np.asarray(val).reshape(-1)
+        
+    pos = to_1d_numpy(pose.p)
+    quat = to_1d_numpy(pose.q)
     
     print("\n🍌 Banana Ground-Truth Pose found!")
     print(f"  Position: X = {pos[0]:.4f}, Y = {pos[1]:.4f}, Z = {pos[2]:.4f}")
