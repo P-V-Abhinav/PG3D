@@ -402,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.025                       # Filter out the table at Z=0.0; 25 mm above the table surface is safe
+    new_bounds[2, 0] = 0.040                       # Filter out the table surface noise; 40 mm is safe
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
