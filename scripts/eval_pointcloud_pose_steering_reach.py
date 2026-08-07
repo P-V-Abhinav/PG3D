@@ -2302,16 +2302,25 @@ def _constraints_for_episode(
     # This overrides the policy's target so it actively reaches for the banana.
     unwrapped = env.unwrapped
     if "Kitchen" in getattr(unwrapped, "__class__").__name__ or hasattr(unwrapped, "ycb_objects"):
-        import torch
+        import numpy as np
         from mani_skill.utils.structs.pose import Pose
         for actor in unwrapped.scene.get_all_actors():
             if "banana" in actor.name.lower():
                 try:
                     # Move goal 5cm above banana center
-                    banana_p = actor.pose.p.clone()
-                    banana_p[0, 2] += 0.05
-                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=banana_p))
-                    print(f"[{spec.output_index}] Banana Goal Override: Moved goal to {banana_p[0].cpu().numpy().tolist()}")
+                    # Safely handle both tensor and numpy types
+                    p_val = actor.pose.p
+                    if hasattr(p_val, 'cpu'):
+                        p_val = p_val.cpu().numpy()
+                    
+                    banana_p = np.asarray(p_val).reshape(-1).copy()
+                    banana_p[2] += 0.05
+                    
+                    # Convert to tensor with batch dimension (1, 3) for ManiSkill's set_pose
+                    import torch
+                    banana_p_tensor = torch.tensor(banana_p, dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
+                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=banana_p_tensor))
+                    print(f"[{spec.output_index}] Banana Goal Override: Moved goal to {banana_p.tolist()}")
                 except Exception as e:
                     print(f"Warning: Failed to override banana goal: {e}")
                 break
