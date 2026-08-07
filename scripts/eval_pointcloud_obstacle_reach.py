@@ -401,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.005                       # Filter out the table at Z=0.0
+    new_bounds[2, 0] = 0.025                       # Filter out the table at Z=0.0; 25 mm above the table surface is safe
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
@@ -2286,13 +2286,6 @@ def _constraints_for_episode(
     # With this step, the camera PCD faithfully captures the obstacle at its
     # true location, regardless of its shape, size, or geometry.
     zero_action = np.zeros(env.action_space.shape, dtype=np.float32)
-    if action_mode == "abs_joint":
-        current_qpos = np.asarray(env.unwrapped.agent.robot.get_qpos())
-        qpos_flat = current_qpos.reshape(-1)
-        za_flat = zero_action.reshape(-1)
-        dof_to_copy = min(len(qpos_flat), len(za_flat))
-        za_flat[:dof_to_copy] = qpos_flat[:dof_to_copy]
-        zero_action = za_flat.reshape(zero_action.shape)
     obs, _, _, _, info = env.step(zero_action)
 
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
