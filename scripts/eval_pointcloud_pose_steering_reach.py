@@ -635,6 +635,11 @@ def main(argv: list[str] | None = None) -> int:
                             render_mode="rgb_array",
                             max_episode_steps=args.max_episode_steps,
                         )
+                        _empty_ghost = _gym.make(
+                            "PG3DReach-XArm7-Gripper-Workspace-v0",
+                            obs_mode="none",
+                            render_mode="rgb_array",
+                        )
                         # Build a posture-only constraint list (no collision constraint)
                         _posture_only: list[Any] = []
                         if getattr(args, "posture_target_joints", None) is not None:
@@ -658,7 +663,7 @@ def main(argv: list[str] | None = None) -> int:
                         for _dbg_method in args.methods:
                             _dbg_row = run_eval_episode(
                                 sim_env=_empty_env,
-                                ghost_env=None,
+                                ghost_env=_empty_ghost,
                                 policy=policy,
                                 adapter=adapter,
                                 method=_dbg_method,
