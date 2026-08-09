@@ -868,9 +868,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--posture-weight",
         type=float,
-        default=1.0,
-        help="Weight for the joint posture constraint cost.",
+        default=0.0,
+        help="Weight for the JointPostureConstraint cost.",
     )
+
+    # New argument to select which object to target in the Kitchen Environment
+    parser.add_argument(
+        "--approach-object",
+        type=str,
+        default="banana",
+        help="The name of the object to target in the kitchen env (e.g. 'banana', 'mug', 'bowl', 'mustard')."
+    )
+
     parser.add_argument(
         "--posture-eval-timestep",
         choices=["all", "final", "midpoint"],
@@ -2298,31 +2307,30 @@ def _constraints_for_episode(
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
 
     # --- Banana Goal Override ---
-    # Dynamically find the banana in the kitchen environment and move the goal marker 5cm above it.
-    # This overrides the policy's target so it actively reaches for the banana.
+    # Dynamically find the requested object in the kitchen environment and move the goal marker 5cm above it.
     unwrapped = env.unwrapped
     if "Kitchen" in getattr(unwrapped, "__class__").__name__ or hasattr(unwrapped, "ycb_objects"):
         import numpy as np
         from mani_skill.utils.structs.pose import Pose
+        target_obj_name = getattr(args, "approach_object", "banana").lower()
         for actor in unwrapped.scene.get_all_actors():
-            if "banana" in actor.name.lower():
+            if target_obj_name in actor.name.lower():
                 try:
-                    # Move goal 5cm above banana center
-                    # Safely handle both tensor and numpy types
+                    # Move goal 5cm above object center
                     p_val = actor.pose.p
                     if hasattr(p_val, 'cpu'):
                         p_val = p_val.cpu().numpy()
                     
-                    banana_p = np.asarray(p_val).reshape(-1).copy()
-                    banana_p[2] += 0.05
+                    obj_p = np.asarray(p_val).reshape(-1).copy()
+                    obj_p[2] += 0.05
                     
                     # Convert to tensor with batch dimension (1, 3) for ManiSkill's set_pose
                     import torch
-                    banana_p_tensor = torch.tensor(banana_p, dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
-                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=banana_p_tensor))
-                    print(f"[{spec.output_index}] Banana Goal Override: Moved goal to {banana_p.tolist()}")
+                    obj_p_tensor = torch.tensor(obj_p, dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
+                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=obj_p_tensor))
+                    print(f"[{spec.output_index}] Goal Override: Moved goal to {target_obj_name} at {obj_p.tolist()}")
                 except Exception as e:
-                    print(f"Warning: Failed to override banana goal: {e}")
+                    print(f"Warning: Failed to override goal for {target_obj_name}: {e}")
                 break
 
     # --- Generalizable point cloud extraction for dynamic collision detection ---

@@ -79,9 +79,11 @@ if __name__ == "__main__":
     parser.add_argument("--y", type=float, required=True, help="Target Y position (meters)")
     parser.add_argument("--z", type=float, required=True, help="Target Z position (meters)")
     
-    # Approach direction helper
-    parser.add_argument("--approach", type=str, choices=["down", "left", "right", "front", "back", "custom"], default="down", 
-                        help="Pre-defined approach directions (gripper orientation). 'down' = approach from above.")
+    # Approach direction helper matches dataset variants exactly
+    parser.add_argument("--approach", type=str, 
+                        choices=["downward", "pitch_30", "pitch_45", "pitch_60", "horizontal_front", "custom"], 
+                        default="downward", 
+                        help="Pre-defined approach orientations matching the training dataset.")
     
     # Manual quaternions if approach == 'custom'
     parser.add_argument("--qw", type=float, default=0.0, help="Quaternion W (used if --approach custom)")
@@ -91,23 +93,17 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Define exact quaternions for SAPIEN xArm7 TCP
-    # Base frame: Z is UP, X is FORWARD, Y is LEFT
-    if args.approach == "down":
-        # Gripper points straight down (-Z)
-        qw, qx, qy, qz = 0.0, 1.0, 0.0, 0.0
-    elif args.approach == "front":
-        # Gripper points inward from the front (+X direction)
-        qw, qx, qy, qz = 0.5, 0.5, 0.5, 0.5
-    elif args.approach == "back":
-        # Gripper points outward from the back (-X direction)
-        qw, qx, qy, qz = 0.5, -0.5, -0.5, 0.5
-    elif args.approach == "left":
-        # Gripper points inward from the left (-Y direction)
-        qw, qx, qy, qz = 0.7071068, 0.7071068, 0.0, 0.0
-    elif args.approach == "right":
-        # Gripper points inward from the right (+Y direction)
-        qw, qx, qy, qz = 0.0, 0.0, -0.7071068, 0.7071068
+    # Define exact quaternions from the training dataset
+    if args.approach == "downward":
+        qw, qx, qy, qz = 0.0000, 1.0000, 0.0000, 0.0000
+    elif args.approach == "pitch_30":
+        qw, qx, qy, qz = 0.0000, 0.9659, 0.0000, -0.2588
+    elif args.approach == "pitch_45":
+        qw, qx, qy, qz = 0.0000, 0.9239, 0.0000, -0.3827
+    elif args.approach == "pitch_60":
+        qw, qx, qy, qz = 0.0000, 0.8660, 0.0000, -0.5000
+    elif args.approach == "horizontal_front":
+        qw, qx, qy, qz = 0.0000, 0.7071, 0.0000, -0.7071
     else:
         qw, qx, qy, qz = args.qw, args.qx, args.qy, args.qz
         
