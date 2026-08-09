@@ -61,23 +61,33 @@ def get_ik(x, y, z, qw, qx, qy, qz, *, start_qpos_seed: np.ndarray | None = None
     # mplib expects a 7D vector: [x, y, z, qw, qx, qy, qz] in world frame
     goal_pose = np.array([x, y, z, qw, qx, qy, qz], dtype=np.float64)
 
-    # 4. Choose IK seed:
-    # If we have the episode's actual start qpos, use that as the seed.
-    # This is CRITICAL: the IK solver will return the joint configuration
-    # that is closest (in joint space) to the seed while satisfying the
-    # Cartesian target. Seeding with the episode start qpos means the
-    # returned target joints represent a pose the arm can naturally reach
-    # from its actual starting state - not just from a generic rest pose.
-    n_ik = len(planner.user_joint_names)
+    # 4. Build the IK seed with the correct full dimension.
+    #
+    # mplib's IK() requires the FULL robot qpos (all joints, including gripper
+    # fingers). For XArm7GripperMotionPlanningSolver this is 13 dims (7 arm + 6
+    # gripper finger joints). The zarr dataset only stores the 7 arm joints in
+    # `state`. So we:
+    #   1. Start from the robot's current full qpos (after env.reset), which
+    #      gives a valid 13-dim baseline (arm at rest, gripper fully open).
+    #   2. Overwrite just the first 7 values with the episode's arm start qpos.
+    # This seeds the IK solver from the arm's actual starting configuration,
+    # while keeping the gripper joints at their default (open) values.
+    full_default_qpos = (
+        np.asarray(env.unwrapped.agent.robot.get_qpos())
+        .reshape(-1)
+        .astype(np.float64)
+    )
     if start_qpos_seed is not None:
-        seed = np.asarray(start_qpos_seed, dtype=np.float64).flatten()[:n_ik]
-        print(f"  IK Seed:     Episode start qpos (first {n_ik} joints)")
+        seed = full_default_qpos.copy()
+        arm_vals = np.asarray(start_qpos_seed, dtype=np.float64).flatten()
+        n_arm = min(len(arm_vals), len(seed))
+        seed[:n_arm] = arm_vals[:n_arm]
+        print(f"  IK Seed:     Episode start qpos ({n_arm} arm joints) + default gripper")
     else:
-        seed = np.asarray(
-            env.unwrapped.agent.robot.get_qpos()
-        ).reshape(-1)[:n_ik].astype(np.float64)
-        print("  IK Seed:     Robot rest pose (no --dataset/--episode provided!)")
+        seed = full_default_qpos
+        print("  IK Seed:     Robot full rest pose (no --dataset/--episode provided!)")
         print("  ⚠️  WARNING: This may give target joints that don't match your episode.")
+
 
     # 5. Solve IK
     print(f"\nSolving IK for Cartesian Pose:")
