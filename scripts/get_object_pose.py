@@ -23,8 +23,9 @@ def main():
     args = parser.parse_args()
 
     # 1. Open the dataset and find the seed for this episode
-    zarr_root = zarr.open_group(args.dataset, mode="r")
-    meta_path = args.dataset.replace(".zarr", "") + "/metadata.json"
+    # metadata.json lives INSIDE the zarr directory
+    import os
+    meta_path = os.path.join(args.dataset, "metadata.json")
     
     try:
         with open(meta_path, "r") as f:

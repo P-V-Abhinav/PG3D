@@ -611,6 +611,97 @@ def main(argv: list[str] | None = None) -> int:
                     timings_path,
                     start_index=timing_written,
                 )
+
+                # --debug-empty-env: run the same episode on the bare workspace env.
+                # This isolates posture steering from the collision constraint and confirms
+                # whether steering itself is working before blaming the kitchen clutter.
+                if getattr(args, "debug_empty_env", False):
+                    try:
+                        print(
+                            f"\n[debug-empty-env] Running episode {spec.output_index} "
+                            f"on empty workspace env...",
+                            flush=True,
+                        )
+                        import gymnasium as _gym
+                        from pg3d.envs.xarm_adapter import (
+                            register_pg3d_xarm7_gripper_reach_envs as _reg,
+                        )
+                        _reg()
+                        _empty_env = _gym.make(
+                            "PG3DReach-XArm7-Gripper-Workspace-v0",
+                            obs_mode=sim_env.unwrapped.obs_mode
+                            if hasattr(sim_env.unwrapped, "obs_mode")
+                            else "pointcloud",
+                            render_mode="rgb_array",
+                            max_episode_steps=args.max_episode_steps,
+                        )
+                        # Build a posture-only constraint list (no collision constraint)
+                        _posture_only: list[Any] = []
+                        if getattr(args, "posture_target_joints", None) is not None:
+                            from pg3d.constraints import JointPostureConstraint
+                            _posture_only.append(
+                                JointPostureConstraint(
+                                    target_q=np.array(
+                                        args.posture_target_joints, dtype=np.float32
+                                    ),
+                                    weight=float(args.posture_weight),
+                                    eval_timestep=args.posture_eval_timestep,
+                                )
+                            )
+                        # Override the goal to match what was used in the kitchen run.
+                        # We re-use the zarr_context target_position (the object XYZ).
+                        _debug_zarr_context = (
+                            zarr_context.copy() if zarr_context is not None else None
+                        )
+                        _debug_output_dir = args.output_dir / "debug_empty_env"
+                        _debug_output_dir.mkdir(parents=True, exist_ok=True)
+                        for _dbg_method in args.methods:
+                            _dbg_row = run_eval_episode(
+                                sim_env=_empty_env,
+                                ghost_env=None,
+                                policy=policy,
+                                adapter=adapter,
+                                method=_dbg_method,
+                                spec=spec,
+                                constraints=_posture_only,
+                                pending_spawn=None,
+                                action_mode=action_mode,
+                                crop_config=crop_config,
+                                goal_thresh=goal_thresh,
+                                output_dir=_debug_output_dir,
+                                max_steps=args.max_steps,
+                                post_success_steps=args.post_success_steps,
+                                planning_horizon_chunks=args.planning_horizon_chunks,
+                                execution_horizon_chunks=args.execution_horizon_chunks,
+                                action_ema_alpha=args.action_ema_alpha,
+                                geometry_mode=args.geometry_mode,
+                                k_schedule=tuple(args.k_schedule),
+                                gripper_open=args.gripper_open,
+                                match_current_robot_points=args.match_current_robot_points,
+                                video=write_video,
+                                rerun=False,
+                                video_fps=args.video_fps,
+                                decisions_file=decisions_file,
+                                step_traces_file=step_traces_file,
+                                rng=rng,
+                                timer=timer,
+                                video_env_factory=None,
+                                zarr_context=_debug_zarr_context,
+                                parallel_pool=parallel_pool,
+                            )
+                            print(
+                                f"[debug-empty-env] method={_dbg_method} "
+                                f"episode={spec.output_index} "
+                                f"reach={_dbg_row['reach_success']}",
+                                flush=True,
+                            )
+                        _empty_env.close()
+                        print("[debug-empty-env] Done.\n", flush=True)
+                    except Exception as _e:
+                        print(f"[debug-empty-env] FAILED: {_e}", flush=True)
+                        import traceback as _tb
+                        _tb.print_exc()
+
                 if should_emit_episode_artifact(spec.output_index, args.plot_every_episodes):
                     _maybe_emit_progress(
                         output_dir=args.output_dir,
@@ -878,6 +969,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default="banana",
         help="The name of the object to target in the kitchen env (e.g. 'banana', 'mug', 'bowl', 'mustard')."
+    )
+
+    # Debug flag: additionally run on empty workspace env to isolate posture steering effect
+    parser.add_argument(
+        "--debug-empty-env",
+        action="store_true",
+        default=False,
+        help=(
+            "Additionally run each episode in the empty PG3DReach-XArm7-Gripper-Workspace-v0 "
+            "env (no obstacles, no collision constraint) using the same goal XYZ and posture "
+            "target. Useful to verify posture steering works in isolation before diagnosing "
+            "kitchen env issues."
+        ),
     )
 
     parser.add_argument(
