@@ -1219,13 +1219,6 @@ def run_eval_episode(
         sim_obs, sim_info = _reset_to_zarr_episode(
             sim_env, rollout_seed=spec.seed, zarr_context=zarr_context
         )
-        # Fix A: Take ONE zero-action step so the SAPIEN renderer re-renders the
-        # scene AFTER _reset_to_zarr_episode has teleported the obstacle to
-        # mid(zarr_start, goal).  Without this step the camera observation still
-        # reflects the pre-teleport obstacle position, giving zero usable
-        # obstacle points in the initial point cloud.
-        _zero_action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        sim_obs, _, _, _, sim_info = sim_env.step(_zero_action)
     else:
         sim_obs, sim_info = sim_env.reset(seed=spec.seed, options={"reconfigure": True})
     video_env: Any | None = None

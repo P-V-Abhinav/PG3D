@@ -806,6 +806,8 @@ def _reset_to_zarr_episode(
         p = np.asarray(p).reshape(-1)
         mid_pos[2] = p[2]
         unwrapped.obstacle.set_pose(Pose.create_from_pq(mid_pos.reshape(1, 3)))
+    if getattr(unwrapped, "scene", None) is not None and hasattr(unwrapped.scene, "update_render"):
+        unwrapped.scene.update_render()
     info = unwrapped.get_info()
     obs = unwrapped.get_obs(info)
     return obs, info
