@@ -182,13 +182,11 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
             color=[0.0, 0.0, 1.0, 1.0], name="obs_box", body_type="kinematic"
         )
         
-        # 2. Cone
-        obj_path = "/tmp/tall_cone.obj"
-        _create_cone_obj(obj_path, radius=0.06, height=0.45)
-        b_cone = self.scene.create_actor_builder()
-        b_cone.add_convex_collision_from_file(obj_path)
-        b_cone.add_visual_from_file(obj_path)
-        self.cone_obs = b_cone.build_kinematic("obs_cone")
+        # 2. Second Box (replacing Cone)
+        self.box2_obs = actors.build_box(
+            self.scene, half_sizes=[0.03, 0.03, 0.15],
+            color=[0.0, 1.0, 0.0, 1.0], name="obs_box2", body_type="kinematic"
+        )
         
         # 3. Sphere
         self.sphere_obs = actors.build_sphere(
@@ -196,7 +194,7 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
             color=[1.0, 0.5, 0.0, 1.0], name="obs_sphere", body_type="kinematic"
         )
         
-        self.obstacles = [self.box_obs, self.cone_obs, self.sphere_obs]
+        self.obstacles = [self.box_obs, self.box2_obs, self.sphere_obs]
         
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
@@ -212,15 +210,15 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
             mid_pos = (start_pos + goal_pos) / 2.0
             
             # Z offsets for centering based on object type
-            # Box is 30cm tall, so center is 0.15. Cone is 45cm tall, center 0.225. Sphere r=4cm, center=0.04
-            z_offsets = [0.15, 0.225, 0.04]
+            # Box 1 is 30cm tall, center 0.15. Box 2 is 30cm tall, center 0.15. Sphere r=4cm, center=0.04
+            z_offsets = [0.15, 0.15, 0.04]
             
             # To set poses in batched environments (tensor), we need (1, 3) arrays
             def set_pose_batched(actor, pos_np):
                 pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
                 actor.set_pose(Pose.create_from_pq(pos_t))
             
-            # Place both Box (0) and Cone (1) in the middle, spaced apart perpendicularly
+            # Place both Box 1 (0) and Box 2 (1) in the middle, spaced apart perpendicularly
             vec = goal_pos[:2] - start_pos[:2]
             length = np.linalg.norm(vec)
             if length > 1e-4:
@@ -235,12 +233,12 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
             p_box[2] = z_offsets[0]
             set_pose_batched(self.obstacles[0], p_box)
             
-            p_cone = mid_pos.copy()
-            p_cone[:2] -= perp * spacing
-            p_cone[2] = z_offsets[1]
-            set_pose_batched(self.obstacles[1], p_cone)
+            p_box2 = mid_pos.copy()
+            p_box2[:2] -= perp * spacing
+            p_box2[2] = z_offsets[1]
+            set_pose_batched(self.obstacles[1], p_box2)
             
-            placed_positions = [start_pos[:2], goal_pos[:2], p_box[:2], p_cone[:2]]
+            placed_positions = [start_pos[:2], goal_pos[:2], p_box[:2], p_box2[:2]]
             
             # Scatter Sphere (2)
             clutter_indices = [2]
