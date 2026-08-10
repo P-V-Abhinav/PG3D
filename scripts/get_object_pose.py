@@ -1,9 +1,10 @@
+#!/usr/bin/env python
 """
-Utility script to get the ground-truth pose of an object 
+Utility script to get the ground-truth pose of the Banana 
 in the PG3DReach-RealKitchen-v0 environment for a given dataset episode.
 
 Usage:
-    python scripts/get_object_pose.py --dataset /scratch2/abhinav.pv/PG3D_artifacts/pg3d_reach_pose_multimodal_xarm7.zarr --episode 0 --object banana
+    python scripts/get_banana_pose.py --dataset /scratch2/abhinav.pv/PG3D_artifacts/pg3d_reach_pose_multimodal_xarm7.zarr --episode 0
 """
 
 import argparse
@@ -19,13 +20,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--episode", type=int, required=True)
-    parser.add_argument("--object", type=str, default="banana", help="The name of the object to find (e.g., 'banana', 'mug', 'bowl', 'mustard')")
     args = parser.parse_args()
 
     # 1. Open the dataset and find the seed for this episode
-    # metadata.json lives INSIDE the zarr directory
-    import os
-    meta_path = os.path.join(args.dataset, "metadata.json")
+    zarr_root = zarr.open_group(args.dataset, mode="r")
+    meta_path = args.dataset.replace(".zarr", "") + "/metadata.json"
     
     try:
         with open(meta_path, "r") as f:
@@ -43,24 +42,20 @@ def main():
     # 3. Reset the environment using the seed
     env.reset(seed=seed)
     
-    # 4. Find the target object actor
-    target_actor = None
-    target_obj_name = args.object.lower()
+    # 4. Find the banana actor
+    # In obstacle_envs.py, it's created in a loop where banana is index 8: "011_banana_8"
+    banana_actor = None
     for actor in env.unwrapped.scene.get_all_actors():
-        if target_obj_name in actor.name.lower():
-            target_actor = actor
+        if "banana" in actor.name:
+            banana_actor = actor
             break
             
-    if target_actor is None:
-        print(f"❌ Could not find '{args.object}' in the scene!")
-        print("Available objects:")
-        for actor in env.unwrapped.scene.get_all_actors():
-            if actor.name.startswith("0"):
-                print(f"  - {actor.name}")
+    if banana_actor is None:
+        print("❌ Could not find banana in the scene!")
         return
         
     # 5. Extract and print the pose
-    pose = target_actor.pose
+    pose = banana_actor.pose
     def to_1d_numpy(val):
         if hasattr(val, 'cpu'):
             val = val.cpu().numpy()
@@ -69,14 +64,15 @@ def main():
     pos = to_1d_numpy(pose.p)
     quat = to_1d_numpy(pose.q)
     
-    print(f"\n✅ {args.object.capitalize()} Ground-Truth Pose found!")
+    print("\n🍌 Banana Ground-Truth Pose found!")
     print(f"  Position: X = {pos[0]:.4f}, Y = {pos[1]:.4f}, Z = {pos[2]:.4f}")
     
-    # We want to approach from ABOVE the object.
+    # We want to approach from ABOVE the banana.
+    # So we take the banana's X and Y, and add some height (e.g., +15cm) to Z.
     target_z = pos[2] + 0.15
     
-    print(f"\nNext step: Run the IK script targeting a point 15cm above the {args.object}:")
-    print(f"python scripts/get_ik_joint_angles.py --x {pos[0]:.4f} --y {pos[1]:.4f} --z {target_z:.4f} --approach downward")
+    print("\nNext step: Run the IK script targeting a point 15cm above the banana:")
+    print(f"python scripts/get_ik_joint_angles.py --x {pos[0]:.4f} --y {pos[1]:.4f} --z {target_z:.4f} --approach down")
 
 
 if __name__ == "__main__":

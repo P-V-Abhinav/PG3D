@@ -402,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.040                       # Filter out the table surface noise; 40 mm is safe
+    new_bounds[2, 0] = 0.025                       # Filter out the table at Z=0.0; 25 mm above the table surface is safe
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
@@ -611,102 +611,6 @@ def main(argv: list[str] | None = None) -> int:
                     timings_path,
                     start_index=timing_written,
                 )
-
-                # --debug-empty-env: run the same episode on the bare workspace env.
-                # This isolates posture steering from the collision constraint and confirms
-                # whether steering itself is working before blaming the kitchen clutter.
-                if getattr(args, "debug_empty_env", False):
-                    try:
-                        print(
-                            f"\n[debug-empty-env] Running episode {spec.output_index} "
-                            f"on empty workspace env...",
-                            flush=True,
-                        )
-                        import gymnasium as _gym
-                        from pg3d.envs.xarm_adapter import (
-                            register_pg3d_xarm7_gripper_reach_envs as _reg,
-                        )
-                        _reg()
-                        _empty_env = _gym.make(
-                            "PG3DReach-XArm7-Gripper-Workspace-v0",
-                            obs_mode=sim_env.unwrapped.obs_mode
-                            if hasattr(sim_env.unwrapped, "obs_mode")
-                            else "pointcloud",
-                            render_mode="rgb_array",
-                            max_episode_steps=args.max_episode_steps,
-                        )
-                        _empty_ghost = _gym.make(
-                            "PG3DReach-XArm7-Gripper-Workspace-v0",
-                            obs_mode="none",
-                            render_mode="rgb_array",
-                        )
-                        # Build a posture-only constraint list (no collision constraint)
-                        _posture_only: list[Any] = []
-                        if getattr(args, "posture_target_joints", None) is not None:
-                            from pg3d.constraints import JointPostureConstraint
-                            _posture_only.append(
-                                JointPostureConstraint(
-                                    target_q=np.array(
-                                        args.posture_target_joints, dtype=np.float32
-                                    ),
-                                    weight=float(args.posture_weight),
-                                    eval_timestep=args.posture_eval_timestep,
-                                )
-                            )
-                        # Override the goal to match what was used in the kitchen run.
-                        # We re-use the zarr_context target_position (the object XYZ).
-                        _debug_zarr_context = (
-                            zarr_context.copy() if zarr_context is not None else None
-                        )
-                        _debug_output_dir = args.output_dir / "debug_empty_env"
-                        _debug_output_dir.mkdir(parents=True, exist_ok=True)
-                        for _dbg_method in args.methods:
-                            _dbg_row = run_eval_episode(
-                                sim_env=_empty_env,
-                                ghost_env=_empty_ghost,
-                                policy=policy,
-                                adapter=adapter,
-                                method=_dbg_method,
-                                spec=spec,
-                                constraints=_posture_only,
-                                pending_spawn=None,
-                                action_mode=action_mode,
-                                crop_config=crop_config,
-                                goal_thresh=goal_thresh,
-                                output_dir=_debug_output_dir,
-                                max_steps=args.max_steps,
-                                post_success_steps=args.post_success_steps,
-                                planning_horizon_chunks=args.planning_horizon_chunks,
-                                execution_horizon_chunks=args.execution_horizon_chunks,
-                                action_ema_alpha=args.action_ema_alpha,
-                                geometry_mode=args.geometry_mode,
-                                k_schedule=tuple(args.k_schedule),
-                                gripper_open=args.gripper_open,
-                                match_current_robot_points=args.match_current_robot_points,
-                                video=write_video,
-                                rerun=False,
-                                video_fps=args.video_fps,
-                                decisions_file=decisions_file,
-                                step_traces_file=step_traces_file,
-                                rng=rng,
-                                timer=timer,
-                                video_env_factory=None,
-                                zarr_context=_debug_zarr_context,
-                                parallel_pool=parallel_pool,
-                            )
-                            print(
-                                f"[debug-empty-env] method={_dbg_method} "
-                                f"episode={spec.output_index} "
-                                f"reach={_dbg_row['reach_success']}",
-                                flush=True,
-                            )
-                        _empty_env.close()
-                        print("[debug-empty-env] Done.\n", flush=True)
-                    except Exception as _e:
-                        print(f"[debug-empty-env] FAILED: {_e}", flush=True)
-                        import traceback as _tb
-                        _tb.print_exc()
-
                 if should_emit_episode_artifact(spec.output_index, args.plot_every_episodes):
                     _maybe_emit_progress(
                         output_dir=args.output_dir,
@@ -964,31 +868,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--posture-weight",
         type=float,
-        default=0.0,
-        help="Weight for the JointPostureConstraint cost.",
+        default=1.0,
+        help="Weight for the joint posture constraint cost.",
     )
-
-    # New argument to select which object to target in the Kitchen Environment
-    parser.add_argument(
-        "--approach-object",
-        type=str,
-        default="banana",
-        help="The name of the object to target in the kitchen env (e.g. 'banana', 'mug', 'bowl', 'mustard')."
-    )
-
-    # Debug flag: additionally run on empty workspace env to isolate posture steering effect
-    parser.add_argument(
-        "--debug-empty-env",
-        action="store_true",
-        default=False,
-        help=(
-            "Additionally run each episode in the empty PG3DReach-XArm7-Gripper-Workspace-v0 "
-            "env (no obstacles, no collision constraint) using the same goal XYZ and posture "
-            "target. Useful to verify posture steering works in isolation before diagnosing "
-            "kitchen env issues."
-        ),
-    )
-
     parser.add_argument(
         "--posture-eval-timestep",
         choices=["all", "final", "midpoint"],
@@ -2414,33 +2296,6 @@ def _constraints_for_episode(
         obs, info = _reset_to_zarr_episode(env, rollout_seed=spec.seed, zarr_context=zarr_context)
     else:
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
-
-    # --- Banana Goal Override ---
-    # Dynamically find the requested object in the kitchen environment and move the goal marker 5cm above it.
-    unwrapped = env.unwrapped
-    if "Kitchen" in getattr(unwrapped, "__class__").__name__ or hasattr(unwrapped, "ycb_objects"):
-        import numpy as np
-        from mani_skill.utils.structs.pose import Pose
-        target_obj_name = getattr(args, "approach_object", "banana").lower()
-        for actor in unwrapped.scene.get_all_actors():
-            if target_obj_name in actor.name.lower():
-                try:
-                    # Move goal 5cm above object center
-                    p_val = actor.pose.p
-                    if hasattr(p_val, 'cpu'):
-                        p_val = p_val.cpu().numpy()
-                    
-                    obj_p = np.asarray(p_val).reshape(-1).copy()
-                    obj_p[2] += 0.05
-                    
-                    # Convert to tensor with batch dimension (1, 3) for ManiSkill's set_pose
-                    import torch
-                    obj_p_tensor = torch.tensor(obj_p, dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
-                    unwrapped.goal_site.set_pose(Pose.create_from_pq(p=obj_p_tensor))
-                    print(f"[{spec.output_index}] Goal Override: Moved goal to {target_obj_name} at {obj_p.tolist()}")
-                except Exception as e:
-                    print(f"Warning: Failed to override goal for {target_obj_name}: {e}")
-                break
 
     # --- Generalizable point cloud extraction for dynamic collision detection ---
     # We take ONE zero-action step after env.reset() to force ManiSkill's
