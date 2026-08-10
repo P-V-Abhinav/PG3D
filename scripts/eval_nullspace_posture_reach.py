@@ -420,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     # Adjust crop bounds for the obstacle environment
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)
-    new_bounds[2, 0] = 0.005
+    new_bounds[2, 0] = 0.05
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
