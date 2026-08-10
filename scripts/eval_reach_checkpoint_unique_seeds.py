@@ -806,8 +806,6 @@ def _reset_to_zarr_episode(
         p = np.asarray(p).reshape(-1)
         mid_pos[2] = p[2]
         unwrapped.obstacle.set_pose(Pose.create_from_pq(mid_pos.reshape(1, 3)))
-    if getattr(unwrapped, "scene", None) is not None and hasattr(unwrapped.scene, "update_render"):
-        unwrapped.scene.update_render()
     info = unwrapped.get_info()
     obs = unwrapped.get_obs(info)
     return obs, info
@@ -829,68 +827,6 @@ def _apply_zarr_initial_entry(
     )
     result["success"] = False
     return result
-
-
-def _apply_zarr_state_only(
-    entry: dict[str, Any],
-    zarr_context: dict[str, Any],
-) -> dict[str, Any]:
-    """Apply zarr robot state, target, and TCP to a live observation entry.
-
-    Unlike _apply_zarr_initial_entry, this function intentionally keeps the
-    LIVE point_cloud / robot_mask / point_valid_mask that were rendered by the
-    simulator AFTER the obstacle has been teleported to its correct position.
-    This ensures the world model and the policy see the obstacle from the very
-    first timestep, instead of a clean training-time scan that has no obstacle.
-
-    Only the scalar/vector robot-state fields are overwritten from the zarr
-    snapshot so that agent_pos and tcp_pose exactly match the recorded start.
-    """
-    result = dict(entry)
-    # Robot state from zarr: these determine the IK starting config and EEF pose.
-    result["agent_pos"] = np.asarray(zarr_context["state"], dtype=np.float32).copy()
-    result["tcp_pose"] = np.asarray(zarr_context["tcp_pose"], dtype=np.float32).copy()
-    result["target_position"] = np.asarray(
-        zarr_context["target_position"], dtype=np.float32
-    ).copy()
-    # Recompute distance with the zarr TCP and target so early-stop logic is correct.
-    result["final_distance"] = float(
-        np.linalg.norm(
-            np.asarray(result["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
-            - np.asarray(result["target_position"], dtype=np.float32).reshape(3)
-        )
-    )
-    result["success"] = False
-    # point_cloud / robot_mask / point_valid_mask are intentionally NOT touched here:
-    # they come from the live sim-env render which already contains the obstacle.
-    return result
-
-
-def _sync_ghost_to_zarr_start(
-    ghost_env: Any,
-    zarr_context: dict[str, Any],
-) -> None:
-    """Set the ghost env's robot qpos to the zarr episode start configuration.
-
-    After provider.reset(seed=...) the ghost env's arm is at the rest-pose
-    keyframe.  The world model reads q0 from the observation's agent_pos
-    (correctly the zarr start joints), so imagined joint sequences are correct.
-    However, the ghost renderer renders the FIRST imagined step from wherever the
-    ghost arm currently is.  This function snaps the ghost arm to the zarr start
-    so that q0 in the ghost sim matches q0 in the world-model math, eliminating
-    a one-step geometry mismatch.
-    """
-    unwrapped = getattr(ghost_env, "unwrapped", ghost_env)
-    robot = getattr(getattr(unwrapped, "agent", None), "robot", None)
-    if robot is None:
-        return  # ghost env doesn't expose robot — skip silently
-    stored_qpos = np.asarray(zarr_context["state"], dtype=np.float32).reshape(-1)
-    current_qpos = np.asarray(robot.get_qpos(), dtype=np.float32)
-    qpos = current_qpos.copy().reshape(-1)
-    qpos[: stored_qpos.size] = stored_qpos
-    robot.set_qpos(qpos.reshape(current_qpos.shape))
-    if hasattr(robot, "set_qvel"):
-        robot.set_qvel(np.zeros_like(qpos.reshape(current_qpos.shape), dtype=np.float32))
 
 
 def run_fresh_episode(

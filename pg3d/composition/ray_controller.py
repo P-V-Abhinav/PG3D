@@ -428,10 +428,7 @@ def parallel_sample_and_score(
     # Re-sort by original candidate index (map_unordered is non-deterministic order).
     results.sort(key=lambda r: r["index"])
 
-    # Reconstruct CandidateDiagnostics using the central scoring function.
-    # We MUST call controller._score_candidate here rather than relying on the
-    # Ray worker's returned scores, because the worker only knows about the
-    # pointcloud collision constraint and ignores all others (like posture).
+    # Reconstruct CandidateDiagnostics — identical structure to the serial path.
     diagnostics: list[CandidateDiagnostics] = []
     for result, chunk in zip(results, chunks):
         rollout = ImaginedRollout(
@@ -444,14 +441,21 @@ def parallel_sample_and_score(
             metadata=result["rollout_metadata"],
             eef_orientations=result.get("eef_orientations"),
         )
-        diag = controller._score_candidate(
-            controller_input,
+        diag = CandidateDiagnostics(
+            index=result["index"],
+            attempted_k=result["attempted_k"],
             action_chunk=chunk,
             rollout=rollout,
-            attempted_k=result["attempted_k"],
-            index=result["index"],
+            constraint_costs=result["constraint_costs"],
+            constraint_satisfied=result["constraint_satisfied"],
+            feasible=result["feasible"],
+            goal_distance=result["goal_distance"],
+            constraint_penalty=result["constraint_penalty"],
+            smoothness=result["smoothness"],
             consensus_deviation=result["consensus_deviation"],
             policy_surrogate=result["policy_surrogate"],
+            total_score=result["total_score"],
+            directional=result.get("directional", 0.0),
         )
         diagnostics.append(diag)
 

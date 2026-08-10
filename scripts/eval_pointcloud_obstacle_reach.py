@@ -210,9 +210,7 @@ from scripts.compare_world_model_rollout import (
 )
 from scripts.eval_reach_checkpoint_unique_seeds import (
     _apply_zarr_initial_entry,
-    _apply_zarr_state_only,
     _reset_to_zarr_episode,
-    _sync_ghost_to_zarr_start,
     _zarr_episode_context,
 )
 from scripts.rollout_dp3_reach_policy import (
@@ -1210,13 +1208,7 @@ def run_eval_episode(
             crop_config=crop_config,
         )
     if zarr_context is not None:
-        # Fix B: Use _apply_zarr_state_only instead of _apply_zarr_initial_entry.
-        # This keeps the LIVE point cloud (which now contains the obstacle) and
-        # only overwrites robot-state scalars (agent_pos, tcp_pose, target_position)
-        # from the zarr snapshot.  The original _apply_zarr_initial_entry replaced
-        # point_cloud / robot_mask / point_valid_mask with the training-time clean
-        # scan, making the world model blind to the obstacle.
-        sim_entry = _apply_zarr_state_only(sim_entry, zarr_context)
+        sim_entry = _apply_zarr_initial_entry(sim_entry, zarr_context)
     obs_window = make_initial_obs_window(sim_entry, n_obs_steps=int(policy.n_obs_steps))
     target = np.asarray(sim_entry["target_position"], dtype=np.float32).reshape(3)
     scene = scene_context_for_constraints(
@@ -1261,13 +1253,6 @@ def run_eval_episode(
             crop_bounds=crop_config.bounds,
         )
         provider.reset(seed=spec.seed, options={"reconfigure": True})
-        # Fix C: Snap the ghost env arm to the zarr episode start configuration.
-        # After provider.reset() the ghost arm is at the rest-pose keyframe.
-        # The world model reads q0 from observation.agent_pos (zarr start joints),
-        # so the imagined joint sequence is already correct — but the ghost renderer
-        # renders the very first step from rest pose unless we sync it here.
-        if zarr_context is not None:
-            _sync_ghost_to_zarr_start(ghost_env, zarr_context)
         if method != "base":
             world_model = GeometricWorldModel(provider)
 
