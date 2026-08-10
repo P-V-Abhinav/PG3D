@@ -17,7 +17,7 @@ Array = np.ndarray
 ActionMode = Literal["abs_joint", "delta_joint"]
 
 DEFAULT_WORKSPACE_BOUNDS = np.asarray(
-    [[-0.9, 0.7], [-0.6, 0.6], [0.0, 1.1]],
+    [[-0.9, 0.7], [-0.6, 0.6], [0.005, 1.1]],
     dtype=np.float32,
 )
 

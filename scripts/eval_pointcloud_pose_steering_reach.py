@@ -211,7 +211,9 @@ from scripts.compare_world_model_rollout import (
 )
 from scripts.eval_reach_checkpoint_unique_seeds import (
     _apply_zarr_initial_entry,
+    _apply_zarr_state_only,
     _reset_to_zarr_episode,
+    _sync_ghost_to_zarr_start,
     _zarr_episode_context,
 )
 from scripts.rollout_dp3_reach_policy import (
@@ -402,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.05                       # Filter out the table at Z=0.0; 50 mm above the table surface is safe
+    new_bounds[2, 0] = 0.005                       # Filter out the table at Z=0.0
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
@@ -1217,6 +1219,13 @@ def run_eval_episode(
         sim_obs, sim_info = _reset_to_zarr_episode(
             sim_env, rollout_seed=spec.seed, zarr_context=zarr_context
         )
+        # Fix A: Take ONE zero-action step so the SAPIEN renderer re-renders the
+        # scene AFTER _reset_to_zarr_episode has teleported the obstacle to
+        # mid(zarr_start, goal).  Without this step the camera observation still
+        # reflects the pre-teleport obstacle position, giving zero usable
+        # obstacle points in the initial point cloud.
+        _zero_action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        sim_obs, _, _, _, sim_info = sim_env.step(_zero_action)
     else:
         sim_obs, sim_info = sim_env.reset(seed=spec.seed, options={"reconfigure": True})
     video_env: Any | None = None
@@ -1228,7 +1237,10 @@ def run_eval_episode(
             crop_config=crop_config,
         )
     if zarr_context is not None:
-        sim_entry = _apply_zarr_initial_entry(sim_entry, zarr_context)
+        # Fix B: Use _apply_zarr_state_only instead of _apply_zarr_initial_entry.
+        # This keeps the LIVE point cloud (obstacle visible) and only overwrites
+        # robot-state scalars from the zarr snapshot.
+        sim_entry = _apply_zarr_state_only(sim_entry, zarr_context)
     obs_window = make_initial_obs_window(sim_entry, n_obs_steps=int(policy.n_obs_steps))
     target = np.asarray(sim_entry["target_position"], dtype=np.float32).reshape(3)
     scene = scene_context_for_constraints(
@@ -1273,6 +1285,9 @@ def run_eval_episode(
             crop_bounds=crop_config.bounds,
         )
         provider.reset(seed=spec.seed, options={"reconfigure": True})
+        # Fix C: Snap the ghost env arm to the zarr episode start configuration.
+        if zarr_context is not None:
+            _sync_ghost_to_zarr_start(ghost_env, zarr_context)
         if method != "base":
             world_model = GeometricWorldModel(provider)
 
