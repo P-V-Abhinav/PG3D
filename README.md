@@ -262,46 +262,6 @@ uv run rerun artifacts/reach-datasets/world-model-vs-sim/episode_000_comparison.
 Rerun overlays the world-model branch and the live-simulator branch with distinct
 robot-point colors, one `episode_XXX_comparison.rrd` per episode.
 
-### Policy Inference 
-The default environment is the cuboid box placed b/w the start & end goal.
-```bash
-python scripts/eval_real_obstacle_reach.py --checkpoint <path_to_checkpoint> --dataset <path_to_zarr> --output-dir <> --video --rerun
-```
-
-### Policy Inference with environment overrides
-Available Environemnts:
-PG3DReach-XArm7-RealObstacle-v0 (Default Single Box Obstacle)
-PG3DReach-RealConeObstacle-v0 (Tall Cone Obstacle)
-PG3DReach-RealMixedObstacle-v0 (Mixed Box, Cone, and Sphere Obstacles)
-PG3DReach-RealKitchen-v0 (Cluttered Kitchen / YCB Objects)
-
-```bash
- python scripts/eval_pointcloud_pose_steering_reach.py \
-  --checkpoint <> \
-  --dataset <> \
-  --env-id-override PG3DReach-RealKitchen-v0 \
-  --output-dir <> \
-  --video --rerun
-```
-### Policy Inference with Pose Steering
-has the paramaters --posture-eval-timestep all/ final & midpoint
-
-```bash
-python scripts/eval_pointcloud_pose_steering_reach.py \
-  --checkpoint <> \
-  --dataset <> \
-  --output-dir  <> \
-  --posture-target-joints 0.155444 -0.185102 0.336528 0.660438 0.081794 0.845265 0.431773 \
-  --posture-eval-timestep all \
-  --posture-weight 1.0 \
-  --video
-```
-### To extract a Pose for Pose Steering from training dataset
-```bash
-python scripts/extract_target_joints.py --dataset path/to/your/dataset.zarr --episode 0 --fraction 0.5
-```
-
-
 ### Real world lab data creation
 
 ```bash
