@@ -63,6 +63,7 @@ class BaseController:
         controller_input: ControllerInput,
         *,
         rng: np.random.Generator | None = None,
+        perturb_scale: float = 0.0,
     ) -> ControllerResult:
         """Select one candidate action chunk."""
         raise NotImplementedError
@@ -74,6 +75,7 @@ class BaseController:
         attempted_k: int,
         start_index: int,
         rng: np.random.Generator | None,
+        perturb_scale: float = 0.0,
     ) -> list[CandidateDiagnostics]:
         # -------------------------------------------------------------------
         # PARALLEL PATH: delegate to Ray actor pool when one is configured.
@@ -99,6 +101,7 @@ class BaseController:
                 collision_constraint_name=constraint_name,
                 max_robot_points=_extract_max_robot_points(controller_input),
                 task_name=self.parallel_task_name,
+                perturb_scale=perturb_scale,
             )
 
         # -------------------------------------------------------------------
@@ -108,6 +111,12 @@ class BaseController:
         chunks = self.policy.sample_action_chunks(policy_input, k=attempted_k, rng=rng)
         if not chunks:
             return []
+            
+        if perturb_scale > 0.0 and rng is not None:
+            for chunk in chunks:
+                noise = rng.normal(scale=perturb_scale, size=chunk.actions.shape).astype(chunk.actions.dtype)
+                chunk.actions = chunk.actions + noise
+                
         surrogates = optional_policy_surrogate(self.policy, policy_input, chunks)
         consensus = consensus_deviations(chunks)
         diagnostics: list[CandidateDiagnostics] = []
@@ -196,6 +205,7 @@ class RejectionController(BaseController):
         controller_input: ControllerInput,
         *,
         rng: np.random.Generator | None = None,
+        perturb_scale: float = 0.0,
     ) -> ControllerResult:
         candidates: list[CandidateDiagnostics] = []
         attempted: list[int] = []
@@ -206,6 +216,7 @@ class RejectionController(BaseController):
                 attempted_k=k,
                 start_index=len(candidates),
                 rng=rng,
+                perturb_scale=perturb_scale,
             )
             candidates.extend(batch)
             feasible = [candidate for candidate in batch if candidate.feasible]
@@ -222,6 +233,7 @@ class RerankingController(BaseController):
         controller_input: ControllerInput,
         *,
         rng: np.random.Generator | None = None,
+        perturb_scale: float = 0.0,
     ) -> ControllerResult:
         candidates: list[CandidateDiagnostics] = []
         attempted: list[int] = []
@@ -232,6 +244,7 @@ class RerankingController(BaseController):
                 attempted_k=k,
                 start_index=len(candidates),
                 rng=rng,
+                perturb_scale=perturb_scale,
             )
             candidates.extend(batch)
             feasible = [candidate for candidate in candidates if candidate.feasible]

@@ -342,6 +342,7 @@ def parallel_sample_and_score(
     collision_constraint_name: str,
     max_robot_points: int | None,
     task_name: str,
+    perturb_scale: float = 0.0,
 ) -> list[CandidateDiagnostics]:
     """
     Parallel equivalent of BaseController._sample_and_score.
@@ -357,6 +358,11 @@ def parallel_sample_and_score(
     )
     if not chunks:
         return []
+
+    if perturb_scale > 0.0 and rng is not None:
+        for chunk in chunks:
+            noise = rng.normal(scale=perturb_scale, size=chunk.actions.shape).astype(chunk.actions.dtype)
+            chunk.actions = chunk.actions + noise
 
     surrogates = optional_policy_surrogate(controller.policy, policy_input, chunks)
     consensus = consensus_deviations(chunks)

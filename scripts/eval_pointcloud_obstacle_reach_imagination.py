@@ -1583,13 +1583,13 @@ def _select_decision(
                     k_schedule=k_schedule,
                     parallel_pool=parallel_pool,
                     parallel_task_name=getattr(provider, "task_name", "unknown") if provider else "unknown",
-                ).select(controller_input, rng=rng)
+                ).select(controller_input, rng=rng, perturb_scale=0.05 * retry)
                 
             total_candidate_total += len(result.candidates)
             feasible = sum(1 for c in result.candidates if c.feasible)
             total_candidate_feasible += feasible
             
-            print(f"[Imagination Search] Depth {depth} | Retry {retry}/{max_retries - 1} | Checked {len(result.candidates)} candidates | Feasible: {feasible}", flush=True)
+            print(f"[Imagination Search] Depth {depth} | Retry {retry}/{max_retries - 1} | Checked {len(result.candidates)} candidates | Feasible: {feasible} | Perturb: {0.05 * retry:.2f}", flush=True)
             
             if depth == 0 and retry == 0:
                 first_step_least_bad = result.action_chunk
