@@ -1569,10 +1569,25 @@ def _select_decision(
         
         print(f"\n--- [Imagination Search] Depth {depth} Start ---", flush=True)
         for retry in range(max_retries):
+            if retry > 0:
+                obs_perturb_scale = 0.01 * retry
+                perturbed_entry = _copy_entry(search_entry)
+                if "agent_pos" in perturbed_entry:
+                    pos = np.asarray(perturbed_entry["agent_pos"])
+                    perturbed_entry["agent_pos"] = pos + rng.normal(scale=obs_perturb_scale, size=pos.shape).astype(pos.dtype)
+                if "point_cloud" in perturbed_entry:
+                    pts = np.asarray(perturbed_entry["point_cloud"])
+                    perturbed_entry["point_cloud"] = pts + rng.normal(scale=obs_perturb_scale, size=pts.shape).astype(pts.dtype)
+                
+                perturbed_window = [_copy_entry(w) for w in search_window]
+                perturbed_window[-1] = perturbed_entry
+            else:
+                perturbed_window = search_window
+                
             controller_input = ControllerInput(
                 observation=entry_to_world_model_observation(search_entry),
                 scene=scene,
-                policy_input=search_window,
+                policy_input=perturbed_window,
             )
             
             with timer.time("candidate_scoring", method=method, geometry_mode=geometry_mode):
@@ -1583,13 +1598,13 @@ def _select_decision(
                     k_schedule=k_schedule,
                     parallel_pool=parallel_pool,
                     parallel_task_name=getattr(provider, "task_name", "unknown") if provider else "unknown",
-                ).select(controller_input, rng=rng, perturb_scale=0.05 * retry)
+                ).select(controller_input, rng=rng, perturb_scale=0.08 * retry)
                 
             total_candidate_total += len(result.candidates)
             feasible = sum(1 for c in result.candidates if c.feasible)
             total_candidate_feasible += feasible
             
-            print(f"[Imagination Search] Depth {depth} | Retry {retry}/{max_retries - 1} | Checked {len(result.candidates)} candidates | Feasible: {feasible} | Perturb: {0.05 * retry:.2f}", flush=True)
+            print(f"[Imagination Search] Depth {depth} | Retry {retry}/{max_retries - 1} | Checked {len(result.candidates)} candidates | Feasible: {feasible} | ActPerturb: {0.08 * retry:.2f} | ObsPerturb: {0.01 * retry if retry > 0 else 0.0:.2f}", flush=True)
             
             if depth == 0 and retry == 0:
                 first_step_least_bad = result.action_chunk
@@ -1635,7 +1650,7 @@ def _select_decision(
             print(f"[Imagination Search] -> Exhausted all {max_retries} retries at depth {depth}. Aborting search.", flush=True)
             break
 
-    if found_path_to_goal and len(safe_chunks) > 0:
+    if len(safe_chunks) > 0:
         concatenated_actions = np.concatenate([c.actions for c in safe_chunks], axis=0)
         mega_chunk = ActionChunk(
             actions=concatenated_actions,
@@ -1648,7 +1663,7 @@ def _select_decision(
             result=safe_first_result,
             candidate_feasible=total_candidate_feasible,
             candidate_total=total_candidate_total,
-            selection_reason="safe_imagined_trajectory",
+            selection_reason="deep_search_concatenated" if found_path_to_goal else "partial_search_concatenated",
         )
     else:
         return EvalDecisionSummary(
