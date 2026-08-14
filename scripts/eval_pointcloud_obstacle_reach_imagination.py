@@ -2408,7 +2408,7 @@ def _constraints_for_episode(
     start_pos = np.asarray(entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
     dists_to_start = np.linalg.norm(env_points - start_pos, axis=1)
     
-    obstacle_points = env_points[(dists_to_target > DEFAULT_GOAL_MARKER_RADIUS) & (dists_to_start > DEFAULT_GOAL_MARKER_RADIUS)]
+    obstacle_points = env_points[(dists_to_target > 0.10) & (dists_to_start > 0.10)]
 
     # Apply Farthest Point Sampling to get maximally spread representative points.
     # FPS ensures the collision checker sees the full spatial extent of the obstacle
