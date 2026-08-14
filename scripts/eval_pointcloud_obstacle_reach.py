@@ -401,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     #    (now ONLY the obstacle) gets the remaining 768 points.
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.005                       # Filter out the table at Z=0.0
+    new_bounds[2, 0] = 0.08                        # Filter out the table completely (8 cm threshold)
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,
@@ -1239,6 +1239,7 @@ def run_eval_episode(
             video_env_factory=video_env_factory,
             spec=spec,
             constraints=constraints,
+            zarr_context=zarr_context,
             color=constraint_overlay_color,
             alpha=constraint_overlay_alpha,
         )
@@ -3486,6 +3487,7 @@ def _maybe_create_overlay_video_env(
     video_env_factory: Callable[[], Any] | None,
     spec: RolloutSpec,
     constraints: list[Any],
+    zarr_context: Any = None,
     color: tuple[float, float, float, float] = (1.0, 0.0, 1.0, 0.2),
     alpha: float = 0.2,
 ) -> Any | None:
@@ -3502,7 +3504,12 @@ def _maybe_create_overlay_video_env(
         if not all(getattr(c, "region", None) is not None for c in constraints):
             return None
         video_env = video_env_factory()
-        video_env.reset(seed=spec.seed, options={"reconfigure": True})
+        if zarr_context is not None:
+            _reset_to_zarr_episode(
+                video_env, rollout_seed=spec.seed, zarr_context=zarr_context
+            )
+        else:
+            video_env.reset(seed=spec.seed, options={"reconfigure": True})
         _add_constraint_overlay_actors(
             video_env,
             constraints=constraints,
