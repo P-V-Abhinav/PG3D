@@ -1328,11 +1328,17 @@ def run_eval_episode(
                 step=steps,
                 decision=decision,
             )
-            steps_to_execute = min(
-                decision.selected_chunk.horizon,
-                int(policy.n_action_steps) * execution_horizon_chunks,
-                max_steps - steps,
-            )
+            if decision.selection_reason == "safe_imagined_trajectory":
+                steps_to_execute = min(
+                    decision.selected_chunk.horizon,
+                    max_steps - steps,
+                )
+            else:
+                steps_to_execute = min(
+                    decision.selected_chunk.horizon,
+                    int(policy.n_action_steps) * execution_horizon_chunks,
+                    max_steps - steps,
+                )
             if replans == 1:
                 print(
                     "action chunk diagnostic: "
@@ -1551,7 +1557,7 @@ def _select_decision(
     controller_cls = RejectionController if method == "rejection" else RerankingController
     
     found_path_to_goal = False
-    safe_first_chunk = None
+    safe_chunks = []
     safe_first_result = None
     
     total_candidate_feasible = 0
@@ -1560,6 +1566,7 @@ def _select_decision(
     for depth in range(max_search_depth):
         chunk_safe = False
         
+        print(f"\n--- [Imagination Search] Depth {depth} Start ---", flush=True)
         for retry in range(max_retries):
             controller_input = ControllerInput(
                 observation=entry_to_world_model_observation(search_entry),
@@ -1581,6 +1588,8 @@ def _select_decision(
             feasible = sum(1 for c in result.candidates if c.feasible)
             total_candidate_feasible += feasible
             
+            print(f"[Imagination Search] Depth {depth} | Retry {retry}/{max_retries - 1} | Checked {len(result.candidates)} candidates | Feasible: {feasible}", flush=True)
+            
             if depth == 0 and retry == 0:
                 first_step_least_bad = result.action_chunk
                 first_step_least_bad_result = result
@@ -1589,11 +1598,12 @@ def _select_decision(
                 first_step_least_bad_result = result
             
             if result.selected.feasible:
+                safe_chunks.append(result.action_chunk)
                 if depth == 0:
-                    safe_first_chunk = result.action_chunk
                     safe_first_result = result
                 
                 rollout = result.selected.rollout
+                print(f"[Imagination Search] -> Found safe candidate! Advancing New_Start. (Goal Dist: {result.selected.goal_distance:.4f})", flush=True)
                 for step_idx in range(rollout.action_chunk.horizon):
                     search_entry = world_model_entry_from_rollout_step(
                         rollout,
@@ -1610,19 +1620,30 @@ def _select_decision(
                 
                 chunk_safe = True
                 if result.selected.goal_distance < goal_thresh:
+                    print(f"[Imagination Search] -> Reached goal! Terminating search.", flush=True)
                     found_path_to_goal = True
                 
                 break 
+            else:
+                print(f"[Imagination Search] -> All candidates collided! Discarding chunk, staying at New_Start.", flush=True)
         
         if found_path_to_goal:
             break
             
         if not chunk_safe:
+            print(f"[Imagination Search] -> Exhausted all {max_retries} retries at depth {depth}. Aborting search.", flush=True)
             break
 
-    if found_path_to_goal and safe_first_chunk is not None:
+    if found_path_to_goal and len(safe_chunks) > 0:
+        concatenated_actions = np.concatenate([c.actions for c in safe_chunks], axis=0)
+        mega_chunk = ActionChunk(
+            actions=concatenated_actions,
+            action_mode=safe_chunks[0].action_mode,
+            dt=safe_chunks[0].dt,
+            metadata={"concatenated": True, "num_chunks": len(safe_chunks)},
+        )
         return EvalDecisionSummary(
-            selected_chunk=safe_first_chunk,
+            selected_chunk=mega_chunk,
             result=safe_first_result,
             candidate_feasible=total_candidate_feasible,
             candidate_total=total_candidate_total,
