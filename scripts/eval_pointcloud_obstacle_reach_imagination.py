@@ -1329,7 +1329,11 @@ def run_eval_episode(
                 step=steps,
                 decision=decision,
             )
-            if decision.selection_reason == "safe_imagined_trajectory":
+            if decision.selection_reason in (
+                "safe_imagined_trajectory",
+                "deep_search_concatenated",
+                "partial_search_concatenated",
+            ):
                 steps_to_execute = min(
                     decision.selected_chunk.horizon,
                     max_steps - steps,
