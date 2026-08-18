@@ -169,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
             random_orientation=args.random_orientation,
             orientation_mode=args.orientation_mode,
+            action_ema_alpha=args.action_ema_alpha,
         )
 
         def process_new_episodes(seed_val, new_episodes_list):
@@ -517,11 +518,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "miss e.g. downward_arc for a seed"
         ),
     )
+    _cone_mode_names = _cone_orientation_names(max_tilt_deg=60, tilt_steps=3, azimuth_steps=8)
     parser.add_argument(
         "--orientation-mode",
         default="all",
-        choices=["all", "downward", "pitch_30", "pitch_45", "pitch_60", "horizontal_front"],
-        help="Generate data for a specific orientation mode, or all of them."
+        choices=["all", "downward", "pitch_30", "pitch_45", "pitch_60", "horizontal_front"] + _cone_mode_names,
+        help="Generate data for a specific orientation mode, or 'all' for the full cone set."
+    )
+    parser.add_argument(
+        "--action-ema-alpha",
+        type=float,
+        default=0.6,
+        help="EMA smoothing factor applied to planned joint positions during replay. 1.0=no smoothing.",
     )
     parser.add_argument(
         "--show-planner-output",
@@ -954,6 +962,7 @@ def _collect_multimodal_episodes(
     viewer_step_delay: float = 0.0,
     random_orientation: bool = False,
     orientation_mode: str = "all",
+    action_ema_alpha: float = 0.6,
 ) -> list[ReachEpisodeData]:
     obs, info = env.reset(seed=seed, options={"reconfigure": True})
     _render_viewer_frame(env, viewer_step_delay)
@@ -1061,13 +1070,14 @@ def _collect_multimodal_episodes(
                 "random": ori_quat_sapien
             }
         else:
-            all_orientations = {
-                "downward": np.array([0.0000, 1.0000, 0.0000, 0.0000], dtype=np.float32),
+            all_orientations = _build_cone_orientations(max_tilt_deg=60, tilt_steps=3, azimuth_steps=8)
+            # Add legacy named modes for backward compatibility.
+            all_orientations.update({
                 "pitch_30": np.array([0.0000, 0.9659, 0.0000, -0.2588], dtype=np.float32),
                 "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32),
                 "pitch_60": np.array([0.0000, 0.8660, 0.0000, -0.5000], dtype=np.float32),
                 "horizontal_front": np.array([0.0000, 0.7071, 0.0000, -0.7071], dtype=np.float32),
-            }
+            })
             if orientation_mode == "all":
                 target_orientations = all_orientations
             else:
@@ -1199,6 +1209,7 @@ def _collect_multimodal_episodes(
             info=info,
             positions=variant["positions"],
             saliency_config=saliency_config,
+            action_ema_alpha=action_ema_alpha,
             viewer_step_delay=viewer_step_delay,
             metadata={
                 "seed": seed,
@@ -1260,6 +1271,7 @@ def _replay_planned_positions_as_episode(
     saliency_config: PointCloudSaliencyConfig | None,
     metadata: dict[str, Any],
     viewer_step_delay: float = 0.0,
+    action_ema_alpha: float = 0.6,
 ) -> ReachEpisodeData | None:
     unwrapped = env.unwrapped
     rows: list[dict[str, np.ndarray]] = []
@@ -1270,8 +1282,14 @@ def _replay_planned_positions_as_episode(
     hold_steps_recorded = 0
     settle_steps_recorded = 0
     planned_step_limit = max(1, max_steps - settle_steps)
+    ema_qpos: np.ndarray | None = None
     for planned_qpos in positions[:planned_step_limit]:
-        sim_action = _format_sim_action(env, planned_qpos)
+        # Apply EMA smoothing to planned joint positions (matches inference-time smoothing).
+        if ema_qpos is None or action_ema_alpha >= 1.0:
+            ema_qpos = planned_qpos
+        else:
+            ema_qpos = action_ema_alpha * planned_qpos + (1.0 - action_ema_alpha) * ema_qpos
+        sim_action = _format_sim_action(env, ema_qpos)
         row = _dataset_row_from_obs(
             obs=obs,
             info=info,
@@ -2521,6 +2539,73 @@ def _pose_with_orientation(sapien: Any, *, position: np.ndarray, quat: np.ndarra
         p=np.asarray(position, dtype=np.float32).reshape(3),
         q=np.asarray(quat, dtype=np.float32).reshape(4),
     )
+
+
+def _build_cone_orientations(
+    max_tilt_deg: float = 60.0,
+    tilt_steps: int = 3,
+    azimuth_steps: int = 8,
+) -> dict[str, np.ndarray]:
+    """Build a dictionary of SAPIEN [w,x,y,z] quaternions covering a cone of approach angles.
+
+    The base orientation is gripper-downward (SAPIEN [0,1,0,0]).  Each entry tilts it
+    by ``theta`` degrees away from vertical, in ``azimuth_steps`` equally-spaced compass
+    directions.  Downward (theta=0) is always included as the "downward" key.
+
+    Args:
+        max_tilt_deg: Half-angle of the cone in degrees (e.g. 60).
+        tilt_steps: Number of discrete tilt levels between 0 and max_tilt_deg (exclusive
+            of 0 — downward is added separately).
+        azimuth_steps: Number of equally-spaced compass azimuths per tilt level.
+
+    Returns:
+        Ordered dict: ``{"downward": ..., "cone_t20_p000": ..., ...}``
+    """
+    from scipy.spatial.transform import Rotation
+
+    orientations: dict[str, np.ndarray] = {}
+    # Base downward orientation in scipy [x,y,z,w] (180° around X-axis).
+    base_rot = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
+
+    # Straight downward — always included.
+    q_scipy = base_rot.as_quat()  # [x,y,z,w]
+    orientations["downward"] = np.array(
+        [q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]], dtype=np.float32
+    )
+
+    tilt_angles = np.linspace(0, max_tilt_deg, tilt_steps + 1)[1:]  # exclude 0°
+    azimuth_angles = np.linspace(0, 360, azimuth_steps, endpoint=False)
+
+    for theta_deg in tilt_angles:
+        theta_rad = np.deg2rad(theta_deg)
+        for phi_deg in azimuth_angles:
+            phi_rad = np.deg2rad(phi_deg)
+            # Tilt axis lies in the XY plane at azimuth phi.
+            tilt_axis = np.array([np.cos(phi_rad), np.sin(phi_rad), 0.0])
+            tilt_rot = Rotation.from_rotvec(tilt_axis * theta_rad)
+            final_rot = tilt_rot * base_rot
+            q = final_rot.as_quat()  # scipy [x,y,z,w]
+            # Convert to SAPIEN [w,x,y,z].
+            sapien_q = np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+            name = f"cone_t{int(round(theta_deg)):02d}_p{int(round(phi_deg)):03d}"
+            orientations[name] = sapien_q
+
+    return orientations
+
+
+def _cone_orientation_names(
+    max_tilt_deg: float = 60.0,
+    tilt_steps: int = 3,
+    azimuth_steps: int = 8,
+) -> list[str]:
+    """Return just the string keys that ``_build_cone_orientations`` would produce."""
+    names = ["downward"]
+    tilt_angles = np.linspace(0, max_tilt_deg, tilt_steps + 1)[1:]
+    azimuth_angles = np.linspace(0, 360, azimuth_steps, endpoint=False)
+    for theta_deg in tilt_angles:
+        for phi_deg in azimuth_angles:
+            names.append(f"cone_t{int(round(theta_deg)):02d}_p{int(round(phi_deg)):03d}")
+    return names
 
 
 def _tcp_pose(unwrapped_env: Any) -> np.ndarray:
