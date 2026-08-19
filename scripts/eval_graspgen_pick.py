@@ -242,26 +242,12 @@ def load_graspgen_sampler(config_path: str | Path) -> Any:
             "Activate the GraspGen venv before running this script.\n"
             f"  (Import error: {_graspgen_err})"  # type: ignore[name-defined]
         )
+    
     # User requested to disable outlier removal since we only have 1 object.
-    # We monkeypatch the graspmoe and point_cloud_utils modules directly here.
+    # We monkeypatch the graspmoe module directly here.
     import grasp_gen.samplers.graspmoe as graspmoe_mod
-    for attr in dir(graspmoe_mod):
-        if "outlier" in attr.lower():
-            setattr(graspmoe_mod, attr, lambda pc, *args, **kwargs: pc)
-
-    try:
-        import grasp_gen.utils.point_cloud_utils as pcu_mod
-        for attr in dir(pcu_mod):
-            if "outlier" in attr.lower():
-                setattr(pcu_mod, attr, lambda pc, *args, **kwargs: (pc, []) if "return_index" in str(getattr(pcu_mod, attr)) else pc)
-                
-        # Also explicitly override any known open3d wrapper functions
-        if hasattr(pcu_mod, "remove_statistical_outlier"):
-            pcu_mod.remove_statistical_outlier = lambda pc, *args, **kwargs: pc
-        if hasattr(pcu_mod, "remove_outliers"):
-            pcu_mod.remove_outliers = lambda pc, *args, **kwargs: pc
-    except ImportError:
-        pass
+    if hasattr(graspmoe_mod, "_statistical_outlier_removal"):
+        graspmoe_mod._statistical_outlier_removal = lambda pts, **kwargs: pts
 
     config_path = str(config_path)
     print(f"[GraspGen] Loading config: {config_path}", flush=True)
@@ -319,20 +305,8 @@ def _run_graspgen(
         Both arrays are concatenated across the diffusion and OBB branches.
         Returns empty arrays if fewer than 10 points survive outlier removal.
     """
-    # --- FOOLPROOF OUTLIER BYPASS ---
-    # Since we don't know the exact class/method doing outlier removal in graspmoe,
-    # and it uses k=20 and thresh=0.014m, we can organically bypass it by duplicating
-    # every point 21 times with microscopic jitter. The nearest 20 neighbors will 
-    # then always be within 0.1mm, safely passing the 14mm threshold!
-    if object_crop.shape[0] > 0:
-        np.random.seed(42)  # Deterministic jitter
-        jitter = np.random.normal(0, 1e-4, size=(21, object_crop.shape[0], 3)).astype(np.float32)
-        dense_crop = (object_crop[None, ...] + jitter).reshape(-1, 3)
-    else:
-        dense_crop = object_crop
-        
     result = run_graspmoe(
-        object_pc=dense_crop,
+        object_pc=object_crop,
         grasp_sampler=sampler,
         grasp_threshold=grasp_threshold,
         num_grasps=num_grasps,
