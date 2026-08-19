@@ -1585,7 +1585,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--robot-clearance-stride", type=int, default=4)
 
     # --- Misc ---
-    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--plots", action="store_true")
     p.add_argument("--profile", action="store_true")
