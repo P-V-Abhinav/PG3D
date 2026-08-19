@@ -384,10 +384,12 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         super()._initialize_episode(env_idx, options)
         with torch.device(self.device):
             rng = np.random.default_rng(self._episode_seed)
-            goal_pos = self.goal_site.pose.p[0].cpu().numpy()
+            # Sample random location far enough but within reach
+            rx = rng.uniform(0.25, 0.55)
+            ry = rng.uniform(-0.3, 0.3)
             
-            # Cheezit lying flat on the table, using the XY of the originally sampled goal
-            pos_t = torch.tensor([goal_pos[0], goal_pos[1], 0.02], dtype=torch.float32, device=self.device).unsqueeze(0)
+            # Cheezit box upright on the table (Z offset ~10.5cm so it doesn't clip through)
+            pos_t = torch.tensor([rx, ry, 0.105], dtype=torch.float32, device=self.device).unsqueeze(0)
             
             # Random rotation around Z axis
             theta = rng.uniform(0, 2 * np.pi)
