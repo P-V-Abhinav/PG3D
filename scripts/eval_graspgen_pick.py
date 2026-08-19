@@ -242,6 +242,13 @@ def load_graspgen_sampler(config_path: str | Path) -> Any:
             "Activate the GraspGen venv before running this script.\n"
             f"  (Import error: {_graspgen_err})"  # type: ignore[name-defined]
         )
+    
+    # User requested to disable outlier removal since we only have 1 object.
+    # We monkeypatch the graspmoe module directly here.
+    import grasp_gen.samplers.graspmoe as graspmoe_mod
+    if hasattr(graspmoe_mod, "_statistical_outlier_removal"):
+        graspmoe_mod._statistical_outlier_removal = lambda pts, **kwargs: pts
+
     config_path = str(config_path)
     print(f"[GraspGen] Loading config: {config_path}", flush=True)
     cfg = load_grasp_cfg(config_path)
