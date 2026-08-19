@@ -1292,6 +1292,7 @@ def run_eval_episode(
     terminated_or_truncated = False
     was_training = policy.training
     policy.eval()
+    decisions: list[Any] = []
     try:
         while steps < max_steps:
             if first_success_step is not None and observed_post_success_steps >= post_success_steps:
@@ -1315,6 +1316,7 @@ def run_eval_episode(
                 timer=timer,
                 parallel_pool=parallel_pool,
             )
+            decisions.append((steps, decision))
             replans += 1
             if decision.result is not None:
                 candidate_feasible += decision.candidate_feasible
@@ -1467,7 +1469,7 @@ def run_eval_episode(
     if rerun:
         rerun_path = output_dir / "rerun" / method / f"episode_{spec.output_index:03d}.rrd"
         with timer.time("rerun_write", method=method):
-            save_rerun_timeline(rerun_path, timeline, constraints=constraints)
+            save_rerun_timeline(rerun_path, timeline, constraints=constraints, decisions=decisions)
     robot_clearance_points: np.ndarray | None = None
     if robot_clearance_metric and constraints and provider is not None:
         try:

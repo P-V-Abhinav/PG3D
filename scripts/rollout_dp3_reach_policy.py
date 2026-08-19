@@ -726,6 +726,7 @@ def save_rerun_timeline(
     timeline: list[dict[str, np.ndarray | bool | float]],
     *,
     constraints: list[object] | None = None,
+    decisions: list[Any] | None = None,
 ) -> None:
     try:
         import rerun as rr
@@ -771,6 +772,34 @@ def save_rerun_timeline(
         tcp = np.asarray(entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3].reshape(1, 3)
         if np.all(np.isfinite(tcp)):
             rr.log("world/tcp", rr.Points3D(tcp, colors=[255, 220, 0]))
+
+        if decisions is not None:
+            active_decision = None
+            for d_step, d in decisions:
+                if d_step <= step_idx:
+                    active_decision = d
+                else:
+                    break
+            if active_decision is not None and getattr(active_decision, "result", None) is not None:
+                result = active_decision.result
+                rejected_paths = []
+                for candidate in result.candidates:
+                    if candidate is not result.selected:
+                        path = np.asarray(candidate.rollout.eef_path, dtype=np.float32)
+                        if path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3:
+                            rejected_paths.append(path)
+                if rejected_paths:
+                    rr.log(
+                        "world/predicted_trajectories/rejected",
+                        rr.LineStrips3D(rejected_paths, colors=[100, 100, 100, 128], radii=0.001),
+                    )
+                
+                selected_path = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)
+                if selected_path.ndim == 2 and selected_path.shape[0] >= 2 and selected_path.shape[1] == 3:
+                    rr.log(
+                        "world/predicted_trajectories/selected",
+                        rr.LineStrips3D([selected_path], colors=[0, 255, 255, 255], radii=0.003),
+                    )
     rr.disconnect()
 
 
