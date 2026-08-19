@@ -1464,12 +1464,13 @@ def _import_run_eval_episode():
 
 try:
     run_eval_episode = _import_run_eval_episode()
-except Exception as _ree_err:
+except Exception as e:
+    _import_err_msg = str(e)
     def run_eval_episode(*args, **kwargs):  # type: ignore[misc]
         raise RuntimeError(
             "Could not import run_eval_episode from "
             "eval_pointcloud_pose_steering_reach.py: "
-            f"{_ree_err}"
+            f"{_import_err_msg}"
         )
 
 
