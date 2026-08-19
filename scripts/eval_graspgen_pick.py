@@ -468,7 +468,7 @@ def _build_graspgen_constraint(
             target_position=target_xyz,
             target_orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # identity
             position_tolerance=float(getattr(args, "grasp_position_tolerance", 0.03)),
-            rotation_tolerance=float("inf"),   # ignore rotation
+            rotation_tolerance=3.15,   # max possible rotation error is pi, satisfies _validate_finite
             weight=float(getattr(args, "grasp_weight", 2.0)),
             name="graspgen_fallback_position_only",
         )
@@ -492,7 +492,7 @@ def _build_graspgen_constraint(
             target_position=target_xyz,
             target_orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             position_tolerance=float(getattr(args, "grasp_position_tolerance", 0.03)),
-            rotation_tolerance=float("inf"),
+            rotation_tolerance=3.15,
             weight=float(getattr(args, "grasp_weight", 2.0)),
             name="graspgen_fallback_position_only",
         )
