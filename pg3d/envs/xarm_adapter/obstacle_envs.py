@@ -364,21 +364,21 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
 
 
 # ---------------------------------------------------------------------------
-# Just Banana Environment (YCB Banana)
+# Just Banana Environment (Now Cheezit Box)
 # ---------------------------------------------------------------------------
 @register_env("jstbanana-v0", max_episode_steps=100)
 class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     def _load_scene(self, options: dict[str, Any] | None) -> None:
         super()._load_scene(options)
         
-        model_id = "011_banana"
+        model_id = "003_cracker_box"
         try:
             builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
             builder.set_scene_idxs(None)
-            self.banana = builder.build_kinematic(name=f"{model_id}")
+            self.cheezit = builder.build_kinematic(name=f"{model_id}")
         except Exception as e:
             print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
-            self.banana = actors.build_box(self.scene, half_sizes=[0.02, 0.08, 0.02], color=[1, 1, 0, 1], name="fallback_banana", body_type="kinematic")
+            self.cheezit = actors.build_box(self.scene, half_sizes=[0.02, 0.08, 0.02], color=[1, 1, 0, 1], name="fallback_cheezit", body_type="kinematic")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
@@ -386,15 +386,15 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             rng = np.random.default_rng(self._episode_seed)
             goal_pos = self.goal_site.pose.p[0].cpu().numpy()
             
-            # Banana lying flat on the table, using the XY of the originally sampled goal
-            pos_t = torch.tensor([goal_pos[0], goal_pos[1], 0.05], dtype=torch.float32, device=self.device).unsqueeze(0)
+            # Cheezit lying flat on the table, using the XY of the originally sampled goal
+            pos_t = torch.tensor([goal_pos[0], goal_pos[1], 0.02], dtype=torch.float32, device=self.device).unsqueeze(0)
             
             # Random rotation around Z axis
             theta = rng.uniform(0, 2 * np.pi)
             q_t = torch.tensor([np.cos(theta/2), 0, 0, np.sin(theta/2)], dtype=torch.float32, device=self.device).unsqueeze(0)
             
-            self.banana.set_pose(Pose.create_from_pq(p=pos_t, q=q_t))
-            # Move the goal marker to be exactly at the banana's centroid.
+            self.cheezit.set_pose(Pose.create_from_pq(p=pos_t, q=q_t))
+            # Move the goal marker to be exactly at the cheezit's centroid.
             self.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
 
     @property
