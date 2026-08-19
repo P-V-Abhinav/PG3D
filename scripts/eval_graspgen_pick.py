@@ -1575,7 +1575,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=[1.0, 0.0, 1.0, 0.2])
 
     # --- Artifact selection ---
-    p.add_argument("--artifact-selection", choices=["first", "random", "all"], default="first")
+    p.add_argument("--artifact-selection", choices=["periodic", "random", "all"], default="periodic")
     p.add_argument("--artifact-episode-count", type=int, default=3)
     p.add_argument("--artifact-selection-seed", type=int, default=0)
     p.add_argument("--plot-every-episodes", type=int, default=5)
