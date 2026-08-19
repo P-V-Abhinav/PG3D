@@ -1449,17 +1449,15 @@ def main(argv: list[str] | None = None) -> int:
 # import directly, so we import the equivalent from pose steering via sys.path.
 # This is the standard pattern used throughout the codebase.
 def _import_run_eval_episode():
-    """Lazy import of run_eval_episode from eval_pointcloud_pose_steering_reach."""
-    import importlib.util
-    script_path = Path(__file__).parent / "eval_pointcloud_pose_steering_reach.py"
-    spec_mod = importlib.util.spec_from_file_location(
-        "_pose_steering_reach", str(script_path)
-    )
-    if spec_mod is None or spec_mod.loader is None:
-        raise ImportError(f"Cannot load module from {script_path}")
-    mod = importlib.util.module_from_spec(spec_mod)
-    spec_mod.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod.run_eval_episode
+    import sys
+    from pathlib import Path
+    
+    script_dir = str(Path(__file__).parent.resolve())
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+        
+    import eval_pointcloud_pose_steering_reach
+    return eval_pointcloud_pose_steering_reach.run_eval_episode
 
 
 try:
