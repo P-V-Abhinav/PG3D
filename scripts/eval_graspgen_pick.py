@@ -1526,7 +1526,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Rotation tolerance (rad) for CartesianPoseConstraint.satisfied(). 0.1745 rad = 10 degrees.")
 
     # --- Episode / source ---
-    p.add_argument("--source", choices=["dataset", "random"], default="random")
+    p.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--seed-start", type=int, default=0)
     p.add_argument("--episode-indices", type=int, nargs="+", default=None)
