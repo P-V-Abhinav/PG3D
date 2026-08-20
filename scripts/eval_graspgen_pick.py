@@ -627,7 +627,7 @@ def _show_graspgen_viser(
         for j, seg in enumerate(lines):
             server.scene.add_line_segments(
                 f"grasps/{'best' if i == best_idx else i}/{j}",
-                points=seg,
+                points=np.expand_dims(seg, 0),  # (1, 2, 3) for 1 line segment
                 colors=np.tile(color, (2, 1)),
                 line_width=2.0 if i == best_idx else 1.0,
             )
