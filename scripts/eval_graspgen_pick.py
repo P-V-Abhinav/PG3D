@@ -305,16 +305,26 @@ def _run_graspgen(
         Both arrays are concatenated across the diffusion and OBB branches.
         Returns empty arrays if fewer than 10 points survive outlier removal.
     """
+    # Center the point cloud so the model sees it near the origin
+    centroid = np.mean(object_crop, axis=0)
+    centered_crop = object_crop - centroid
+
     result = run_graspmoe(
-        object_pc=object_crop,
+        object_pc=centered_crop,
         grasp_sampler=sampler,
         grasp_threshold=grasp_threshold,
         num_grasps=num_grasps,
         topk_num_grasps=-1,   # keep all; we pick best ourselves
     )
     grasps_diff = result["grasps_diff"]   # (Nd, 4, 4)
+    if grasps_diff.shape[0] > 0:
+        grasps_diff[:, :3, 3] += centroid
+        
     scores_diff = result["scores_diff"]   # (Nd,)
     grasps_obb  = result["grasps_obb"]    # (No, 4, 4)
+    if grasps_obb.shape[0] > 0:
+        grasps_obb[:, :3, 3] += centroid
+        
     scores_obb  = result["scores_obb"]    # (No,)
 
     if grasps_diff.shape[0] > 0 and grasps_obb.shape[0] > 0:
@@ -571,9 +581,6 @@ def _build_graspgen_constraint(
         f"[GraspGen] Episode {spec.output_index}: "
         f"CartesianPoseConstraint  pos_tol={pos_tol:.3f}m  "
         f"rot_tol={rot_tol:.3f}rad  weight={weight:.1f}",
-        flush=True,
-    )
-
     constraints: list[Any] = [constraint]
 
     # Optionally stack a joint posture constraint (same as pose steering eval)
@@ -1334,7 +1341,26 @@ def main(argv: list[str] | None = None) -> int:
                 write_video = args.video and spec.output_index in video_episode_indices
                 write_rerun = args.rerun and spec.output_index in rerun_episode_indices
 
-                for method in args.methods:
+                import scripts.eval_pointcloud_pose_steering_reach as eval_module
+                orig_entry_to_wm = eval_module.entry_to_world_model_observation
+                
+                def masked_entry_to_wm(entry):
+                    obs = orig_entry_to_wm(entry)
+                    target_xyz = np.asarray(entry["target_position"], dtype=np.float32).reshape(-1)[:3]
+                    dists = np.linalg.norm(obs.point_cloud - target_xyz.reshape(1, 3), axis=1)
+                    # Mask out points within 20cm of the goal so they are not treated as obstacles
+                    mask = (dists < 0.20)
+                    new_robot_mask = obs.robot_mask | mask
+                    import dataclasses
+                    if dataclasses.is_dataclass(obs):
+                        return dataclasses.replace(obs, robot_mask=new_robot_mask)
+                    else:
+                        return obs._replace(robot_mask=new_robot_mask)
+                
+                eval_module.entry_to_world_model_observation = masked_entry_to_wm
+
+                try:
+                    for method in args.methods:
                     row = run_eval_episode(
                         sim_env=sim_env,
                         ghost_env=ghost_env,
@@ -1401,6 +1427,9 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"  Achieved Rot Error: {pm['rotation_error_at_min_position']:.4f} rad (at best position)")
                         print(f"  Strictly Satisfied: {pm['satisfied']} (within {pm['position_tolerance']}m and {pm['rotation_tolerance']:.4f}rad)")
                         print("=============================\n", flush=True)
+                finally:
+                    eval_module.entry_to_world_model_observation = orig_entry_to_wm
+                    
                 timing_written = _write_new_timing_events(
                     timer, timings_path, start_index=timing_written
                 )
