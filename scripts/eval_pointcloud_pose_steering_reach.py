@@ -1559,26 +1559,13 @@ def _select_decision(
         )
     if world_model is None or provider is None:
         raise RuntimeError("controller methods require a world model and ghost provider")
-        
-    def _get_wm_obs(entry: Entry) -> Any:
-        obs = entry_to_world_model_observation(entry)
-        if goal_mask_radius is not None:
-            target_xyz = np.asarray(entry["target_position"], dtype=np.float32).reshape(-1)[:3]
-            dists = np.linalg.norm(obs.point_cloud - target_xyz.reshape(1, 3), axis=1)
-            mask = (dists < goal_mask_radius)
-            import dataclasses
-            if dataclasses.is_dataclass(obs):
-                return dataclasses.replace(obs, robot_mask=obs.robot_mask | mask)
-            else:
-                return obs._replace(robot_mask=obs.robot_mask | mask)
-        return obs
     if match_current_robot_points:
         provider.set_robot_point_budget_from_mask(
             np.asarray(current_entry["robot_mask"], dtype=bool),
             point_valid_mask=np.asarray(current_entry["point_valid_mask"], dtype=bool),
         )
     controller_input = ControllerInput(
-        observation=_get_wm_obs(current_entry),
+        observation=entry_to_world_model_observation(current_entry, goal_mask_radius=goal_mask_radius),
         scene=scene,
         policy_input=obs_window,
     )
@@ -1631,6 +1618,7 @@ def _select_multichunk(
     obs_window: list[Entry],
     scene: Any,
     constraints: list[Any],
+    goal_mask_radius: float | None = None,
     crop_config: PointCloudCropConfig,
     goal_thresh: float,
     planning_horizon_chunks: int,
@@ -1657,6 +1645,7 @@ def _select_multichunk(
                 obs_window=obs_window,
                 scene=scene,
                 constraints=constraints,
+                goal_mask_radius=goal_mask_radius,
                 crop_config=crop_config,
                 goal_thresh=goal_thresh,
                 planning_horizon_chunks=planning_horizon_chunks,
@@ -1689,6 +1678,7 @@ def _build_multichunk_candidates(
     obs_window: list[Entry],
     scene: Any,
     constraints: list[Any],
+    goal_mask_radius: float | None = None,
     crop_config: PointCloudCropConfig,
     goal_thresh: float,
     planning_horizon_chunks: int,
@@ -1712,7 +1702,7 @@ def _build_multichunk_candidates(
         for branch_idx, next_chunk in enumerate(next_chunks):
             if geometry_mode == "exact":
                 rollout = world_model.imagine(
-                    _get_wm_obs(branch_entries[branch_idx]),
+                    entry_to_world_model_observation(branch_entries[branch_idx], goal_mask_radius=goal_mask_radius),
                     next_chunk,
                     metadata={"branch": branch_idx, "chunk_index": chunk_idx},
                 )
@@ -1733,7 +1723,7 @@ def _build_multichunk_candidates(
             else:
                 rollout = _fast_imagine_rollout(
                     provider=provider,
-                    observation=_get_wm_obs(branch_entries[branch_idx]),
+                    observation=entry_to_world_model_observation(branch_entries[branch_idx], goal_mask_radius=goal_mask_radius),
                     action_chunk=next_chunk,
                     metadata={"branch": branch_idx, "chunk_index": chunk_idx},
                     timer=timer,
@@ -1837,6 +1827,7 @@ def _fast_imagine_rollout(
     action_chunk: ActionChunk,
     metadata: dict[str, Any],
     timer: TimingRecorder,
+    goal_mask_radius: float | None = None,
 ) -> ImaginedRollout:
     """Imagine q/EEF trajectories without rendering robot point clouds for every step."""
     q = interpret_joint_chunk(action_chunk, observation.robot_state.joint_positions)
@@ -1881,8 +1872,8 @@ def _render_feedback_entry(
     with timer.time("ghost_pointcloud_render", geometry_mode="fast"):
         robot_points = provider.robot_point_cloud(q)
     static_scene = static_scene_from_robot_mask(
-        _get_wm_obs(previous_entry).point_cloud,
-        _get_wm_obs(previous_entry).robot_mask,
+        entry_to_world_model_observation(previous_entry, goal_mask_radius=goal_mask_radius).point_cloud,
+        entry_to_world_model_observation(previous_entry, goal_mask_radius=goal_mask_radius).robot_mask,
     )
     scene, robot_mask = compose_robot_cloud(static_scene, robot_points)
     one_step_rollout = ImaginedRollout(

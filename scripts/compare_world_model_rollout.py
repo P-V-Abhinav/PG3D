@@ -492,11 +492,15 @@ def run_comparison_episode(
     }
 
 
-def entry_to_world_model_observation(entry: Entry) -> Observation:
+def entry_to_world_model_observation(entry: Entry, goal_mask_radius: float | None = None) -> Observation:
     """Convert a fixed-size policy entry into a valid-point world-model observation."""
     valid = np.asarray(entry["point_valid_mask"], dtype=bool)
     points = np.asarray(entry["point_cloud"], dtype=np.float32)[valid]
     robot_mask = np.asarray(entry["robot_mask"], dtype=bool)[valid]
+    if goal_mask_radius is not None:
+        target_xyz = np.asarray(entry["target_position"], dtype=np.float32).reshape(-1)[:3]
+        dists = np.linalg.norm(points - target_xyz.reshape(1, 3), axis=1)
+        robot_mask = robot_mask | (dists < goal_mask_radius)
     return Observation(
         point_cloud=points,
         point_features={},
