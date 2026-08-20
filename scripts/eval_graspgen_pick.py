@@ -1343,24 +1343,6 @@ def main(argv: list[str] | None = None) -> int:
                 write_video = args.video and spec.output_index in video_episode_indices
                 write_rerun = args.rerun and spec.output_index in rerun_episode_indices
 
-                import scripts.eval_pointcloud_pose_steering_reach as eval_module
-                orig_entry_to_wm = eval_module.entry_to_world_model_observation
-                
-                def masked_entry_to_wm(entry):
-                    obs = orig_entry_to_wm(entry)
-                    target_xyz = np.asarray(entry["target_position"], dtype=np.float32).reshape(-1)[:3]
-                    dists = np.linalg.norm(obs.point_cloud - target_xyz.reshape(1, 3), axis=1)
-                    # Mask out points within 20cm of the goal so they are not treated as obstacles
-                    mask = (dists < 0.20)
-                    new_robot_mask = obs.robot_mask | mask
-                    import dataclasses
-                    if dataclasses.is_dataclass(obs):
-                        return dataclasses.replace(obs, robot_mask=new_robot_mask)
-                    else:
-                        return obs._replace(robot_mask=new_robot_mask)
-                
-                eval_module.entry_to_world_model_observation = masked_entry_to_wm
-
                 for method in args.methods:
                     row = run_eval_episode(
                         sim_env=sim_env,
@@ -1372,6 +1354,7 @@ def main(argv: list[str] | None = None) -> int:
                         constraints=constraints,
                         pending_spawn=pending_spawn,
                         action_mode=action_mode,
+                        goal_mask_radius=0.20,
                         crop_config=crop_config,
                         goal_thresh=goal_thresh,
                         output_dir=args.output_dir,
@@ -1428,8 +1411,6 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"  Achieved Rot Error: {pm['rotation_error_at_min_position']:.4f} rad (at best position)")
                         print(f"  Strictly Satisfied: {pm['satisfied']} (within {pm['position_tolerance']}m and {pm['rotation_tolerance']:.4f}rad)")
                         print("=============================\n", flush=True)
-                eval_module.entry_to_world_model_observation = orig_entry_to_wm
-                    
                 timing_written = _write_new_timing_events(
                     timer, timings_path, start_index=timing_written
                 )
