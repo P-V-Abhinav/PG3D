@@ -1576,7 +1576,7 @@ def main(argv: list[str] | None = None) -> int:
     # Expand crop bounds for kitchen scene (same as pose steering script).
     new_bounds = crop_config.bounds.copy()
     new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)
-    new_bounds[2, 0] = 0.08
+    new_bounds[2, 0] = 0.01
     crop_config = PointCloudCropConfig(
         bounds=new_bounds,
         num_points=crop_config.num_points,

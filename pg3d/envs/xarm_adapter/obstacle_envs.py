@@ -384,7 +384,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     # Tighter bounds to ensure the object spawns comfortably within robot reach.
     _JSTBANANA_X_RANGE = (-0.15, 0.25)
     _JSTBANANA_Y_RANGE = (-0.25, 0.25)
-    _JSTBANANA_Z     = 0.01   # table surface height for object base
+    _JSTBANANA_Z     = 0.08   # table surface height for object base
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
