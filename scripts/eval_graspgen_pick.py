@@ -8,18 +8,25 @@ Architecture
 2. Per episode reset:
    a. Get scene point cloud from ManiSkill cameras (one zero-action step to
       force the renderer to capture the post-init scene).
-   b. Crop to the target object via a sphere of radius
-      --grasp-object-crop-radius around entry["target_position"].
-      (ManiSkill knows the exact object pose; entry["target_position"] IS the
-      goal-site/object centroid in world frame.)
-   c. Run GraspGen (diffusion + OBB MoE) on the object crop.
-   d. Pick the best-scoring grasp candidate.
-   e. Apply --graspgen-z-offset to adjust for gripper geometry differences.
-   f. Wrap as a CartesianPoseConstraint.
+   b. **Object pose**: For jstbanana-v0 (and any env with `cheezit` actor),
+      the grasp target position is read DIRECTLY from the actor's world-frame
+      pose — NOT from entry["target_position"] (goal_site). This avoids the
+      convoluted goal→object indirection and works regardless of where the
+      object is placed in the workspace.
+   c. Crop the raw point cloud to a sphere around the actor centroid.
+   d. Run GraspGen (diffusion + OBB MoE) on the object crop.
+   e. Pick the best-scoring grasp candidate.
+   f. Apply --graspgen-z-offset to adjust for gripper geometry differences.
+   g. Wrap as a CartesianPoseConstraint.
 3. Reranking loop (UNCHANGED from pose-steering eval):
    * Sample k action chunks from the reach checkpoint.
    * Score each by CartesianPoseConstraint cost + goal_distance + smoothness.
    * Execute the chunk whose imagined EEF path gets closest to the grasp pose.
+4. Debug visualisations (--graspgen-viser / --rerun):
+   * Viser: launches a local 3-D server showing the object point cloud and
+     ALL GraspGen candidate grasps as pitchfork frames.
+   * Rerun: logs the best grasp AND all candidates as pitchfork line strips
+     (approach arm + two finger-span lines) inside the existing timeline.
 
 Gripper masking
 ===============
@@ -185,10 +192,16 @@ from scripts.rollout_dp3_reach_policy import (
     obs_window_to_torch,
     policy_action_to_sim_action,
     rollout_observation_entry,
-    save_rerun_timeline,
+    save_rerun_timeline as _save_rerun_timeline_base,
     save_video,
     select_rollout_specs,
 )
+
+
+# save_rerun_timeline is re-exported so any code that imports it from this
+# module still works.  GraspGen pitchfork logging is done explicitly in main()
+# after run_eval_episode returns, writing a companion .pitchforks.rrd file.
+save_rerun_timeline = _save_rerun_timeline_base
 
 # Re-register the plain "PG3DReach-RealObstacle-v0" env in case only this
 # script is imported (obstacle_envs.py only registers the XArm7 variants).
@@ -258,19 +271,68 @@ def load_graspgen_sampler(config_path: str | Path) -> Any:
     return sampler
 
 
+def _get_object_actor_xyz(env: Any, *, grasp_actor_name: str | None = None) -> np.ndarray | None:
+    """Return the world-frame centroid of the primary graspable actor, or None.
+
+    Priority order:
+      1. ``env.unwrapped.cheezit``  — jstbanana-v0's single object.
+      2. Named actor via ``grasp_actor_name``.
+      3. ``env.unwrapped.ycb_objects[0]``  — kitchen/multi-object envs.
+    Returns None when none of the above are available.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+
+    # 1. jstbanana-v0 direct attribute
+    cheezit = getattr(unwrapped, "cheezit", None)
+    if cheezit is not None:
+        try:
+            p = cheezit.pose.p
+            if hasattr(p, "__getitem__"):
+                p = p[0]  # batched: (1, 3) → (3,)
+            return np.asarray(p).flatten()[:3].astype(np.float32)
+        except Exception as exc:
+            print(f"[GraspGen] Warning: cheezit.pose.p failed ({exc})", flush=True)
+
+    # 2. Named actor (fallback)
+    if grasp_actor_name is not None:
+        try:
+            actor = next(
+                a for a in getattr(unwrapped, "scene", unwrapped).actors
+                if getattr(a, "name", "") == grasp_actor_name
+            )
+            p = actor.pose.p
+            if hasattr(p, "__getitem__"):
+                p = p[0]
+            return np.asarray(p).flatten()[:3].astype(np.float32)
+        except Exception:
+            pass
+
+    # 3. ycb_objects[0]
+    ycb = getattr(unwrapped, "ycb_objects", None)
+    if ycb and len(ycb) > 0:
+        try:
+            p = ycb[0].pose.p
+            if hasattr(p, "__getitem__"):
+                p = p[0]
+            return np.asarray(p).flatten()[:3].astype(np.float32)
+        except Exception:
+            pass
+
+    return None
+
+
 def _crop_object_pointcloud(
     scene_cloud: np.ndarray,
     robot_mask: np.ndarray,
     target_xyz: np.ndarray,
     radius: float,
 ) -> np.ndarray:
-    """Crop the scene point cloud to a sphere around the target object.
+    """Crop the scene point cloud to a sphere around ``target_xyz``.
 
     Args:
         scene_cloud : (N, 3) world-frame scene PC from ManiSkill cameras.
         robot_mask  : (N,)   True where point belongs to the robot.
-        target_xyz  : (3,)   world-frame centroid of the target object
-                             (= entry["target_position"]).
+        target_xyz  : (3,)   world-frame centroid (from actor pose, NOT goal_site).
         radius      : sphere radius in metres (default 0.10 m).
 
     Returns:
@@ -385,6 +447,206 @@ def _rot3x3_to_quat_wxyz(rot: np.ndarray) -> np.ndarray:
     )
 
 
+# ---------------------------------------------------------------------------
+# Viser / Rerun pitchfork grasp visualisation helpers
+# ---------------------------------------------------------------------------
+
+# Gripper geometry constants used for the pitchfork visualisation.
+# These match the Robotiq 2F-140 finger geometry that GraspGen was trained on.
+_GRASP_VIS_APPROACH_LEN  = 0.06   # length of the blue approach arrow (m)
+_GRASP_VIS_FINGER_WIDTH  = 0.08   # full span of the two finger lines (m)
+_GRASP_VIS_FINGER_DEPTH  = 0.04   # how far fingers project along approach from TCP
+
+
+def _pitchfork_lines_for_grasp(
+    grasp_T: np.ndarray,
+    *,
+    approach_len: float = _GRASP_VIS_APPROACH_LEN,
+    finger_width: float = _GRASP_VIS_FINGER_WIDTH,
+    finger_depth: float = _GRASP_VIS_FINGER_DEPTH,
+) -> list[np.ndarray]:
+    """Return three line segments that form a T-bar / pitchfork for one grasp SE(3).
+
+    The pitchfork matches Viser's canonical grasp frame:
+      • Local Z  = approach axis  → one line from TCP backward along -Z.
+      • Local X  = finger axis    → two lines left/right of the approach tip.
+
+    Returns a list of three (2, 3) float32 arrays (each a two-point segment).
+    """
+    grasp_T = np.asarray(grasp_T, dtype=np.float32)
+    origin   = grasp_T[:3, 3]           # TCP / grasp contact centre
+    approach = grasp_T[:3, 2]           # local Z column
+    finger   = grasp_T[:3, 0]           # local X column
+
+    # 1. Approach arm: from origin, going backward (-approach)
+    tip = origin - approach * approach_len
+
+    # 2 & 3. Finger span: two equal lines extending along ±X from the tip
+    half = finger_width / 2.0
+    finger_root = tip + approach * finger_depth
+    lines = [
+        np.stack([origin, tip], axis=0),                             # approach
+        np.stack([finger_root - finger * half,
+                  finger_root + finger * half], axis=0),             # finger bar
+    ]
+    return [l.astype(np.float32) for l in lines]
+
+
+def _log_graspgen_rerun(
+    all_grasps: np.ndarray,
+    all_scores: np.ndarray,
+    best_idx: int,
+    object_cloud: np.ndarray,
+    *,
+    episode_index: int,
+) -> None:
+    """Log all grasp candidates + object cloud to an open Rerun session.
+
+    Called inside _build_graspgen_constraint BEFORE save_rerun_timeline;
+    uses static=True so the visuals persist across all timesteps.
+    """
+    try:
+        import rerun as rr
+    except ImportError:
+        return
+
+    # Object point cloud (centred)
+    if object_cloud.shape[0] > 0:
+        rr.log(
+            "world/graspgen/object_cloud",
+            rr.Points3D(object_cloud, colors=[255, 200, 50]),
+            static=True,
+        )
+
+    # All candidates — green lines
+    all_strips: list[np.ndarray] = []
+    for i in range(all_grasps.shape[0]):
+        if i == best_idx:
+            continue
+        lines = _pitchfork_lines_for_grasp(all_grasps[i])
+        all_strips.extend(lines)
+
+    if all_strips:
+        rr.log(
+            "world/graspgen/candidates",
+            rr.LineStrips3D(all_strips, colors=[60, 200, 60, 160], radii=0.001),
+            static=True,
+        )
+
+    # Best grasp — bright yellow lines, thicker
+    best_lines = _pitchfork_lines_for_grasp(all_grasps[best_idx])
+    rr.log(
+        "world/graspgen/best_grasp",
+        rr.LineStrips3D(best_lines, colors=[255, 255, 0, 255], radii=0.003),
+        static=True,
+    )
+    # Best grasp origin point
+    rr.log(
+        "world/graspgen/best_grasp_origin",
+        rr.Points3D(
+            all_grasps[best_idx:best_idx + 1, :3, 3],
+            colors=[255, 80, 0], radii=0.008,
+        ),
+        static=True,
+    )
+    print(
+        f"[GraspGen] Logged {all_grasps.shape[0]} candidates to Rerun "
+        f"(episode {episode_index}, best_idx={best_idx})",
+        flush=True,
+    )
+
+
+def _show_graspgen_viser(
+    all_grasps: np.ndarray,
+    all_scores: np.ndarray,
+    best_idx: int,
+    object_cloud: np.ndarray,
+    *,
+    episode_index: int,
+    block: bool = True,
+) -> None:
+    """Open a local Viser window with the object PC and all grasp candidates.
+
+    Visualises each grasp as a pitchfork (approach + finger lines) coloured
+    from blue (low score) to green (high score). The best grasp is bright red.
+    Set block=True to pause until the user closes the window (default), or
+    block=False to return immediately (window keeps running in the background).
+    """
+    try:
+        import viser
+        import viser.transforms as vtf
+    except ImportError:
+        print(
+            "[GraspGen] viser not installed — skipping debug window. "
+            "Install with: pip install viser",
+            flush=True,
+        )
+        return
+
+    server = viser.ViserServer()
+    server.scene.world_axes.visible = True
+
+    # Object point cloud
+    if object_cloud.shape[0] > 0:
+        server.scene.add_point_cloud(
+            "object_cloud",
+            points=object_cloud,
+            colors=np.tile([255, 200, 50], (object_cloud.shape[0], 1)),
+            point_size=0.004,
+        )
+
+    # Score range for colour mapping
+    s_min = float(all_scores.min())
+    s_max = float(all_scores.max())
+    s_range = max(s_max - s_min, 1e-6)
+
+    for i, (grasp_T, score) in enumerate(zip(all_grasps, all_scores)):
+        t = float((score - s_min) / s_range)  # 0..1
+        if i == best_idx:
+            color = [255, 80, 0]   # bright orange-red for best
+            radius = 0.004
+        else:
+            # blue → green gradient
+            r = int(20)
+            g = int(60 + t * 190)
+            b = int(200 - t * 140)
+            color = [r, g, b]
+            radius = 0.001
+
+        rot = grasp_T[:3, :3]
+        pos = grasp_T[:3, 3]
+        try:
+            wxyz = vtf.SO3.from_matrix(rot).wxyz
+        except Exception:
+            from scipy.spatial.transform import Rotation as R_scipy
+            xyzw = R_scipy.from_matrix(rot.astype(np.float64)).as_quat()
+            wxyz = np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]], dtype=np.float32)
+
+        # Draw the approach + finger pitchfork as scene line segments
+        lines = _pitchfork_lines_for_grasp(grasp_T)
+        for j, seg in enumerate(lines):
+            server.scene.add_line_segments(
+                f"grasps/{'best' if i == best_idx else i}/{j}",
+                points=seg,
+                colors=np.tile(color, (2, 1)),
+                line_width=2.0 if i == best_idx else 1.0,
+            )
+
+    print(
+        f"[GraspGen Viser] Episode {episode_index}: showing {all_grasps.shape[0]} grasps. "
+        f"Open browser at http://localhost:8080 — close the window or Ctrl+C to continue.",
+        flush=True,
+    )
+    if block:
+        try:
+            while True:
+                import time
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    server.stop()
+
+
 def _build_graspgen_constraint(
     env: Any,
     *,
@@ -396,17 +658,13 @@ def _build_graspgen_constraint(
 ) -> tuple[list[Any], None]:
     """Reset the env and build a CartesianPoseConstraint from GraspGen.
 
-    This is the Phase-0 replacement for _constraints_for_episode().
-
-    Steps
-    -----
-    1. Reset env (same as obstacle eval).
-    2. Take one zero-action step so the renderer captures the post-init scene.
-    3. Crop point cloud to target object.
-    4. Run GraspGen MoE → pick best grasp.
-    5. Apply Z-offset for gripper geometry correction.
-    6. Print detailed diagnostics (position, orientation, approach axis, score).
-    7. Return [CartesianPoseConstraint] (+ optional JointPostureConstraint).
+    Key changes vs the old version
+    --------------------------------
+    * Object pose: read directly from ``env.unwrapped.cheezit`` (jstbanana-v0)
+      rather than from ``entry['target_position']`` (which is the goal_site).
+    * Visualisation: if ``--graspgen-viser`` is set, opens a blocking Viser
+      window with all grasp candidates; if ``--rerun`` is set, logs pitchforks
+      to the active Rerun session.
 
     Returns (constraints, None) — the None matches the PendingObstacleSpawn
     slot from the original signature so the caller loop doesn't need changes.
@@ -418,23 +676,6 @@ def _build_graspgen_constraint(
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
 
     # --- 2. Zero-action step: forces renderer to re-render after _initialize_episode ---
-    # If we are using an env_id_override, we must move the spawned object to the zarr target_position
-    if getattr(args, "env_id_override", None) and zarr_context is not None:
-        target = np.asarray(zarr_context["target_position"], dtype=np.float32).reshape(3)
-        # Move ycb_objects[0] or cheezit to target
-        unwrapped = env.unwrapped
-        from mani_skill.utils.structs.pose import Pose
-        if hasattr(unwrapped, "ycb_objects") and len(unwrapped.ycb_objects) > 0:
-            p = unwrapped.ycb_objects[0].pose.p
-            if hasattr(p, "detach"): p = p[0].detach().cpu().numpy()
-            pos = torch.tensor([target[0], target[1], target[2]], dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
-            q = unwrapped.ycb_objects[0].pose.q
-            unwrapped.ycb_objects[0].set_pose(Pose.create_from_pq(p=pos, q=q))
-        elif hasattr(unwrapped, "cheezit"):
-            pos = torch.tensor([target[0], target[1], 0.08], dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
-            q = unwrapped.cheezit.pose.q
-            unwrapped.cheezit.set_pose(Pose.create_from_pq(p=pos, q=q))
-
     zero_action = np.zeros(env.action_space.shape, dtype=np.float32)
     action_mode_str = str(getattr(args, "action_mode", "abs_joint"))
     if action_mode_str == "abs_joint":
@@ -449,38 +690,34 @@ def _build_graspgen_constraint(
     # --- 3. Get scene point cloud ---
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
     if zarr_context is not None:
-        if getattr(args, "env_id_override", None):
-            # If overriding the env, we want the FRESH point cloud of the new object, NOT the zarr point cloud!
-            # We just copy the target position/tcp/agent state from zarr.
-            entry["target_position"] = np.asarray(zarr_context["target_position"]).copy()
-            entry["tcp_pose"] = np.asarray(zarr_context["tcp_pose"]).copy()
-            entry["agent_pos"] = np.asarray(zarr_context["state"]).copy()
-        else:
-            entry = _apply_zarr_initial_entry(entry, zarr_context)
+        entry = _apply_zarr_initial_entry(entry, zarr_context)
 
     scene_cloud = np.asarray(entry["point_cloud"], dtype=np.float32).reshape(-1, 3)
     robot_mask  = np.asarray(entry["robot_mask"],  dtype=bool).reshape(-1)
-    target_xyz  = np.asarray(entry["target_position"], dtype=np.float32).reshape(3)
 
-    # --- 3a. Optionally use a specific YCB object's pose instead of goal_site ---
-    grasp_obj_idx = getattr(args, "grasp_object_index", -1)
-    if grasp_obj_idx >= 0:
-        try:
-            p = env.unwrapped.ycb_objects[grasp_obj_idx].pose.p
-            if hasattr(p, "detach"):
-                p = p[0].detach().cpu().numpy()
-            target_xyz = np.asarray(p).flatten()[:3].astype(np.float32)
-            print(
-                f"[GraspGen] Episode {spec.output_index}: "
-                f"using YCB object [{grasp_obj_idx}] at {target_xyz.tolist()}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[GraspGen] Warning: could not get ycb_objects[{grasp_obj_idx}] pose "
-                f"({exc}); falling back to target_position.",
-                flush=True,
-            )
+    # --- 3a. Resolve object position: direct actor pose takes priority ---
+    # For jstbanana-v0 the cheezit object is placed randomly in the workspace;
+    # entry['target_position'] (the goal_site) follows the object because the
+    # env moves goal_site to the cheezit centroid, BUT reading directly from
+    # the actor is cleaner and avoids any timing races.
+    grasp_actor_name = getattr(args, "grasp_actor_name", None)
+    actor_xyz = _get_object_actor_xyz(env, grasp_actor_name=grasp_actor_name)
+
+    if actor_xyz is not None:
+        target_xyz = actor_xyz
+        print(
+            f"[GraspGen] Episode {spec.output_index}: "
+            f"object actor pose → {target_xyz.tolist()}",
+            flush=True,
+        )
+    else:
+        # Fallback: use goal_site / target_position (pose steering behaviour)
+        target_xyz = np.asarray(entry["target_position"], dtype=np.float32).reshape(3)
+        print(
+            f"[GraspGen] Episode {spec.output_index}: "
+            f"no actor found, using goal_site target_position → {target_xyz.tolist()}",
+            flush=True,
+        )
 
     # --- 4. Crop to object ---
     crop_radius = float(getattr(args, "grasp_object_crop_radius", 0.10))
@@ -504,12 +741,11 @@ def _build_graspgen_constraint(
             "falling back to goal-position-only constraint (no orientation).",
             flush=True,
         )
-        # Fallback: constrain only position, no rotation requirement
         constraint = CartesianPoseConstraint(
             target_position=target_xyz,
-            target_orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # identity
+            target_orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             position_tolerance=float(getattr(args, "grasp_position_tolerance", 0.03)),
-            rotation_tolerance=3.15,   # max possible rotation error is pi, satisfies _validate_finite
+            rotation_tolerance=3.15,
             weight=float(getattr(args, "grasp_weight", 2.0)),
             name="graspgen_fallback_position_only",
         )
@@ -565,6 +801,29 @@ def _build_graspgen_constraint(
         flush=True,
     )
 
+    # --- 7b. Debug visualisations (Viser + Rerun pitchforks) ---
+    if getattr(args, "graspgen_viser", False):
+        _show_graspgen_viser(
+            all_grasps, all_scores, best_idx, object_crop,
+            episode_index=spec.output_index,
+            block=True,
+        )
+
+    # Rerun pitchfork logging: deferred — logged inside save_rerun_timeline.
+    # Store on args so run_eval_episode can pass them through.
+    if getattr(args, "rerun", False):
+        # Attach the grasp data as a per-episode attribute on args so that the
+        # Rerun writer in run_eval_episode can call _log_graspgen_rerun.
+        # We use a dict keyed by output_index to handle multiple episodes.
+        if not hasattr(args, "_graspgen_rerun_data"):
+            args._graspgen_rerun_data = {}
+        args._graspgen_rerun_data[spec.output_index] = {
+            "all_grasps": all_grasps,
+            "all_scores": all_scores,
+            "best_idx": best_idx,
+            "object_cloud": object_crop,
+        }
+
     # --- 8. Apply Z-offset for XArm7 gripper geometry ---
     z_offset = float(getattr(args, "graspgen_z_offset", 0.0))
     adjusted = _apply_z_offset(best_grasp, z_offset)
@@ -587,7 +846,7 @@ def _build_graspgen_constraint(
 
     constraint = CartesianPoseConstraint(
         target_position=adj_pos,
-        target_orientation=adj_quat,   # (4,) wxyz quaternion — accepted by constraint
+        target_orientation=adj_quat,   # (4,) wxyz quaternion
         position_tolerance=pos_tol,
         rotation_tolerance=rot_tol,
         weight=weight,
@@ -1412,6 +1671,43 @@ def main(argv: list[str] | None = None) -> int:
                         parallel_pool=None,
                     )
                     rows.append(row)
+                    # --- Pitchfork Rerun logging (post run_eval_episode) ---
+                    # run_eval_episode writes the .rrd via save_rerun_timeline.
+                    # We write a companion .pitchforks.rrd in the same directory
+                    # with all GraspGen candidate grasps visualized as T-bar lines.
+                    if write_rerun:
+                        rerun_data = getattr(args, "_graspgen_rerun_data", {}).get(
+                            spec.output_index
+                        )
+                        if rerun_data is not None:
+                            rerun_data["episode_index"] = spec.output_index
+                            pitchfork_path = (
+                                args.output_dir / "rerun" / method
+                                / f"episode_{spec.output_index:03d}.pitchforks.rrd"
+                            )
+                            pitchfork_path.parent.mkdir(parents=True, exist_ok=True)
+                            try:
+                                import rerun as rr
+                                rr.init("pg3d_graspgen_pitchforks", spawn=False)
+                                rr.save(str(pitchfork_path))
+                                _log_graspgen_rerun(
+                                    rerun_data["all_grasps"],
+                                    rerun_data["all_scores"],
+                                    rerun_data["best_idx"],
+                                    rerun_data["object_cloud"],
+                                    episode_index=spec.output_index,
+                                )
+                                rr.disconnect()
+                                print(
+                                    f"[GraspGen] Pitchfork .rrd → {pitchfork_path}",
+                                    flush=True,
+                                )
+                            except Exception as rr_exc:
+                                print(
+                                    f"[GraspGen] Warning: pitchfork Rerun write failed: "
+                                    f"{type(rr_exc).__name__}: {rr_exc}",
+                                    flush=True,
+                                )
                     with timer.time("json_write", artifact="metrics"):
                         metrics_file.write(json.dumps(_jsonable(row), sort_keys=True) + "\n")
                         metrics_file.flush()
@@ -1554,16 +1850,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "axis to account for gripper geometry difference. "
                         "0.0 for Robotiq 2F-140 (same as GraspGen training gripper).")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
-                   help="Sphere radius (m) around target_position for object crop.")
+                   help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
-                   help="Index into env.unwrapped.ycb_objects[] to use as the grasp "
-                        "target. -1 = use entry['target_position'] (goal site).")
+                   help="Legacy: index into env.unwrapped.ycb_objects[] to override the "
+                        "actor-pose lookup. -1 = use automatic actor detection (preferred).")
+    g.add_argument("--grasp-actor-name", type=str, default=None,
+                   help="Named SAPIEN actor to use as the grasp target (optional, "
+                        "overrides auto-detection for envs with multiple objects).")
     g.add_argument("--grasp-weight", type=float, default=2.0,
                    help="Weight of the CartesianPoseConstraint in candidate scoring.")
     g.add_argument("--grasp-position-tolerance", type=float, default=0.02,
                    help="Position tolerance (m) for CartesianPoseConstraint.satisfied().")
     g.add_argument("--grasp-rotation-tolerance", type=float, default=0.1745,
                    help="Rotation tolerance (rad) for CartesianPoseConstraint.satisfied(). 0.1745 rad = 10 degrees.")
+    g.add_argument("--graspgen-viser", action="store_true",
+                   help="Open a blocking Viser 3-D debug window after each GraspGen call, "
+                        "showing the object cloud and all grasp candidates as pitchforks. "
+                        "Close the browser tab or press Ctrl+C to continue.")
 
     # --- Episode / source ---
     p.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
@@ -1591,7 +1894,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--gripper-open", type=float, default=0.04,
                    help="Gripper open position (m). The reach ckpt does not predict "
                         "gripper actions; this value pads the sim action.")
-    p.add_argument("--geometry-mode", choices=["fast", "exact"], default="fast")
+    p.add_argument("--geometry-mode", choices=["fast", "exact"], default="exact",
+                   help="World-model geometry mode. 'exact' uses the full robot point cloud "
+                        "at each waypoint for collision scoring (slow but accurate). "
+                        "'fast' uses a cached ghost approximation.")
+    p.add_argument("--constraint-target", choices=["eef", "robot"], default="robot",
+                   help="Which part of the robot to score against collision constraints. "
+                        "'robot' uses the full robot point cloud; 'eef' uses only the "
+                        "end-effector position. Default: robot.")
     p.add_argument("--match-current-robot-points", action="store_true")
     p.add_argument("--policy-batch-size", type=int, default=64)
     p.add_argument("--score-weights", type=float, nargs=4, default=None,

@@ -380,21 +380,52 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
             self.cheezit = actors.build_box(self.scene, half_sizes=[0.02, 0.08, 0.02], color=[1, 1, 0, 1], name="fallback_cheezit", body_type="kinematic")
 
+    # Workspace XY bounds for random object placement in jstbanana-v0.
+    # These match the effective crop bounds used by eval_graspgen_pick.py
+    # (X: [-0.9, 0.7] cropped to max 0.7, Y: [-0.6, 0.6]) with a small inset.
+    _JSTBANANA_X_RANGE = (-0.70, 0.65)
+    _JSTBANANA_Y_RANGE = (-0.50, 0.50)
+    _JSTBANANA_Z     = 0.08   # table surface height for object base
+    _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
+
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
         with torch.device(self.device):
             rng = np.random.default_rng(self._episode_seed)
-            goal_pos = self.goal_site.pose.p[0].cpu().numpy()
-            # Cheezit placed at the episode's goal position XY, but lifted to z=0.08 to prevent sinking
-            pos_t = torch.tensor([goal_pos[0], goal_pos[1], 0.08], dtype=torch.float32, device=self.device).unsqueeze(0)
-            
+            start_pos = self.agent.tcp_pose.p[0].cpu().numpy()[:2]  # XY of robot TCP
+
+            # --- Random placement within workspace crop bounds ---
+            placed = False
+            for _ in range(200):
+                sx = rng.uniform(*self._JSTBANANA_X_RANGE)
+                sy = rng.uniform(*self._JSTBANANA_Y_RANGE)
+                if np.linalg.norm(np.array([sx, sy]) - start_pos) >= self._JSTBANANA_MIN_DIST_FROM_START:
+                    placed = True
+                    break
+            if not placed:
+                # Fallback: use centre of workspace
+                sx, sy = 0.30, 0.0
+
+            pos_np = np.array([sx, sy, self._JSTBANANA_Z], dtype=np.float32)
+            pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+
             # Random rotation around Z axis
             theta = rng.uniform(0, 2 * np.pi)
-            q_t = torch.tensor([np.cos(theta/2), 0, 0, np.sin(theta/2)], dtype=torch.float32, device=self.device).unsqueeze(0)
-            
+            q_t = torch.tensor(
+                [np.cos(theta / 2), 0, 0, np.sin(theta / 2)],
+                dtype=torch.float32, device=self.device,
+            ).unsqueeze(0)
+
             self.cheezit.set_pose(Pose.create_from_pq(p=pos_t, q=q_t))
-            # Move the goal marker to be exactly at the cheezit's centroid.
+            # Move the goal marker to exactly the cheezit centroid so the
+            # reach-policy goal marker (blue sphere) coincides with the object.
             self.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+
+            print(
+                f"[jstbanana-v0] Episode seed={self._episode_seed}: "
+                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {self._JSTBANANA_Z:.3f})",
+                flush=True,
+            )
 
     @property
     def _default_sensor_configs(self) -> list[CameraConfig]:
