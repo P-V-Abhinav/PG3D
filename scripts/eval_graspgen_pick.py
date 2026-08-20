@@ -418,6 +418,23 @@ def _build_graspgen_constraint(
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
 
     # --- 2. Zero-action step: forces renderer to re-render after _initialize_episode ---
+    # If we are using an env_id_override, we must move the spawned object to the zarr target_position
+    if getattr(args, "env_id_override", None) and zarr_context is not None:
+        target = np.asarray(zarr_context["target_position"], dtype=np.float32).reshape(3)
+        # Move ycb_objects[0] or cheezit to target
+        unwrapped = env.unwrapped
+        from mani_skill.utils.structs.pose import Pose
+        if hasattr(unwrapped, "ycb_objects") and len(unwrapped.ycb_objects) > 0:
+            p = unwrapped.ycb_objects[0].pose.p
+            if hasattr(p, "detach"): p = p[0].detach().cpu().numpy()
+            pos = torch.tensor([target[0], target[1], target[2]], dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
+            q = unwrapped.ycb_objects[0].pose.q
+            unwrapped.ycb_objects[0].set_pose(Pose.create_from_pq(p=pos, q=q))
+        elif hasattr(unwrapped, "cheezit"):
+            pos = torch.tensor([target[0], target[1], 0.08], dtype=torch.float32, device=unwrapped.device).unsqueeze(0)
+            q = unwrapped.cheezit.pose.q
+            unwrapped.cheezit.set_pose(Pose.create_from_pq(p=pos, q=q))
+
     zero_action = np.zeros(env.action_space.shape, dtype=np.float32)
     action_mode_str = str(getattr(args, "action_mode", "abs_joint"))
     if action_mode_str == "abs_joint":
@@ -432,7 +449,14 @@ def _build_graspgen_constraint(
     # --- 3. Get scene point cloud ---
     entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
     if zarr_context is not None:
-        entry = _apply_zarr_initial_entry(entry, zarr_context)
+        if getattr(args, "env_id_override", None):
+            # If overriding the env, we want the FRESH point cloud of the new object, NOT the zarr point cloud!
+            # We just copy the target position/tcp/agent state from zarr.
+            entry["target_position"] = np.asarray(zarr_context["target_position"]).copy()
+            entry["tcp_pose"] = np.asarray(zarr_context["tcp_pose"]).copy()
+            entry["agent_pos"] = np.asarray(zarr_context["state"]).copy()
+        else:
+            entry = _apply_zarr_initial_entry(entry, zarr_context)
 
     scene_cloud = np.asarray(entry["point_cloud"], dtype=np.float32).reshape(-1, 3)
     robot_mask  = np.asarray(entry["robot_mask"],  dtype=bool).reshape(-1)
