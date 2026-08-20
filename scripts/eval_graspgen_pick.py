@@ -201,13 +201,15 @@ from scripts.rollout_dp3_reach_policy import (
 # save_rerun_timeline is re-exported so any code that imports it from this
 # module still works.  GraspGen pitchfork logging is done explicitly in main()
 # after run_eval_episode returns, writing a companion .pitchforks.rrd file.
+# Store the current episode's graspgen data here before calling run_eval_episode
+CURRENT_RERUN_DATA = None
+
 def save_rerun_timeline(
     path: "Path",
     timeline: list,
     *,
     constraints: list | None = None,
     decisions: list | None = None,
-    _graspgen_rerun_data: dict | None = None,
 ) -> None:
     try:
         import rerun as rr
@@ -219,7 +221,8 @@ def save_rerun_timeline(
     rr.save(str(path))
     
     # Inject GraspGen pitchforks into the main Rerun session!
-    if _graspgen_rerun_data is not None:
+    if CURRENT_RERUN_DATA is not None:
+        _graspgen_rerun_data = CURRENT_RERUN_DATA
         rr.set_time_sequence("step", 0)
         _log_graspgen_rerun(
             _graspgen_rerun_data["all_grasps"],
@@ -674,18 +677,10 @@ def _show_graspgen_viser(
     s_range = max(s_max - s_min, 1e-6)
 
     for i, (grasp_T, score) in enumerate(zip(all_grasps, all_scores)):
-        t = float((score - s_min) / s_range)  # 0..1
-        if i == best_idx:
-            color = [255, 80, 0]   # bright orange-red for best
-            radius = 0.004
-        else:
-            # blue → green gradient
-            r = int(20)
-            g = int(60 + t * 190)
-            b = int(200 - t * 140)
-            color = [r, g, b]
-            radius = 0.001
-
+        if i != best_idx:
+            continue
+        
+        color = [255, 80, 0]   # bright orange-red for best
         rot = grasp_T[:3, :3]
         pos = grasp_T[:3, 3]
         try:
@@ -699,10 +694,10 @@ def _show_graspgen_viser(
         lines = _pitchfork_lines_for_grasp(grasp_T)
         for j, seg in enumerate(lines):
             server.scene.add_line_segments(
-                f"grasps/{'best' if i == best_idx else i}/{j}",
+                f"grasps/best/{j}",
                 points=np.expand_dims(seg, 0),  # (1, 2, 3) for 1 line segment
                 colors=tuple(color),
-                line_width=2.0 if i == best_idx else 1.0,
+                line_width=2.0,
             )
 
     print(
@@ -1710,6 +1705,10 @@ def main(argv: list[str] | None = None) -> int:
                 write_rerun = args.rerun and spec.output_index in rerun_episode_indices
 
                 for method in args.methods:
+                    # Expose current grasp data to the monkeypatched save_rerun_timeline
+                    global CURRENT_RERUN_DATA
+                    CURRENT_RERUN_DATA = getattr(args, "_graspgen_rerun_data", {}).get(spec.output_index)
+
                     row = run_eval_episode(
                         sim_env=sim_env,
                         ghost_env=ghost_env,
@@ -1840,11 +1839,17 @@ def _import_run_eval_episode():
         sys.path.insert(0, script_dir)
         
     import eval_pointcloud_pose_steering_reach
+    # Monkeypatch the module so that it uses the local save_rerun_timeline
+    # which has the logic for logging GraspGen pitchforks into the main file.
+    eval_pointcloud_pose_steering_reach.save_rerun_timeline = save_rerun_timeline
     return eval_pointcloud_pose_steering_reach.run_eval_episode
 
 
 try:
     run_eval_episode = _import_run_eval_episode()
+    # Monkeypatch the module's save_rerun_timeline so run_eval_episode calls our custom one!
+    import eval_pointcloud_pose_steering_reach
+    eval_pointcloud_pose_steering_reach.save_rerun_timeline = save_rerun_timeline
 except Exception as e:
     _import_err_msg = str(e)
     def run_eval_episode(*args, **kwargs):  # type: ignore[misc]
