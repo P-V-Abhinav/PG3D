@@ -581,6 +581,8 @@ def _build_graspgen_constraint(
         f"[GraspGen] Episode {spec.output_index}: "
         f"CartesianPoseConstraint  pos_tol={pos_tol:.3f}m  "
         f"rot_tol={rot_tol:.3f}rad  weight={weight:.1f}",
+        flush=True,
+    )
     constraints: list[Any] = [constraint]
 
     # Optionally stack a joint posture constraint (same as pose steering eval)
