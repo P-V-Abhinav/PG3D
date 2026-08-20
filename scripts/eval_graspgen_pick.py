@@ -284,7 +284,7 @@ def save_rerun_timeline(
                         if path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3:
                             rejected_paths.append(path)
                 if rejected_paths:
-                    rr.log("world/rejected_paths", rr.LineStrips3D(rejected_paths, colors=[255, 0, 0, 128]))
+                    rr.log("world/rejected_paths", rr.LineStrips3D(rejected_paths, colors=[128, 128, 128, 128]))
                 selected = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)
                 if selected.ndim == 2 and selected.shape[0] >= 2 and selected.shape[1] == 3:
                     rr.log("world/selected_path", rr.LineStrips3D([selected], colors=[0, 255, 0]))
@@ -553,29 +553,33 @@ def _pitchfork_lines_for_grasp(
     finger_width: float = _GRASP_VIS_FINGER_WIDTH,
     finger_depth: float = _GRASP_VIS_FINGER_DEPTH,
 ) -> list[np.ndarray]:
-    """Return three line segments that form a T-bar / pitchfork for one grasp SE(3).
-
-    The pitchfork matches Viser's canonical grasp frame:
-      • Local Z  = approach axis  → one line from TCP backward along -Z.
-      • Local X  = finger axis    → two lines left/right of the approach tip.
-
-    Returns a list of three (2, 3) float32 arrays (each a two-point segment).
-    """
+    """Return line segments that form a T-bar / pitchfork for one grasp SE(3)."""
     grasp_T = np.asarray(grasp_T, dtype=np.float32)
     origin   = grasp_T[:3, 3]           # TCP / grasp contact centre
-    approach = grasp_T[:3, 2]           # local Z column
+    approach = grasp_T[:3, 2]           # local Z column (points FROM base TO TCP)
     finger   = grasp_T[:3, 0]           # local X column
 
-    # 1. Approach arm: from origin, going backward (-approach)
-    tip = origin - approach * approach_len
-
-    # 2 & 3. Finger span: two equal lines extending along ±X from the tip
-    half = finger_width / 2.0
-    finger_root = tip + approach * finger_depth
+    # TCP is exactly at 'origin'.
+    # The base of the fingers (crossbar) is 'finger_depth' behind the TCP.
+    finger_root = origin - approach * finger_depth
+    
+    # Handle / approach line (from the finger root, backwards)
+    handle_end = finger_root - approach * approach_len
+    
+    # Crossbar
+    half_width = finger_width / 2.0
+    left_root = finger_root - finger * half_width
+    right_root = finger_root + finger * half_width
+    
+    # Prongs (from the root, forwards to the tips at the TCP plane)
+    left_tip = origin - finger * half_width
+    right_tip = origin + finger * half_width
+    
     lines = [
-        np.stack([origin, tip], axis=0),                             # approach
-        np.stack([finger_root - finger * half,
-                  finger_root + finger * half], axis=0),             # finger bar
+        np.stack([finger_root, handle_end], axis=0),   # handle
+        np.stack([left_root, right_root], axis=0),     # crossbar
+        np.stack([left_root, left_tip], axis=0),       # left prong
+        np.stack([right_root, right_tip], axis=0),     # right prong
     ]
     return [l.astype(np.float32) for l in lines]
 
