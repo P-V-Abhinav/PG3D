@@ -201,7 +201,92 @@ from scripts.rollout_dp3_reach_policy import (
 # save_rerun_timeline is re-exported so any code that imports it from this
 # module still works.  GraspGen pitchfork logging is done explicitly in main()
 # after run_eval_episode returns, writing a companion .pitchforks.rrd file.
-save_rerun_timeline = _save_rerun_timeline_base
+def save_rerun_timeline(
+    path: "Path",
+    timeline: list,
+    *,
+    constraints: list | None = None,
+    decisions: list | None = None,
+    _graspgen_rerun_data: dict | None = None,
+) -> None:
+    try:
+        import rerun as rr
+    except ImportError:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rr.init("pg3d_dp3_reach_policy_rollout", spawn=False)
+    rr.save(str(path))
+    
+    # Inject GraspGen pitchforks into the main Rerun session!
+    if _graspgen_rerun_data is not None:
+        rr.set_time_sequence("step", 0)
+        _log_graspgen_rerun(
+            _graspgen_rerun_data["all_grasps"],
+            _graspgen_rerun_data["all_scores"],
+            _graspgen_rerun_data["best_idx"],
+            _graspgen_rerun_data["object_cloud"],
+            episode_index=_graspgen_rerun_data.get("episode_index", 0),
+        )
+
+    if constraints:
+        from pg3d.viz.constraints import avoid_region_line_visuals, cartesian_pose_line_visuals
+
+        rr.set_time_sequence("step", 0)
+        for visual in avoid_region_line_visuals(constraints):
+            rr.log(
+                f"world/constraints/{visual.name}",
+                rr.LineStrips3D(visual.line_strips, colors=visual.color),
+                static=True,
+            )
+        for constraint in constraints:
+            if type(constraint).__name__ == "CartesianPoseConstraint":
+                for visual in cartesian_pose_line_visuals(constraint):
+                    rr.log(
+                        f"world/constraints/{visual.name}",
+                        rr.LineStrips3D(visual.line_strips, colors=visual.color),
+                        static=True,
+                    )
+
+    for step_idx, entry in enumerate(timeline):
+        rr.set_time_sequence("step", step_idx)
+        import numpy as np
+        valid = np.asarray(entry["point_valid_mask"], dtype=bool)
+        points = np.asarray(entry["point_cloud"], dtype=np.float32)[valid]
+        if points.size:
+            rr.log("world/point_cloud", rr.Points3D(points, colors=[180, 180, 180]))
+            robot_points = points[np.asarray(entry["robot_mask"], dtype=bool)[valid]]
+            if robot_points.size:
+                rr.log("world/robot_points", rr.Points3D(robot_points, colors=[0, 128, 255]))
+        target = np.asarray(entry["target_position"], dtype=np.float32).reshape(1, 3)
+        if np.all(np.isfinite(target)):
+            rr.log("world/goal", rr.Points3D(target, colors=[0, 255, 0]))
+        tcp = np.asarray(entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3].reshape(1, 3)
+        if np.all(np.isfinite(tcp)):
+            rr.log("world/tcp", rr.Points3D(tcp, colors=[255, 220, 0]))
+
+        if decisions is not None:
+            active_decision = None
+            for d_step, d in decisions:
+                if d_step <= step_idx:
+                    active_decision = d
+                else:
+                    break
+            if active_decision is not None and getattr(active_decision, "result", None) is not None:
+                result = active_decision.result
+                rejected_paths = []
+                for candidate in result.candidates:
+                    if candidate is not result.selected:
+                        path = np.asarray(candidate.rollout.eef_path, dtype=np.float32)
+                        if path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3:
+                            rejected_paths.append(path)
+                if rejected_paths:
+                    rr.log("world/rejected_paths", rr.LineStrips3D(rejected_paths, colors=[255, 0, 0, 128]))
+                selected = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)
+                if selected.ndim == 2 and selected.shape[0] >= 2 and selected.shape[1] == 3:
+                    rr.log("world/selected_path", rr.LineStrips3D([selected], colors=[0, 255, 0]))
+    rr.disconnect()
+
 
 # Re-register the plain "PG3DReach-RealObstacle-v0" env in case only this
 # script is imported (obstacle_envs.py only registers the XArm7 variants).
@@ -519,19 +604,7 @@ def _log_graspgen_rerun(
         )
 
     # All candidates — green lines
-    all_strips: list[np.ndarray] = []
-    for i in range(all_grasps.shape[0]):
-        if i == best_idx:
-            continue
-        lines = _pitchfork_lines_for_grasp(all_grasps[i])
-        all_strips.extend(lines)
-
-    if all_strips:
-        rr.log(
-            "world/graspgen/candidates",
-            rr.LineStrips3D(all_strips, colors=[60, 200, 60, 160], radii=0.001),
-            static=True,
-        )
+    # (Disabled: user requested ONLY the best grasp to be shown in Rerun)
 
     # Best grasp — bright yellow lines, thicker
     best_lines = _pitchfork_lines_for_grasp(all_grasps[best_idx])
@@ -584,7 +657,7 @@ def _show_graspgen_viser(
         return
 
     server = viser.ViserServer()
-    server.scene.world_axes.visible = True
+    server.scene.world_axes.visible = False
 
     # Object point cloud
     if object_cloud.shape[0] > 0:
@@ -670,7 +743,11 @@ def _build_graspgen_constraint(
     slot from the original signature so the caller loop doesn't need changes.
     """
     # --- 1. Reset ---
-    if zarr_context is not None:
+    # For jstbanana-v0 we explicitly want to test on freshly randomized
+    # objects (ignoring the dataset state), otherwise the cheezit box
+    # is left at the origin because it doesn't exist in the legacy dataset.
+    is_banana = getattr(env.unwrapped, "_JSTBANANA_Z", None) is not None
+    if zarr_context is not None and not is_banana:
         obs, info = _reset_to_zarr_episode(env, rollout_seed=spec.seed, zarr_context=zarr_context)
     else:
         obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
@@ -1607,6 +1684,12 @@ def main(argv: list[str] | None = None) -> int:
                     else None
                 )
 
+                # Disable zarr_context for jstbanana-v0 so run_eval_episode
+                # doesn't forcefully reset the goal_site away from the object.
+                is_banana = getattr(sim_env.unwrapped, "_JSTBANANA_Z", None) is not None
+                if is_banana:
+                    zarr_context = None
+
                 # *** KEY DIFFERENCE FROM POSE STEERING: use GraspGen constraint ***
                 constraints, pending_spawn = _build_graspgen_constraint(
                     sim_env,
@@ -1671,43 +1754,6 @@ def main(argv: list[str] | None = None) -> int:
                         parallel_pool=None,
                     )
                     rows.append(row)
-                    # --- Pitchfork Rerun logging (post run_eval_episode) ---
-                    # run_eval_episode writes the .rrd via save_rerun_timeline.
-                    # We write a companion .pitchforks.rrd in the same directory
-                    # with all GraspGen candidate grasps visualized as T-bar lines.
-                    if write_rerun:
-                        rerun_data = getattr(args, "_graspgen_rerun_data", {}).get(
-                            spec.output_index
-                        )
-                        if rerun_data is not None:
-                            rerun_data["episode_index"] = spec.output_index
-                            pitchfork_path = (
-                                args.output_dir / "rerun" / method
-                                / f"episode_{spec.output_index:03d}.pitchforks.rrd"
-                            )
-                            pitchfork_path.parent.mkdir(parents=True, exist_ok=True)
-                            try:
-                                import rerun as rr
-                                rr.init("pg3d_graspgen_pitchforks", spawn=False)
-                                rr.save(str(pitchfork_path))
-                                _log_graspgen_rerun(
-                                    rerun_data["all_grasps"],
-                                    rerun_data["all_scores"],
-                                    rerun_data["best_idx"],
-                                    rerun_data["object_cloud"],
-                                    episode_index=spec.output_index,
-                                )
-                                rr.disconnect()
-                                print(
-                                    f"[GraspGen] Pitchfork .rrd → {pitchfork_path}",
-                                    flush=True,
-                                )
-                            except Exception as rr_exc:
-                                print(
-                                    f"[GraspGen] Warning: pitchfork Rerun write failed: "
-                                    f"{type(rr_exc).__name__}: {rr_exc}",
-                                    flush=True,
-                                )
                     with timer.time("json_write", artifact="metrics"):
                         metrics_file.write(json.dumps(_jsonable(row), sort_keys=True) + "\n")
                         metrics_file.flush()

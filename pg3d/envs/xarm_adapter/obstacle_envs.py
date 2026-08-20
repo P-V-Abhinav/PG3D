@@ -381,10 +381,9 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             self.cheezit = actors.build_box(self.scene, half_sizes=[0.02, 0.08, 0.02], color=[1, 1, 0, 1], name="fallback_cheezit", body_type="kinematic")
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
-    # These match the effective crop bounds used by eval_graspgen_pick.py
-    # (X: [-0.9, 0.7] cropped to max 0.7, Y: [-0.6, 0.6]) with a small inset.
-    _JSTBANANA_X_RANGE = (-0.70, 0.65)
-    _JSTBANANA_Y_RANGE = (-0.50, 0.50)
+    # Tighter bounds to ensure the object spawns comfortably within robot reach.
+    _JSTBANANA_X_RANGE = (-0.30, 0.35)
+    _JSTBANANA_Y_RANGE = (-0.30, 0.30)
     _JSTBANANA_Z     = 0.08   # table surface height for object base
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
