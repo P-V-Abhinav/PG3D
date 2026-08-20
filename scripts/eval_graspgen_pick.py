@@ -1361,8 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
                 
                 eval_module.entry_to_world_model_observation = masked_entry_to_wm
 
-                try:
-                    for method in args.methods:
+                for method in args.methods:
                     row = run_eval_episode(
                         sim_env=sim_env,
                         ghost_env=ghost_env,
@@ -1429,8 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"  Achieved Rot Error: {pm['rotation_error_at_min_position']:.4f} rad (at best position)")
                         print(f"  Strictly Satisfied: {pm['satisfied']} (within {pm['position_tolerance']}m and {pm['rotation_tolerance']:.4f}rad)")
                         print("=============================\n", flush=True)
-                finally:
-                    eval_module.entry_to_world_model_observation = orig_entry_to_wm
+                eval_module.entry_to_world_model_observation = orig_entry_to_wm
                     
                 timing_written = _write_new_timing_events(
                     timer, timings_path, start_index=timing_written
