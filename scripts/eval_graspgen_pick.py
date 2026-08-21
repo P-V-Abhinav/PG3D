@@ -1748,6 +1748,7 @@ def _execute_open_loop_grasp(
     # 1. Cartesian interpolation for the approach
     steps = 40
     qpos_track = current_qpos.copy()
+    current_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()
     
     active_mask = np.zeros(sim_env.unwrapped.agent.robot.dof, dtype=bool)
     active_mask[:7] = True  # Only IK the 7 arm joints
@@ -1755,7 +1756,9 @@ def _execute_open_loop_grasp(
     for i in range(1, steps + 1):
         alpha = i / steps
         target_p = current_pos + alpha * (final_grasp_pos - current_pos)
-        target_pose = sapien.Pose(p=target_p, q=final_grasp_quat)
+        # Keep orientation constant! The policy already aligned the gripper.
+        # Enforcing final_grasp_quat abruptly causes massive IK twisting.
+        target_pose = sapien.Pose(p=target_p, q=current_quat)
         
         ik_qpos, success, error = model.compute_inverse_kinematics(
             link_idx,
