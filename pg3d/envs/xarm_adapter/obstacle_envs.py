@@ -433,10 +433,13 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             pos_np = np.array([sx, sy, self._JSTBANANA_Z], dtype=np.float32)
             pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-            # Random rotation around Z axis
+            # Stand the object up (90 deg around X) then apply random Z rotation
             theta = rng.uniform(0, 2 * np.pi)
+            import scipy.spatial.transform
+            r = scipy.spatial.transform.Rotation.from_euler('zx', [theta, np.pi/2], degrees=False)
+            q_xyzw = r.as_quat()
             q_t = torch.tensor(
-                [np.cos(theta / 2), 0, 0, np.sin(theta / 2)],
+                [q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]],
                 dtype=torch.float32, device=self.device,
             ).unsqueeze(0)
 
