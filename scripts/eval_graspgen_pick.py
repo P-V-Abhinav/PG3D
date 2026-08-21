@@ -330,42 +330,35 @@ logger = logging.getLogger(__name__)
 #  GraspGen utilities  (everything NEW compared to pose_steering eval)
 # ===========================================================================
 
-def _hide_marker_spheres_from_cameras(env: Any) -> None:
-    """Set visibility=0 on the start_site and goal_site render bodies.
+def _make_marker_spheres_strictly_virtual(env: Any) -> None:
+    """Replace start_site and goal_site with empty kinematic actors.
 
-    Both spheres are kinematic actors with no physics collision.  They appear
-    in the depth cameras and therefore generate spurious points in the point
-    cloud that is fed to GraspGen.  Setting visibility=0 on their
-    RenderBodyComponents removes them from ALL render passes (colour AND depth),
-    so they produce zero points.
-
-    Must be called AFTER gym.make() / env.reset() because SAPIEN 3 only
-    attaches RenderBodyComponents to actors after the scene is built.
+    This makes them strictly virtual: they retain their coordinate frame and
+    pose so the policy can still compute tcp_to_goal_pos, but they have absolutely
+    no visual or collision geometry. They become fully invisible to the depth
+    cameras and will never contaminate the point cloud.
     """
-    try:
-        import sapien.render as sr
-    except ImportError:
-        print("[GraspGen] WARNING: sapien.render not available; cannot hide marker spheres.", flush=True)
+    unwrapped = getattr(env, "unwrapped", env)
+    scene = getattr(unwrapped, "scene", None)
+    if scene is None:
         return
 
-    unwrapped = getattr(env, "unwrapped", env)
-    hidden: list[str] = []
+    replaced = []
     for attr in ("start_site", "goal_site"):
         actor = getattr(unwrapped, attr, None)
-        if actor is None:
-            continue
-        try:
-            bodies = actor.find_components_by_type(sr.RenderBodyComponent)
-            for body in bodies:
-                body.visibility = 0.0
-            hidden.append(attr)
-        except Exception as exc:
-            print(f"[GraspGen] WARNING: could not hide {attr}: {exc}", flush=True)
+        if actor is not None:
+            pose = actor.pose
+            scene.remove_actor(actor)
+            
+            builder = scene.create_actor_builder()
+            new_actor = builder.build_kinematic(name=f"{attr}_virtual")
+            new_actor.set_pose(pose)
+            
+            setattr(unwrapped, attr, new_actor)
+            replaced.append(attr)
 
-    if hidden:
-        print(f"[GraspGen] Hidden from sim_env cameras: {hidden}", flush=True)
-    else:
-        print("[GraspGen] WARNING: no marker actors found to hide.", flush=True)
+    if replaced:
+        print(f"[GraspGen] Made strictly virtual in sim_env: {replaced}", flush=True)
 
 
 def load_graspgen_sampler(config_path: str | Path) -> Any:
@@ -1815,19 +1808,15 @@ def main(argv: list[str] | None = None) -> int:
                           max_episode_steps=args.max_episode_steps),
         )
 
-        # ── Hide marker spheres in sim_env cameras ──────────────────────────
-        # start_site (TCP marker) and goal_site (target sphere) are kinematic
-        # actors with no physics collision.  They appear in depth camera images
-        # and therefore produce spurious points in the point cloud fed to both
-        # the DP3 policy and GraspGen.  For sim_env (the env whose cameras we
-        # actually use for the point cloud), we hide them completely.
-        # They remain visible in ghost_env / video_env for visual debugging.
-        #
-        # We do this AFTER gym.make() (not inside _load_scene) because SAPIEN 3
-        # only attaches RenderBodyComponents to actors after the full scene is
-        # built, which happens during env.reset() — but gym.make() triggers an
-        # initial reset internally so the scene IS ready here.
-        _hide_marker_spheres_from_cameras(sim_env)
+        # ── Make marker spheres virtual ONLY in sim_env ─────────────────────
+        # We completely strip the visual shapes from start_site and goal_site
+        # in the sim_env so they NEVER appear in the point cloud cameras.
+        # However, because ghost_env and video_env are separate env instances
+        # (created via separate gym.make calls), they RETAIN their original
+        # visual shapes. This perfectly matches the "virtual obstacle" pattern:
+        # invisible to the policy, but visible in the video/debug rendering!
+        _make_marker_spheres_strictly_virtual(sim_env)
+
         adapter = DP3ChunkPolicyAdapter(
             policy,
             action_mode=action_mode,
