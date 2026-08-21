@@ -493,23 +493,14 @@ def _crop_object_pointcloud(
     robot_mask: np.ndarray,
     target_xyz: np.ndarray,
     radius: float,
-    *,
-    marker_positions: list[np.ndarray] | None = None,
-    marker_radius: float = 0.05,
 ) -> np.ndarray:
     """Crop the scene point cloud to a sphere around ``target_xyz``.
 
     Args:
         scene_cloud      : (N, 3) world-frame scene PC from ManiSkill cameras.
         robot_mask       : (N,)   True where point belongs to the robot.
-        target_xyz       : (3,)   world-frame centroid (from actor pose, NOT goal_site).
+        target_xyz       : (3,)   world-frame centroid (from actor pose).
         radius           : sphere crop radius in metres (default 0.10 m).
-        marker_positions : list of (3,) world-frame centres of kinematic marker
-                           actors (start_site, goal_site).  Points within
-                           ``marker_radius`` of any marker are excluded so the
-                           sphere meshes don't contaminate the cloud sent to
-                           GraspGen and corrupt its centroid estimate.
-        marker_radius    : exclusion radius around each marker (default 0.05 m).
 
     Returns:
         (M, 3) float32 object-only point cloud (may be empty).
@@ -524,25 +515,6 @@ def _crop_object_pointcloud(
     # Crop to the object bounding sphere.
     dists = np.linalg.norm(env_cloud - target_xyz.reshape(1, 3), axis=1)
     env_cloud = env_cloud[dists < float(radius)]
-
-    # Remove points belonging to kinematic marker spheres (start_site / goal_site).
-    # These actors are rendered by the cameras but have no physics collision, so
-    # the robot_mask does NOT exclude them.  Their points shift the centroid used
-    # inside _run_graspgen and cause the returned grasp translations to be offset.
-    if marker_positions and env_cloud.shape[0] > 0:
-        keep = np.ones(env_cloud.shape[0], dtype=bool)
-        for m_xyz in marker_positions:
-            m_dists = np.linalg.norm(env_cloud - m_xyz.reshape(1, 3), axis=1)
-            keep &= m_dists >= float(marker_radius)
-        n_before = env_cloud.shape[0]
-        env_cloud = env_cloud[keep]
-        n_removed = n_before - env_cloud.shape[0]
-        if n_removed > 0:
-            print(
-                f"[GraspGen] Removed {n_removed} marker-sphere points from object crop "
-                f"(marker_radius={marker_radius:.3f}m).",
-                flush=True,
-            )
 
     return env_cloud.astype(np.float32)
 
@@ -756,8 +728,8 @@ def _log_graspgen_rerun(
         rr.Points3D(
             all_grasps[best_idx:best_idx + 1, :3, 3],
             colors=[255, 80, 0], radii=0.008,
+            static=True,
         ),
-        static=True,
     )
     print(
         f"[GraspGen] Logged {all_grasps.shape[0]} candidates to Rerun "
@@ -949,20 +921,13 @@ def _build_graspgen_constraint(
             flush=True,
         )
 
-    # --- 4. Crop to object, masking out kinematic marker spheres ---
+    # --- 4. Crop to object ---
+    # The start_site and goal_site markers are strictly virtual and invisible,
+    # so we DO NOT need to extract their positions and filter them out anymore.
+    # Filtering around goal_site was accidentally deleting the actual object points!
     crop_radius = float(getattr(args, "grasp_object_crop_radius", 0.10))
-    # start_site and goal_site are rendered by cameras but have no collision —
-    # the robot_mask won't cover them.  Get their world positions so we can
-    # remove their points before the centroid computation inside _run_graspgen.
-    marker_xyzs = _get_marker_positions(env)
-    # Use a 4 cm exclusion radius (sphere radius is goal_thresh ≈ 0.025 m, so
-    # 4 cm comfortably removes the rendered disc/sphere without cutting into the
-    # actual object when they are far apart).
-    marker_radius_excl = float(getattr(args, "graspgen_marker_excl_radius", 0.04))
     object_crop = _crop_object_pointcloud(
-        scene_cloud, robot_mask, target_xyz, crop_radius,
-        marker_positions=marker_xyzs,
-        marker_radius=marker_radius_excl,
+        scene_cloud, robot_mask, target_xyz, crop_radius
     )
 
     print(
