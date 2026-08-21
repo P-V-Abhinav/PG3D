@@ -1740,42 +1740,41 @@ def _execute_open_loop_grasp(
     tcp_link_name = sim_env.unwrapped.agent.tcp.name
     link_idx = model.get_link_index(tcp_link_name)
     
-    # 1. Scrap the GraspGen target. The user explicitly requested to just 
-    # move straight down by 15cm from the current position!
+    # 1. Target is straight down by 15cm from current TCP position
     target_pos = current_pos.copy()
     target_pos[2] -= 0.15
+    target_pose = sapien.Pose(p=target_pos, q=current_quat)
     
-    steps = 40
-    qpos_track = current_qpos.copy()
+    # Solve IK exactly ONCE for the final destination
+    final_qpos, success, error = model.compute_inverse_kinematics(
+        link_idx,
+        target_pose,
+        initial_qpos=current_qpos,
+        max_iterations=200,
+    )
     
-    for i in range(1, steps + 1):
-        alpha = i / steps
-        target_p = current_pos + alpha * (target_pos - current_pos)
-        target_pose = sapien.Pose(p=target_p, q=current_quat)
-        
-        # Omit active_qmask to avoid masking the wrong DOFs, which caused the arm to twist.
-        ik_qpos, success, error = model.compute_inverse_kinematics(
-            link_idx,
-            target_pose,
-            initial_qpos=qpos_track,
-            max_iterations=100,
-        )
-        
-        if success:
-            qpos_track = ik_qpos
+    # Safety check: reject the solution if it implies a huge, implausible joint jump
+    arm_dof = 7
+    joint_delta = np.abs(final_qpos[:arm_dof] - current_qpos[:arm_dof])
+    
+    if not success or joint_delta.max() > 0.5:
+        print(f"\n[Phase 1 Error] IK sanity check FAILED (success={success}, max_delta={joint_delta.max():.3f} rad). Aborting descent rather than flying away.", flush=True)
+    else:
+        steps = 40
+        for i in range(1, steps + 1):
+            alpha = i / steps
+            qpos_step = current_qpos.copy()
+            qpos_step[:arm_dof] = (1 - alpha) * current_qpos[:arm_dof] + alpha * final_qpos[:arm_dof]
             
-        # Stepping the environment requires an action matching its full action space
-        # (8-dim for xarm7_gripper). We pad the 7 arm joints with the fully open gripper.
-        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        action[:7] = qpos_track[:7]
-        if action.shape[0] > 7:
-            action[7:] = 0.0  # 0.0 is fully open for the mimic controller!
-        
-        # Step the physics
-        sim_env.step(action)
-        if video_env is not None:
-            video_env.step(action)
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+            action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+            action[:arm_dof] = qpos_step[:arm_dof]
+            if action.shape[0] > arm_dof:
+                action[arm_dof] = 0.0  # Keep gripper 100% open during descent
+                
+            sim_env.step(action)
+            if video_env is not None:
+                video_env.step(action)
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
             
     # Post-approach debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
