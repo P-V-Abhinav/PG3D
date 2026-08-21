@@ -1078,7 +1078,7 @@ def _build_graspgen_constraint(
         args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
     # --- 8b. Create Pre-Grasp Pose ---
-    approach_offset = float(getattr(args, "grasp_approach_offset", 0.10))
+    approach_offset = float(getattr(args, "grasp_approach_offset", 0.02))
     # approach vector is the local Z axis of the adjusted rotation
     approach_vec = adj_rot[:, 2]
     # offset backward (negative approach_vec)
@@ -1741,72 +1741,9 @@ def _execute_open_loop_grasp(
     links = [link.name for link in sim_env.unwrapped.agent.robot.get_links()]
     link_idx = links.index(tcp_link_name)
     
-    # 1. Target is straight down by 15cm from current TCP position
-    target_pos = current_pos.copy()
-    target_pos[2] -= 0.15
-    target_pose = sapien.Pose(p=target_pos, q=current_quat)
+    # 1. Skip the Cartesian descent entirely. The goal marker was placed 2cm above the object, 
+    # so the arm is already close enough. Just move straight to closing the gripper.
     
-    # 1. Scrap the nonlinear IK. Use Jacobian velocity control for a purely downward 15cm motion.
-    # The XArm7 has 7 DOFs for a 6-DOF task, making it redundant. Nonlinear IK can jump to a different 
-    # nullspace configuration (flipping the elbow) to achieve the exact same pose, causing the arm to twist.
-    # A damped least-squares pseudo-inverse finds the *minimum norm* joint velocities, avoiding any nullspace drift.
-    
-    steps = 40
-    distance = 0.15
-    dz_per_step = -distance / steps
-    arm_dof = 7
-    damping = 1e-4
-    
-    qpos_track = current_qpos.copy()
-    
-    for step_i in range(1, steps + 1):
-        # SAPIEN 3 PinocchioModel API
-        model.compute_forward_kinematics(qpos_track)
-        
-        # Try to get the world-frame Jacobian
-        try:
-            J_full = model.get_link_jacobian(link_idx, local=False)
-        except AttributeError:
-            # Fallback for some SAPIEN versions if get_link_jacobian doesn't exist
-            J_full = model.compute_single_link_local_jacobian(link_idx, qpos_track)
-            # Transform from local to world using the link's world pose
-            # (If this fallback is hit, we need to transform the twist, but let's hope local=False works)
-            # We'll just trust the user's snippet!
-            pass
-            
-        if hasattr(model, 'get_link_jacobian'):
-            J = J_full[:, :arm_dof]
-        else:
-            # If we used local jacobian, we need the twist in the local frame.
-            # But the user's snippet assumes world frame. Let's stick to the user's snippet.
-            J = model.compute_full_jacobian(qpos_track)[:6, :arm_dof] # Approximation, compute_full_jacobian might be different
-            
-        J = J_full[:, :arm_dof]
-        
-        twist = np.zeros(6, dtype=np.float32)
-        twist[2] = dz_per_step  # Pure world-frame Z velocity
-        
-        # Damped least squares
-        JJt = J @ J.T
-        dq = J.T @ np.linalg.solve(JJt + damping * np.eye(6), twist)
-        
-        # Safety check
-        if np.abs(dq).max() > 0.05:
-            print(f"\n[Phase 1 Error] step {step_i}: suspicious dq {np.abs(dq).max():.4f} rad. Aborting descent.", flush=True)
-            break
-            
-        qpos_track[:arm_dof] += dq
-        
-        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        action[:arm_dof] = qpos_track[:arm_dof]
-        if action.shape[0] > arm_dof:
-            action[arm_dof] = 0.0  # Keep gripper 100% open
-            
-        sim_env.step(action)
-        if video_env is not None:
-            video_env.step(action)
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
-            
     # Post-approach debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
     current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
