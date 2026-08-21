@@ -37,7 +37,12 @@ def _hide_marker_spheres(env: Any) -> None:
             for obj in getattr(actor, "_objs", [actor]):
                 body = obj.find_component_by_type(sr.RenderBodyComponent)
                 if body is not None:
-                    body.entity.remove_component(body)
+                    if hasattr(body, 'set_visibility'):
+                        body.set_visibility(0.0)
+                    elif hasattr(body, 'set_visible'):
+                        body.set_visible(False)
+                    else:
+                        body.disable()
 
 
 def _create_cone_obj(

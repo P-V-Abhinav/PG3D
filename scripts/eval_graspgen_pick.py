@@ -312,7 +312,12 @@ class _PG3DReachRealObstacleEnv(PG3DReachEnv):
                     for obj in getattr(actor, "_objs", [actor]):
                         body = obj.find_component_by_type(sr.RenderBodyComponent)
                         if body is not None:
-                            body.entity.remove_component(body)
+                            if hasattr(body, 'set_visibility'):
+                                body.set_visibility(0.0)
+                            elif hasattr(body, 'set_visible'):
+                                body.set_visible(False)
+                            else:
+                                body.disable()
         except ImportError:
             pass
 
@@ -363,7 +368,12 @@ def _make_marker_spheres_strictly_virtual(env: Any) -> None:
                 for obj in getattr(actor, "_objs", [actor]):
                     body = obj.find_component_by_type(sr.RenderBodyComponent)
                     if body is not None:
-                        body.entity.remove_component(body)
+                        if hasattr(body, 'set_visibility'):
+                            body.set_visibility(0.0)
+                        elif hasattr(body, 'set_visible'):
+                            body.set_visible(False)
+                        else:
+                            body.disable()
                 stripped.append(attr)
             except Exception as exc:
                 print(f"[GraspGen] WARNING: could not strip {attr}: {exc}", flush=True)
@@ -801,30 +811,39 @@ def _show_graspgen_viser(
     s_range = max(s_max - s_min, 1e-6)
 
     for i, (grasp_T, score) in enumerate(zip(all_grasps, all_scores)):
-        if i != best_idx:
-            continue
-
         pos = grasp_T[:3, 3]
+
+        if i == best_idx:
+            color = (255, 80, 0)
+            node_name = "grasps/best"
+            line_width = 3.0
+            radius = 0.015
+        else:
+            normalized_score = float((score - s_min) / s_range)
+            # Interpolate between blue (lowest score) and green (highest score)
+            color = (0, int(255 * normalized_score), int(255 * (1 - normalized_score)))
+            node_name = f"grasps/candidate_{i}"
+            line_width = 1.0
+            radius = 0.005
 
         # ── 1. Plain sphere at TCP position ──────────────────────────────────
         # This makes it immediately obvious whether the POSITION is correct
         # regardless of orientation/pitchfork rendering artifacts.
         server.scene.add_icosphere(
-            "grasps/best/tcp_sphere",
-            radius=0.015,
-            color=(255, 80, 0),
+            f"{node_name}/tcp_sphere",
+            radius=radius,
+            color=color,
             position=pos,
         )
 
         # ── 2. Pitchfork lines (approach + finger bars) ───────────────────────
-        color = (255, 80, 0)
         lines = _pitchfork_lines_for_grasp(grasp_T)
         for j, seg in enumerate(lines):
             server.scene.add_line_segments(
-                f"grasps/best/{j}",
+                f"{node_name}/{j}",
                 points=np.expand_dims(seg, 0),
                 colors=color,
-                line_width=3.0,
+                line_width=line_width,
             )
 
     # ── 3. Actor centroid marker (magenta) ────────────────────────────────────
