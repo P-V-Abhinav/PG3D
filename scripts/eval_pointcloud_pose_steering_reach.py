@@ -1233,7 +1233,7 @@ def run_eval_episode(
             pos_t = torch.tensor(target_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
             sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
             # The observation contains target_position pulled from goal_site, so we must re-generate it!
-            sim_obs = sim_env.unwrapped._get_obs()
+            sim_obs = sim_env.unwrapped.get_obs()
             
     video_env: Any | None = None
     with timer.time("observation_adapt_crop", source="reset"):
