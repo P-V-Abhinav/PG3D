@@ -304,12 +304,16 @@ class _PG3DReachRealObstacleEnv(PG3DReachEnv):
             name="obstacle",
             body_type="kinematic",
         )
-        for attr in ("start_site", "goal_site"):
-            actor = getattr(self, attr, None)
-            if actor is not None:
-                for obj in getattr(actor, "_objs", [actor]):
-                    for body in obj.get_render_bodies():
-                        body.set_visible(False)
+        try:
+            import sapien.render as sr
+            for attr in ("start_site", "goal_site"):
+                actor = getattr(self, attr, None)
+                if actor is not None:
+                    for obj in getattr(actor, "_objs", [actor]):
+                        for body in obj.find_components_by_type(sr.RenderBodyComponent):
+                            body.set_visible(False)
+        except ImportError:
+            pass
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
@@ -344,6 +348,11 @@ def _make_marker_spheres_strictly_virtual(env: Any) -> None:
     no visual geometry. They become fully invisible to the depth
     cameras and will never contaminate the point cloud.
     """
+    try:
+        import sapien.render as sr
+    except ImportError:
+        return
+
     unwrapped = getattr(env, "unwrapped", env)
     stripped = []
     for attr in ("start_site", "goal_site"):
@@ -351,7 +360,7 @@ def _make_marker_spheres_strictly_virtual(env: Any) -> None:
         if actor is not None:
             try:
                 for obj in getattr(actor, "_objs", [actor]):
-                    for body in obj.get_render_bodies():
+                    for body in obj.find_components_by_type(sr.RenderBodyComponent):
                         body.set_visible(False)
                 stripped.append(attr)
             except Exception as exc:

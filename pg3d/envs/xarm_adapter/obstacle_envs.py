@@ -26,11 +26,16 @@ from pg3d.envs.xarm_adapter.reach_env import PG3DReachXArm7GripperEnv
 
 def _hide_marker_spheres(env: Any) -> None:
     """Hide the start_site and goal_site markers so they do not show in point clouds."""
+    try:
+        import sapien.render as sr
+    except ImportError:
+        return
+        
     for attr in ("start_site", "goal_site"):
         actor = getattr(env, attr, None)
         if actor is not None:
             for obj in getattr(actor, "_objs", [actor]):
-                for body in obj.get_render_bodies():
+                for body in obj.find_components_by_type(sr.RenderBodyComponent):
                     body.set_visible(False)
 
 
