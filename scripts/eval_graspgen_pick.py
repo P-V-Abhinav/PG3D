@@ -1756,16 +1756,21 @@ def _execute_open_loop_grasp(
     
     # Safety check: reject the solution if it implies a huge, implausible joint jump
     arm_dof = 7
-    joint_delta = np.abs(final_qpos[:arm_dof] - current_qpos[:arm_dof])
+    raw_delta = final_qpos[:arm_dof] - current_qpos[:arm_dof]
     
-    if not success or joint_delta.max() > 0.5:
-        print(f"\n[Phase 1 Error] IK sanity check FAILED (success={success}, max_delta={joint_delta.max():.3f} rad). Aborting descent rather than flying away.", flush=True)
+    # Wrap each joint's delta into (-pi, pi] to pick the short path, avoiding 2*pi multiples
+    wrapped_delta = np.mod(raw_delta + np.pi, 2 * np.pi) - np.pi
+    
+    max_delta = np.abs(wrapped_delta).max()
+    
+    if not success or max_delta > 0.5:
+        print(f"\n[Phase 1 Error] IK sanity check FAILED (success={success}, max_delta={max_delta:.3f} rad after unwrap). Aborting descent rather than flying away.", flush=True)
     else:
         steps = 40
         for i in range(1, steps + 1):
             alpha = i / steps
             qpos_step = current_qpos.copy()
-            qpos_step[:arm_dof] = (1 - alpha) * current_qpos[:arm_dof] + alpha * final_qpos[:arm_dof]
+            qpos_step[:arm_dof] = current_qpos[:arm_dof] + alpha * wrapped_delta
             
             action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
             action[:arm_dof] = qpos_step[:arm_dof]
