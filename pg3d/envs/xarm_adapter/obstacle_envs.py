@@ -24,6 +24,16 @@ from mani_skill.utils.structs.pose import Pose
 from pg3d.envs.xarm_adapter.reach_env import PG3DReachXArm7GripperEnv
 
 
+def _hide_marker_spheres(env: Any) -> None:
+    """Hide the start_site and goal_site markers so they do not show in point clouds."""
+    for attr in ("start_site", "goal_site"):
+        actor = getattr(env, attr, None)
+        if actor is not None:
+            for obj in getattr(actor, "_objs", [actor]):
+                for body in obj.get_render_bodies():
+                    body.set_visible(False)
+
+
 def _create_cone_obj(
     filepath: str,
     radius: float = 0.05,
@@ -121,6 +131,7 @@ class PG3DReachXArm7RealObstacleEnv(PG3DReachXArm7GripperEnv):
             name="obstacle",
             body_type="kinematic",
         )
+        _hide_marker_spheres(self)
 
     def _initialize_episode(
         self, env_idx: torch.Tensor, options: dict[str, Any]
@@ -151,6 +162,7 @@ class PG3DReachRealConeObstacleEnv(PG3DReachXArm7GripperEnv):
         builder.add_convex_collision_from_file(obj_path)
         builder.add_visual_from_file(obj_path)
         self.obstacle = builder.build_kinematic("obstacle")
+        _hide_marker_spheres(self)
 
     def _initialize_episode(
         self, env_idx: torch.Tensor, options: dict[str, Any]
@@ -201,6 +213,7 @@ class PG3DReachRealMixedObstacleEnv(PG3DReachXArm7GripperEnv):
         )
         
         self.obstacles = [self.box_obs, self.box_obs_2, self.box_obs_3, self.sphere_obs]
+        _hide_marker_spheres(self)
         
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
@@ -311,6 +324,7 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
                 print(f"[PG3DReachRealKitchenEnv] Failed to load YCB {model_id}: {e}")
                 actor = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.1], color=[1, 0, 0, 1], name=f"fallback_{i}", body_type="kinematic")
                 self.ycb_objects.append(actor)
+        _hide_marker_spheres(self)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
@@ -378,6 +392,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         except Exception as e:
             print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
             self.cheezit = actors.build_box(self.scene, half_sizes=[0.02, 0.08, 0.02], color=[1, 1, 0, 1], name="fallback_cheezit", body_type="kinematic")
+        _hide_marker_spheres(self)
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
     # Tighter bounds to ensure the object spawns comfortably within robot reach.

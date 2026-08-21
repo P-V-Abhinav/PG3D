@@ -63,6 +63,12 @@ class PG3DReachRealObstacleEnv(PG3DReachEnv):
             name="obstacle",
             body_type="kinematic",
         )
+        for attr in ("start_site", "goal_site"):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                for obj in getattr(actor, "_objs", [actor]):
+                    for body in obj.get_render_bodies():
+                        body.set_visible(False)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
