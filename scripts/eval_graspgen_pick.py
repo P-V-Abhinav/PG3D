@@ -331,34 +331,33 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 
 def _make_marker_spheres_strictly_virtual(env: Any) -> None:
-    """Replace start_site and goal_site with empty kinematic actors.
+    """Strip visual components from start_site and goal_site.
 
     This makes them strictly virtual: they retain their coordinate frame and
     pose so the policy can still compute tcp_to_goal_pos, but they have absolutely
-    no visual or collision geometry. They become fully invisible to the depth
+    no visual geometry. They become fully invisible to the depth
     cameras and will never contaminate the point cloud.
     """
-    unwrapped = getattr(env, "unwrapped", env)
-    scene = getattr(unwrapped, "scene", None)
-    if scene is None:
+    try:
+        import sapien.render as sr
+    except ImportError:
         return
 
-    replaced = []
+    unwrapped = getattr(env, "unwrapped", env)
+    stripped = []
     for attr in ("start_site", "goal_site"):
         actor = getattr(unwrapped, attr, None)
         if actor is not None:
-            pose = actor.pose
-            scene.remove_actor(actor)
-            
-            builder = scene.create_actor_builder()
-            new_actor = builder.build_kinematic(name=f"{attr}_virtual")
-            new_actor.set_pose(pose)
-            
-            setattr(unwrapped, attr, new_actor)
-            replaced.append(attr)
+            try:
+                bodies = actor.find_components_by_type(sr.RenderBodyComponent)
+                for body in bodies:
+                    body.entity.remove_component(body)
+                stripped.append(attr)
+            except Exception as exc:
+                print(f"[GraspGen] WARNING: could not strip {attr}: {exc}", flush=True)
 
-    if replaced:
-        print(f"[GraspGen] Made strictly virtual in sim_env: {replaced}", flush=True)
+    if stripped:
+        print(f"[GraspGen] Made strictly virtual in sim_env: {stripped}", flush=True)
 
 
 def load_graspgen_sampler(config_path: str | Path) -> Any:
