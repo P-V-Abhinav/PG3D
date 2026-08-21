@@ -505,36 +505,55 @@ def _run_graspgen(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run GraspGen MoE on the object crop.
 
-    Uses run_graspmoe which combines diffusion (neural) + OBB (geometric)
-    candidates, all scored by the GraspGen discriminator.
-
     Returns:
-        all_grasps : (N, 4, 4) float32 SE(3) matrices in world frame.
+        all_grasps : (N, 4, 4) float32 SE(3) matrices in **world frame**.
         all_scores : (N,)      float32 discriminator scores in [0, 1].
-        Both arrays are concatenated across the diffusion and OBB branches.
-        Returns empty arrays if fewer than 10 points survive outlier removal.
     """
-    # Center the point cloud so the model sees it near the origin
+    # ── Coordinate debug ──────────────────────────────────────────────────────
+    # 'object_crop' must be in ManiSkill WORLD frame (same frame as actor.pose.p).
+    # We centre it here so GraspGen sees the object near the origin.
+    # The centroid is added back to the model's output translation so that
+    # all_grasps[:, :3, 3] end up in world frame.
     centroid = np.mean(object_crop, axis=0)
     centered_crop = object_crop - centroid
+    local_extent = centered_crop.max(axis=0) - centered_crop.min(axis=0)
+
+    print(
+        f"\n[GraspGen DEBUG] Episode {episode_index} — coordinate pipeline\n"
+        f"  crop shape          : {object_crop.shape}\n"
+        f"  crop min  (world)   : {object_crop.min(axis=0).tolist()}\n"
+        f"  crop max  (world)   : {object_crop.max(axis=0).tolist()}\n"
+        f"  centroid  (world)   : {centroid.tolist()}   ← sent to GraspGen as translation offset\n"
+        f"  local extent (m)    : {local_extent.tolist()}   ← object bounding box in local frame\n"
+        f"  (model input is centred at origin; centroid is re-added to output translations)",
+        flush=True,
+    )
 
     result = run_graspmoe(
         object_pc=centered_crop,
         grasp_sampler=sampler,
         grasp_threshold=grasp_threshold,
         num_grasps=num_grasps,
-        topk_num_grasps=-1,   # keep all; we pick best ourselves
+        topk_num_grasps=-1,
     )
-    grasps_diff = result["grasps_diff"]   # (Nd, 4, 4)
+    grasps_diff = result["grasps_diff"]   # (Nd, 4, 4) — translations in LOCAL frame
+    scores_diff = result["scores_diff"]
+    grasps_obb  = result["grasps_obb"]
+    scores_obb  = result["scores_obb"]
+
+    # Debug: show a sample of raw (local-frame) grasp translations before centroid is added
+    if grasps_diff.shape[0] > 0:
+        sample = grasps_diff[0, :3, 3]
+        print(
+            f"  sample grasp[0] local  (before centroid): {sample.tolist()}",
+            flush=True,
+        )
+
+    # Re-add centroid to convert translations from local → world frame.
     if grasps_diff.shape[0] > 0:
         grasps_diff[:, :3, 3] += centroid
-        
-    scores_diff = result["scores_diff"]   # (Nd,)
-    grasps_obb  = result["grasps_obb"]    # (No, 4, 4)
     if grasps_obb.shape[0] > 0:
         grasps_obb[:, :3, 3] += centroid
-        
-    scores_obb  = result["scores_obb"]    # (No,)
 
     if grasps_diff.shape[0] > 0 and grasps_obb.shape[0] > 0:
         all_grasps = np.concatenate([grasps_diff, grasps_obb], axis=0)
@@ -940,9 +959,17 @@ def _build_graspgen_constraint(
     raw_rot  = best_grasp[:3, :3]
     raw_quat = _rot3x3_to_quat_wxyz(raw_rot)
     approach = raw_rot[:, 2]  # local Z = approach axis
+
+    # Compute distance from grasp TCP to the object actor centroid.
+    # This should be in the range [0, ~0.15 m] for a well-placed grasp.
+    # If it's >> 0.2 m the centroid estimate is wrong (marker contamination).
+    dist_to_actor = float(np.linalg.norm(raw_pos - target_xyz))
+
     print(
-        f"[GraspGen] Episode {spec.output_index}: raw grasp (Robotiq 2F-140 frame):\n"
-        f"  position      = {raw_pos.tolist()}\n"
+        f"[GraspGen] Episode {spec.output_index}: raw grasp (world frame):\n"
+        f"  object actor xyz (world) = {target_xyz.tolist()}\n"
+        f"  grasp  TCP   xyz (world) = {raw_pos.tolist()}\n"
+        f"  distance actor→grasp     = {dist_to_actor:.4f} m  ← should be < 0.20 m\n"
         f"  quaternion    = {raw_quat.tolist()}  (wxyz)\n"
         f"  approach_axis = {approach.tolist()}  (local Z col of rotation)",
         flush=True,

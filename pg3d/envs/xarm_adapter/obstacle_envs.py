@@ -370,7 +370,26 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
 class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     def _load_scene(self, options: dict[str, Any] | None) -> None:
         super()._load_scene(options)
-        
+
+        # --- Hide start_site from all depth cameras ---
+        # start_site is a kinematic sphere placed at the robot TCP for human
+        # visualisation only.  Its rendered geometry appears in the camera depth
+        # maps and thus leaks into the point cloud even though it has no physics
+        # collision (robot_mask doesn't cover it).  The spurious points near the
+        # TCP contaminate the centroid estimate inside _run_graspgen and push the
+        # returned grasp translations far from the actual object.
+        # SAPIEN 3 RenderBodyComponent.visibility = 0.0 makes it fully invisible
+        # to ALL render passes including depth, so no points are produced.
+        # The goal_site sphere is intentionally left visible: the reach policy
+        # was trained observing that green marker and uses it for navigation.
+        try:
+            import sapien.render as sr
+            for comp in self.start_site.find_components_by_type(sr.RenderBodyComponent):
+                comp.visibility = 0.0
+            print("[jstbanana-v0] start_site hidden from cameras (visibility=0)", flush=True)
+        except Exception as exc:
+            print(f"[jstbanana-v0] WARNING: could not hide start_site: {exc}", flush=True)
+
         model_id = "003_cracker_box"
         try:
             builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
@@ -384,7 +403,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     # Tighter bounds to ensure the object spawns comfortably within robot reach.
     _JSTBANANA_X_RANGE = (-0.15, 0.15)
     _JSTBANANA_Y_RANGE = (-0.25, 0.15)
-    _JSTBANANA_Z     = 0.08   # table surface height for object base
+    _JSTBANANA_Z     = 0.01   # table surface height for object base (1 cm above table)
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
