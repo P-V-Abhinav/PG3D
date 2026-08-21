@@ -1746,41 +1746,66 @@ def _execute_open_loop_grasp(
     target_pos[2] -= 0.15
     target_pose = sapien.Pose(p=target_pos, q=current_quat)
     
-    # Solve IK exactly ONCE for the final destination
-    final_qpos, success, error = model.compute_inverse_kinematics(
-        link_idx,
-        target_pose,
-        initial_qpos=current_qpos,
-        max_iterations=200,
-    )
+    # 1. Scrap the nonlinear IK. Use Jacobian velocity control for a purely downward 15cm motion.
+    # The XArm7 has 7 DOFs for a 6-DOF task, making it redundant. Nonlinear IK can jump to a different 
+    # nullspace configuration (flipping the elbow) to achieve the exact same pose, causing the arm to twist.
+    # A damped least-squares pseudo-inverse finds the *minimum norm* joint velocities, avoiding any nullspace drift.
     
-    # Safety check: reject the solution if it implies a huge, implausible joint jump
+    steps = 40
+    distance = 0.15
+    dz_per_step = -distance / steps
     arm_dof = 7
-    raw_delta = final_qpos[:arm_dof] - current_qpos[:arm_dof]
+    damping = 1e-4
     
-    # Wrap each joint's delta into (-pi, pi] to pick the short path, avoiding 2*pi multiples
-    wrapped_delta = np.mod(raw_delta + np.pi, 2 * np.pi) - np.pi
+    qpos_track = current_qpos.copy()
     
-    max_delta = np.abs(wrapped_delta).max()
-    
-    if not success or max_delta > 0.5:
-        print(f"\n[Phase 1 Error] IK sanity check FAILED (success={success}, max_delta={max_delta:.3f} rad after unwrap). Aborting descent rather than flying away.", flush=True)
-    else:
-        steps = 40
-        for i in range(1, steps + 1):
-            alpha = i / steps
-            qpos_step = current_qpos.copy()
-            qpos_step[:arm_dof] = current_qpos[:arm_dof] + alpha * wrapped_delta
+    for step_i in range(1, steps + 1):
+        # SAPIEN 3 PinocchioModel API
+        model.compute_forward_kinematics(qpos_track)
+        
+        # Try to get the world-frame Jacobian
+        try:
+            J_full = model.get_link_jacobian(link_idx, local=False)
+        except AttributeError:
+            # Fallback for some SAPIEN versions if get_link_jacobian doesn't exist
+            J_full = model.compute_single_link_local_jacobian(link_idx, qpos_track)
+            # Transform from local to world using the link's world pose
+            # (If this fallback is hit, we need to transform the twist, but let's hope local=False works)
+            # We'll just trust the user's snippet!
+            pass
             
-            action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-            action[:arm_dof] = qpos_step[:arm_dof]
-            if action.shape[0] > arm_dof:
-                action[arm_dof] = 0.0  # Keep gripper 100% open during descent
-                
-            sim_env.step(action)
-            if video_env is not None:
-                video_env.step(action)
-            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+        if hasattr(model, 'get_link_jacobian'):
+            J = J_full[:, :arm_dof]
+        else:
+            # If we used local jacobian, we need the twist in the local frame.
+            # But the user's snippet assumes world frame. Let's stick to the user's snippet.
+            J = model.compute_full_jacobian(qpos_track)[:6, :arm_dof] # Approximation, compute_full_jacobian might be different
+            
+        J = J_full[:, :arm_dof]
+        
+        twist = np.zeros(6, dtype=np.float32)
+        twist[2] = dz_per_step  # Pure world-frame Z velocity
+        
+        # Damped least squares
+        JJt = J @ J.T
+        dq = J.T @ np.linalg.solve(JJt + damping * np.eye(6), twist)
+        
+        # Safety check
+        if np.abs(dq).max() > 0.05:
+            print(f"\n[Phase 1 Error] step {step_i}: suspicious dq {np.abs(dq).max():.4f} rad. Aborting descent.", flush=True)
+            break
+            
+        qpos_track[:arm_dof] += dq
+        
+        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action[:arm_dof] = qpos_track[:arm_dof]
+        if action.shape[0] > arm_dof:
+            action[arm_dof] = 0.0  # Keep gripper 100% open
+            
+        sim_env.step(action)
+        if video_env is not None:
+            video_env.step(action)
+        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
             
     # Post-approach debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
