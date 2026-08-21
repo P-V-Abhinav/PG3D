@@ -284,10 +284,16 @@ def save_rerun_timeline(
                         if path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3:
                             rejected_paths.append(path)
                 if rejected_paths:
-                    rr.log("world/rejected_paths", rr.LineStrips3D(rejected_paths, colors=[128, 128, 128, 128]))
-                selected = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)
-                if selected.ndim == 2 and selected.shape[0] >= 2 and selected.shape[1] == 3:
-                    rr.log("world/selected_path", rr.LineStrips3D([selected], colors=[0, 255, 0]))
+                    rr.log(
+                        "world/predicted_trajectories/rejected",
+                        rr.LineStrips3D(rejected_paths, colors=[100, 100, 100, 128], radii=0.001),
+                    )
+                selected_path = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)
+                if selected_path.ndim == 2 and selected_path.shape[0] >= 2 and selected_path.shape[1] == 3:
+                    rr.log(
+                        "world/predicted_trajectories/selected",
+                        rr.LineStrips3D([selected_path], colors=[0, 255, 255, 255], radii=0.003),
+                    )
     rr.disconnect()
 
 
