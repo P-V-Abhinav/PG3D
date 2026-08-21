@@ -737,8 +737,8 @@ def _log_graspgen_rerun(
         rr.Points3D(
             all_grasps[best_idx:best_idx + 1, :3, 3],
             colors=[255, 80, 0], radii=0.008,
-            static=True,
         ),
+        static=True,
     )
     print(
         f"[GraspGen] Logged {all_grasps.shape[0]} candidates to Rerun "
