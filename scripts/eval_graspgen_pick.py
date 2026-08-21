@@ -1722,49 +1722,42 @@ def _execute_open_loop_grasp(
     if CURRENT_RERUN_DATA is None or "final_grasp_pos" not in CURRENT_RERUN_DATA:
         return
         
-    final_grasp_pos = CURRENT_RERUN_DATA["final_grasp_pos"]
-    final_grasp_quat = CURRENT_RERUN_DATA["final_grasp_quat"]
-    
-    print("\n--- [Phase 0 Complete] Arm reached the goal marker! ---", flush=True)
-    
-    model = sim_env.unwrapped.agent.robot.create_pinocchio_model()
-    link_idx = sim_env.unwrapped.agent.robot.links_map[sim_env.unwrapped.agent.ee_link_name].get_index()
+    print("\n--- [Phase 1] Executing Open-Loop Grasp Approach ---", flush=True)
     
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
     current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    
-    # We can get cartesian rotation from the TCP pose as well (quat or euler)
+    current_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()
     from scipy.spatial.transform import Rotation
     current_rot_euler = Rotation.from_quat(
-        # scipy expects xyzw, sapien is wxyz
-        np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
+        np.roll(current_quat, -1)
     ).as_euler('xyz', degrees=True)
     
-    print("\n--- [Phase 1] Executing Open-Loop Grasp Approach ---", flush=True)
     print(f"[Debug] Pre-Approach Cartesian Pos: {current_pos.tolist()}", flush=True)
     print(f"[Debug] Pre-Approach Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
     print(f"[Debug] Pre-Approach Joint Angles: {current_qpos.tolist()}", flush=True)
     
-    # 1. Cartesian interpolation for the approach
+    model = sim_env.unwrapped.agent.robot.create_pinocchio_model()
+    tcp_link_name = sim_env.unwrapped.agent.tcp.name
+    link_idx = model.get_link_index(tcp_link_name)
+    
+    # 1. Scrap the GraspGen target. The user explicitly requested to just 
+    # move straight down by 15cm from the current position!
+    target_pos = current_pos.copy()
+    target_pos[2] -= 0.15
+    
     steps = 40
     qpos_track = current_qpos.copy()
-    current_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()
-    
-    active_mask = np.zeros(sim_env.unwrapped.agent.robot.dof, dtype=bool)
-    active_mask[:7] = True  # Only IK the 7 arm joints
     
     for i in range(1, steps + 1):
         alpha = i / steps
-        target_p = current_pos + alpha * (final_grasp_pos - current_pos)
-        # Keep orientation constant! The policy already aligned the gripper.
-        # Enforcing final_grasp_quat abruptly causes massive IK twisting.
+        target_p = current_pos + alpha * (target_pos - current_pos)
         target_pose = sapien.Pose(p=target_p, q=current_quat)
         
+        # Omit active_qmask to avoid masking the wrong DOFs, which caused the arm to twist.
         ik_qpos, success, error = model.compute_inverse_kinematics(
             link_idx,
             target_pose,
             initial_qpos=qpos_track,
-            active_qmask=active_mask,
             max_iterations=100,
         )
         
