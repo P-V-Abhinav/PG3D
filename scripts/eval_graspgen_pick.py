@@ -1737,8 +1737,9 @@ def _execute_open_loop_grasp(
     print(f"[Debug] Pre-Approach Joint Angles: {current_qpos.tolist()}", flush=True)
     
     model = sim_env.unwrapped.agent.robot.create_pinocchio_model()
-    tcp_link_name = sim_env.unwrapped.agent.tcp.name
-    link_idx = model.get_link_index(tcp_link_name)
+    tcp_link_name = sim_env.unwrapped.agent.ee_link_name
+    links = [link.name for link in sim_env.unwrapped.agent.robot.get_links()]
+    link_idx = links.index(tcp_link_name)
     
     # 1. Target is straight down by 15cm from current TCP position
     target_pos = current_pos.copy()
