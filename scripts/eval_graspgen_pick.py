@@ -310,7 +310,8 @@ class _PG3DReachRealObstacleEnv(PG3DReachEnv):
                 actor = getattr(self, attr, None)
                 if actor is not None:
                     for obj in getattr(actor, "_objs", [actor]):
-                        for body in obj.find_components_by_type(sr.RenderBodyComponent):
+                        body = obj.find_component_by_type(sr.RenderBodyComponent)
+                        if body is not None:
                             body.set_visible(False)
         except ImportError:
             pass
@@ -360,7 +361,8 @@ def _make_marker_spheres_strictly_virtual(env: Any) -> None:
         if actor is not None:
             try:
                 for obj in getattr(actor, "_objs", [actor]):
-                    for body in obj.find_components_by_type(sr.RenderBodyComponent):
+                    body = obj.find_component_by_type(sr.RenderBodyComponent)
+                    if body is not None:
                         body.set_visible(False)
                 stripped.append(attr)
             except Exception as exc:

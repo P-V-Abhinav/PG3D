@@ -35,7 +35,8 @@ def _hide_marker_spheres(env: Any) -> None:
         actor = getattr(env, attr, None)
         if actor is not None:
             for obj in getattr(actor, "_objs", [actor]):
-                for body in obj.find_components_by_type(sr.RenderBodyComponent):
+                body = obj.find_component_by_type(sr.RenderBodyComponent)
+                if body is not None:
                     body.set_visible(False)
 
 
