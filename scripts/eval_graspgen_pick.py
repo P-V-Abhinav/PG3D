@@ -1793,26 +1793,11 @@ def _execute_open_loop_grasp(
     print(f"[Debug] Pre-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
     print(f"[Debug] Pre-Grasp Joint Angles: {current_qpos.tolist()}", flush=True)
     
-    # 2. Close the passive gripper joints manually
-    arm_names = [f"joint{i}" for i in range(1, 8)]
-    gripper_indices = [
-        i for i, joint in enumerate(sim_env.unwrapped.agent.robot.get_active_joints()) 
-        if joint.get_name() not in arm_names
-    ]
-    
-    # We will step physics and manually increase the joint position of gripper joints
+    # 2. Close the gripper natively via the mimic controller!
     close_steps = 30
     for i in range(1, close_steps + 1):
-        # We incrementally set the qpos of the gripper joints. Max closed is roughly 0.85.
         target_val = 0.85 * (i / close_steps)
         current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-        for idx in gripper_indices:
-            current_qpos[idx] = target_val
-        
-        # Teleport joints since they are passive/mimic and don't respond well to env.step()
-        sim_env.unwrapped.agent.robot.set_qpos(current_qpos)
-        if video_env is not None:
-            video_env.unwrapped.agent.robot.set_qpos(current_qpos)
             
         # Keep the arm still, but command the gripper to close if it has an action dimension
         action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
