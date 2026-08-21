@@ -1768,8 +1768,12 @@ def _execute_open_loop_grasp(
         if success:
             qpos_track = ik_qpos
             
-        # Stepping the environment requires a 7-dim action in our absolute action space
-        action = qpos_track[:7]
+        # Stepping the environment requires an action matching its full action space
+        # (8-dim for xarm7_gripper). We pad the 7 arm joints with the gripper_open value.
+        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action[:7] = qpos_track[:7]
+        if action.shape[0] > 7:
+            action[7:] = 0.04  # standard gripper_open
         
         # Step the physics
         sim_env.step(action)
@@ -1810,8 +1814,12 @@ def _execute_open_loop_grasp(
         if video_env is not None:
             video_env.unwrapped.agent.robot.set_qpos(current_qpos)
             
-        # Keep the arm still
-        action = current_qpos[:7]
+        # Keep the arm still, but command the gripper to close if it has an action dimension
+        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action[:7] = current_qpos[:7]
+        if action.shape[0] > 7:
+            action[7:] = target_val
+            
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)
