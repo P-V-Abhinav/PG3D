@@ -1095,9 +1095,9 @@ def _build_graspgen_constraint(
     # The DP3 policy observation includes the goal_site. We must move the goal_site
     # to the pregrasp_pos so the policy actually steers towards the safe approach
     # pose rather than the centroid of the object (which would cause collision).
-    if hasattr(sim_env.unwrapped, "goal_site"):
-        pos_t = torch.tensor(pregrasp_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
-        sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+    if hasattr(env.unwrapped, "goal_site"):
+        pos_t = torch.tensor(pregrasp_pos, dtype=torch.float32, device=env.unwrapped.device).unsqueeze(0)
+        env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
 
     # --- 9. Build CartesianPoseConstraint ---
     pos_tol  = float(getattr(args, "grasp_position_tolerance", 0.02))
