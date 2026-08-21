@@ -381,8 +381,8 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
     # Tighter bounds to ensure the object spawns comfortably within robot reach.
-    _JSTBANANA_X_RANGE = (-0.15, 0.15)
-    _JSTBANANA_Y_RANGE = (-0.25, 0.15)
+    _JSTBANANA_X_RANGE = (-0.15, 0.07)
+    _JSTBANANA_Y_RANGE = (-0.25, 0.07)
     _JSTBANANA_Z     = 0.08  # table surface height for object base
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
