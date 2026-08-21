@@ -1769,17 +1769,17 @@ def _execute_open_loop_grasp(
             qpos_track = ik_qpos
             
         # Stepping the environment requires an action matching its full action space
-        # (8-dim for xarm7_gripper). We pad the 7 arm joints with the gripper_open value.
+        # (8-dim for xarm7_gripper). We pad the 7 arm joints with the fully open gripper.
         action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
         action[:7] = qpos_track[:7]
         if action.shape[0] > 7:
-            action[7:] = 0.04  # standard gripper_open
+            action[7:] = 0.0  # 0.0 is fully open for the mimic controller!
         
         # Step the physics
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)
-            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
             
     # Post-approach debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
@@ -1808,7 +1808,7 @@ def _execute_open_loop_grasp(
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)
-            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
 
     # Post-grasp debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
@@ -2262,7 +2262,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--goal-thresh", type=float, default=None)
     p.add_argument("--max-episode-steps", type=int, default=None)
     p.add_argument("--action-ema-alpha", type=float, default=1.0)
-    p.add_argument("--gripper-open", type=float, default=0.04,
+    p.add_argument("--gripper-open", type=float, default=0.0,
                    help="Gripper open position (m). The reach ckpt does not predict "
                         "gripper actions; this value pads the sim action.")
     p.add_argument("--geometry-mode", choices=["fast", "exact"], default="exact",

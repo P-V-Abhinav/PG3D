@@ -1221,6 +1221,20 @@ def run_eval_episode(
         )
     else:
         sim_obs, sim_info = sim_env.reset(seed=spec.seed, options={"reconfigure": True})
+        
+    # --- GRASPGEN FIX: Sync Goal Marker with Constraint ---
+    # If a CartesianPoseConstraint exists, move the goal_site to its target position.
+    # Otherwise, the environment reset leaves the goal_site at the object centroid!
+    if len(constraints) > 0 and hasattr(constraints[0], "target_position"):
+        if hasattr(sim_env.unwrapped, "goal_site"):
+            import torch
+            from mani_skill.utils.structs.pose import Pose
+            target_pos = constraints[0].target_position
+            pos_t = torch.tensor(target_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
+            sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+            # The observation contains target_position pulled from goal_site, so we must re-generate it!
+            sim_obs = sim_env.unwrapped._get_obs()
+            
     video_env: Any | None = None
     with timer.time("observation_adapt_crop", source="reset"):
         sim_entry = rollout_observation_entry(
