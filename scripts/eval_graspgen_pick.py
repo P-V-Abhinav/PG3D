@@ -312,7 +312,12 @@ class _PG3DReachRealObstacleEnv(PG3DReachEnv):
                     for obj in getattr(actor, "_objs", [actor]):
                         body = obj.find_component_by_type(sr.RenderBodyComponent)
                         if body is not None:
-                            body.set_visible(False)
+                            if hasattr(body, 'set_visibility'):
+                                body.set_visibility(0.0)
+                            elif hasattr(body, 'set_visible'):
+                                body.set_visible(False)
+                            else:
+                                body.disable()
         except ImportError:
             pass
 
@@ -363,7 +368,12 @@ def _make_marker_spheres_strictly_virtual(env: Any) -> None:
                 for obj in getattr(actor, "_objs", [actor]):
                     body = obj.find_component_by_type(sr.RenderBodyComponent)
                     if body is not None:
-                        body.set_visible(False)
+                        if hasattr(body, 'set_visibility'):
+                            body.set_visibility(0.0)
+                        elif hasattr(body, 'set_visible'):
+                            body.set_visible(False)
+                        else:
+                            body.disable()
                 stripped.append(attr)
             except Exception as exc:
                 print(f"[GraspGen] WARNING: could not strip {attr}: {exc}", flush=True)
