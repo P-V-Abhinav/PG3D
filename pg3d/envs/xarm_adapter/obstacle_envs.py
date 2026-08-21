@@ -329,11 +329,11 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
                 # ManiSkill 3 standard asset loading
                 builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
                 builder.set_scene_idxs(None) # applies to all scenes
-                actor = builder.build_kinematic(name=f"{model_id}_{i}")
+                actor = builder.build(name=f"{model_id}_{i}")
                 self.ycb_objects.append(actor)
             except Exception as e:
                 print(f"[PG3DReachRealKitchenEnv] Failed to load YCB {model_id}: {e}")
-                actor = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.1], color=[1, 0, 0, 1], name=f"fallback_{i}", body_type="kinematic")
+                actor = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.1], color=[1, 0, 0, 1], name=f"fallback_{i}", body_type="dynamic")
                 self.ycb_objects.append(actor)
         _hide_marker_spheres(self)
 
@@ -399,10 +399,10 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         try:
             builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
             builder.set_scene_idxs(None)
-            self.cheezit = builder.build_kinematic(name="cheezit")
+            self.cheezit = builder.build(name="cheezit")
         except Exception as e:
             print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
-            self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 0, 0, 1], name="fallback_jello", body_type="kinematic")
+            self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 0, 0, 1], name="fallback_jello", body_type="dynamic")
         _hide_marker_spheres(self)
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
@@ -436,7 +436,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             # Stand the object up (90 deg around X) then apply random Z rotation
             theta = rng.uniform(0, 2 * np.pi)
             import scipy.spatial.transform
-            r = scipy.spatial.transform.Rotation.from_euler('zx', [theta, np.pi/2], degrees=False)
+            r = scipy.spatial.transform.Rotation.from_euler('xz', [np.pi/2, theta], degrees=False)
             q_xyzw = r.as_quat()
             q_t = torch.tensor(
                 [q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]],
