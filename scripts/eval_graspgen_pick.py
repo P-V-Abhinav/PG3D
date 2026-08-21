@@ -1706,15 +1706,23 @@ def resolve_checkpoint_path(checkpoint: Path | None, checkpoint_dir: Path | None
 #              and loads GraspGenSampler first.
 # ===========================================================================
 
-def _execute_open_loop_grasp(
+def _execute_pick_and_place(
     sim_env: Any,
     video_env: Any,
     frames: list[np.ndarray],
     timeline: list[dict[str, Any]],
     method: str,
+    *,
+    policy: Any,
+    adapter: Any,
+    crop_config: Any,
+    action_mode: Any,
+    args: Any,
 ):
     import sapien.core as sapien
     import rerun as rr
+    import torch
+    from mani_skill.utils.structs.pose import Pose
     from pg3d.utils.arrays import frame_to_numpy as _frame_to_numpy
     from scripts.eval_pointcloud_pose_steering_reach import _render_video_frame
     
@@ -1785,6 +1793,83 @@ def _execute_open_loop_grasp(
     print(f"[Debug] Post-Grasp Cartesian Pos: {current_pos.tolist()}", flush=True)
     print(f"[Debug] Post-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
     print(f"[Debug] Post-Grasp Joint Angles: {current_qpos.tolist()}\n", flush=True)
+
+    print("\n--- [Phase 2] Moving to Place Goal ---", flush=True)
+    
+    # 1. Define a new goal location (e.g. up and to the right)
+    new_goal_pos = np.array([0.2, 0.2, 0.25], dtype=np.float32)
+    print(f"[Debug] New Goal Pos: {new_goal_pos.tolist()}", flush=True)
+
+    # Move the goal_site to the new goal position so the policy sees it in the point cloud
+    if hasattr(sim_env.unwrapped, "goal_site"):
+        pos_t = torch.tensor(new_goal_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
+        sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+
+    # 2. Get fresh observation and init window
+    sim_obs = sim_env.unwrapped.get_obs()
+    sim_info = {}
+    sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
+    obs_window = make_initial_obs_window(sim_entry, n_obs_steps=int(policy.n_obs_steps))
+    timeline.append(sim_entry)
+
+    # 3. Run policy for 50 steps
+    place_steps = 50
+    rng = np.random.default_rng(args.seed)
+    ema_sim_action = None
+    action_ema_alpha = args.action_ema_alpha
+
+    for step in range(place_steps):
+        chunks = adapter.sample_action_chunks(obs_window, k=1, rng=rng)
+        selected_chunk = chunks[0]
+        
+        policy_action = selected_chunk.actions[0]
+        
+        sim_action = policy_action_to_sim_action(
+            policy_action,
+            np.asarray(sim_entry["agent_pos"], dtype=np.float32),
+            action_mode=action_mode,
+            sim_action_dim=int(np.prod(sim_env.action_space.shape)),
+            low=getattr(sim_env.action_space, "low", None),
+            high=getattr(sim_env.action_space, "high", None),
+            gripper_open=0.85,  # Keep gripper closed
+        )
+        
+        if ema_sim_action is None or action_ema_alpha >= 1.0:
+            ema_sim_action = sim_action
+        else:
+            ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
+            
+        sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
+        if video_env is not None:
+            video_env.step(ema_sim_action)
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+            
+        sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
+        obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
+        timeline.append(sim_entry)
+        
+        tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
+        if np.linalg.norm(tcp_pos - new_goal_pos) < 0.05:
+            print(f"[Phase 2] Reached new goal at step {step}!", flush=True)
+            break
+            
+    print("\n--- [Phase 3] Releasing Object ---", flush=True)
+    open_steps = 20
+    for i in range(1, open_steps + 1):
+        target_val = 0.85 * (1.0 - i / open_steps)
+        current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
+            
+        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action[:7] = current_qpos[:7]
+        if action.shape[0] > 7:
+            action[7:] = target_val
+            
+        sim_env.step(action)
+        if video_env is not None:
+            video_env.step(action)
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+
+    print("[Phase 3] Pick and place complete!\n", flush=True)
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -2030,7 +2115,18 @@ def main(argv: list[str] | None = None) -> int:
                         robot_clearance_stride=args.robot_clearance_stride,
                         zarr_context=zarr_context,
                         parallel_pool=None,
-                        post_episode_callback=_execute_open_loop_grasp,
+                        post_episode_callback=lambda s, v, f, t, m: _execute_pick_and_place(
+                            sim_env=s,
+                            video_env=v,
+                            frames=f,
+                            timeline=t,
+                            method=m,
+                            policy=policy,
+                            adapter=adapter,
+                            crop_config=crop_config,
+                            action_mode=action_mode,
+                            args=args,
+                        ),
                     )
                     rows.append(row)
                     with timer.time("json_write", artifact="metrics"):
