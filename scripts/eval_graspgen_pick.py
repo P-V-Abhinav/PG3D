@@ -330,6 +330,44 @@ logger = logging.getLogger(__name__)
 #  GraspGen utilities  (everything NEW compared to pose_steering eval)
 # ===========================================================================
 
+def _hide_marker_spheres_from_cameras(env: Any) -> None:
+    """Set visibility=0 on the start_site and goal_site render bodies.
+
+    Both spheres are kinematic actors with no physics collision.  They appear
+    in the depth cameras and therefore generate spurious points in the point
+    cloud that is fed to GraspGen.  Setting visibility=0 on their
+    RenderBodyComponents removes them from ALL render passes (colour AND depth),
+    so they produce zero points.
+
+    Must be called AFTER gym.make() / env.reset() because SAPIEN 3 only
+    attaches RenderBodyComponents to actors after the scene is built.
+    """
+    try:
+        import sapien.render as sr
+    except ImportError:
+        print("[GraspGen] WARNING: sapien.render not available; cannot hide marker spheres.", flush=True)
+        return
+
+    unwrapped = getattr(env, "unwrapped", env)
+    hidden: list[str] = []
+    for attr in ("start_site", "goal_site"):
+        actor = getattr(unwrapped, attr, None)
+        if actor is None:
+            continue
+        try:
+            bodies = actor.find_components_by_type(sr.RenderBodyComponent)
+            for body in bodies:
+                body.visibility = 0.0
+            hidden.append(attr)
+        except Exception as exc:
+            print(f"[GraspGen] WARNING: could not hide {attr}: {exc}", flush=True)
+
+    if hidden:
+        print(f"[GraspGen] Hidden from sim_env cameras: {hidden}", flush=True)
+    else:
+        print("[GraspGen] WARNING: no marker actors found to hide.", flush=True)
+
+
 def load_graspgen_sampler(config_path: str | Path) -> Any:
     """Load GraspGenSampler from a Robotiq YAML config.
 
@@ -761,26 +799,41 @@ def _show_graspgen_viser(
     for i, (grasp_T, score) in enumerate(zip(all_grasps, all_scores)):
         if i != best_idx:
             continue
-        
-        color = [255, 80, 0]   # bright orange-red for best
-        rot = grasp_T[:3, :3]
-        pos = grasp_T[:3, 3]
-        try:
-            wxyz = vtf.SO3.from_matrix(rot).wxyz
-        except Exception:
-            from scipy.spatial.transform import Rotation as R_scipy
-            xyzw = R_scipy.from_matrix(rot.astype(np.float64)).as_quat()
-            wxyz = np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]], dtype=np.float32)
 
-        # Draw the approach + finger pitchfork as scene line segments
+        pos = grasp_T[:3, 3]
+
+        # ── 1. Plain sphere at TCP position ──────────────────────────────────
+        # This makes it immediately obvious whether the POSITION is correct
+        # regardless of orientation/pitchfork rendering artifacts.
+        server.scene.add_icosphere(
+            "grasps/best/tcp_sphere",
+            radius=0.015,
+            color=(255, 80, 0),
+            position=pos,
+        )
+
+        # ── 2. Pitchfork lines (approach + finger bars) ───────────────────────
+        color = (255, 80, 0)
         lines = _pitchfork_lines_for_grasp(grasp_T)
         for j, seg in enumerate(lines):
             server.scene.add_line_segments(
                 f"grasps/best/{j}",
-                points=np.expand_dims(seg, 0),  # (1, 2, 3) for 1 line segment
-                colors=tuple(color),
-                line_width=2.0,
+                points=np.expand_dims(seg, 0),
+                colors=color,
+                line_width=3.0,
             )
+
+    # ── 3. Actor centroid marker (magenta) ────────────────────────────────────
+    # Shows where _get_object_actor_xyz reported the object to be.
+    # If this overlaps the cheezit point cloud, the centroid read is correct.
+    if object_cloud.shape[0] > 0:
+        cloud_centroid = object_cloud.mean(axis=0)
+        server.scene.add_icosphere(
+            "debug/cloud_centroid",
+            radius=0.012,
+            color=(220, 0, 220),
+            position=cloud_centroid,
+        )
 
     print(
         f"[GraspGen Viser] Episode {episode_index}: showing {all_grasps.shape[0]} grasps. "
@@ -1761,6 +1814,20 @@ def main(argv: list[str] | None = None) -> int:
             **_env_kwargs(metadata, render_mode=None,
                           max_episode_steps=args.max_episode_steps),
         )
+
+        # ── Hide marker spheres in sim_env cameras ──────────────────────────
+        # start_site (TCP marker) and goal_site (target sphere) are kinematic
+        # actors with no physics collision.  They appear in depth camera images
+        # and therefore produce spurious points in the point cloud fed to both
+        # the DP3 policy and GraspGen.  For sim_env (the env whose cameras we
+        # actually use for the point cloud), we hide them completely.
+        # They remain visible in ghost_env / video_env for visual debugging.
+        #
+        # We do this AFTER gym.make() (not inside _load_scene) because SAPIEN 3
+        # only attaches RenderBodyComponents to actors after the full scene is
+        # built, which happens during env.reset() — but gym.make() triggers an
+        # initial reset internally so the scene IS ready here.
+        _hide_marker_spheres_from_cameras(sim_env)
         adapter = DP3ChunkPolicyAdapter(
             policy,
             action_mode=action_mode,
