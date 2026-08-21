@@ -1091,6 +1091,14 @@ def _build_graspgen_constraint(
             flush=True,
         )
 
+    # --- 8c. Update Policy Goal Marker (goal_site) ---
+    # The DP3 policy observation includes the goal_site. We must move the goal_site
+    # to the pregrasp_pos so the policy actually steers towards the safe approach
+    # pose rather than the centroid of the object (which would cause collision).
+    if hasattr(sim_env.unwrapped, "goal_site"):
+        pos_t = torch.tensor(pregrasp_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
+        sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+
     # --- 9. Build CartesianPoseConstraint ---
     pos_tol  = float(getattr(args, "grasp_position_tolerance", 0.02))
     rot_tol  = float(getattr(args, "grasp_rotation_tolerance", 0.35))
@@ -1717,19 +1725,31 @@ def _execute_open_loop_grasp(
     final_grasp_pos = CURRENT_RERUN_DATA["final_grasp_pos"]
     final_grasp_quat = CURRENT_RERUN_DATA["final_grasp_quat"]
     
+    print("\n--- [Phase 0 Complete] Arm reached the goal marker! ---", flush=True)
+    
+    model = sim_env.unwrapped.agent.robot.create_pinocchio_model()
+    link_idx = sim_env.unwrapped.agent.robot.links_map[sim_env.unwrapped.agent.ee_link_name].get_index()
+    
+    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
+    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    
+    # We can get cartesian rotation from the TCP pose as well (quat or euler)
+    from scipy.spatial.transform import Rotation
+    current_rot_euler = Rotation.from_quat(
+        # scipy expects xyzw, sapien is wxyz
+        np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
+    ).as_euler('xyz', degrees=True)
+    
     print("\n--- [Phase 1] Executing Open-Loop Grasp Approach ---", flush=True)
-    
-    model = sim_env.agent.robot.create_pinocchio_model()
-    link_idx = sim_env.agent.robot.links_map[sim_env.agent.ee_link_name].get_index()
-    
-    current_qpos = sim_env.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos = sim_env.agent.tcp_pose.p[0].cpu().numpy()
+    print(f"[Debug] Pre-Approach Cartesian Pos: {current_pos.tolist()}", flush=True)
+    print(f"[Debug] Pre-Approach Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
+    print(f"[Debug] Pre-Approach Joint Angles: {current_qpos.tolist()}", flush=True)
     
     # 1. Cartesian interpolation for the approach
     steps = 40
     qpos_track = current_qpos.copy()
     
-    active_mask = np.zeros(sim_env.agent.robot.dof, dtype=bool)
+    active_mask = np.zeros(sim_env.unwrapped.agent.robot.dof, dtype=bool)
     active_mask[:7] = True  # Only IK the 7 arm joints
     
     for i in range(1, steps + 1):
@@ -1757,11 +1777,22 @@ def _execute_open_loop_grasp(
             video_env.step(action)
             frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
             
-    print("--- [Phase 1] Closing Gripper ---", flush=True)
+    # Post-approach debug
+    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
+    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    current_rot_euler = Rotation.from_quat(
+        np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
+    ).as_euler('xyz', degrees=True)
+    
+    print("\n--- [Phase 1] Closing Gripper ---", flush=True)
+    print(f"[Debug] Pre-Grasp Cartesian Pos: {current_pos.tolist()}", flush=True)
+    print(f"[Debug] Pre-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
+    print(f"[Debug] Pre-Grasp Joint Angles: {current_qpos.tolist()}", flush=True)
+    
     # 2. Close the passive gripper joints manually
     arm_names = [f"joint{i}" for i in range(1, 8)]
     gripper_indices = [
-        i for i, name in enumerate(sim_env.agent.robot.get_active_joint_names()) 
+        i for i, name in enumerate(sim_env.unwrapped.agent.robot.get_active_joint_names()) 
         if name not in arm_names
     ]
     
@@ -1770,14 +1801,14 @@ def _execute_open_loop_grasp(
     for i in range(1, close_steps + 1):
         # We incrementally set the qpos of the gripper joints. Max closed is roughly 0.85.
         target_val = 0.85 * (i / close_steps)
-        current_qpos = sim_env.agent.robot.get_qpos()[0].cpu().numpy()
+        current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
         for idx in gripper_indices:
             current_qpos[idx] = target_val
         
         # Teleport joints since they are passive/mimic and don't respond well to env.step()
-        sim_env.agent.robot.set_qpos(current_qpos)
+        sim_env.unwrapped.agent.robot.set_qpos(current_qpos)
         if video_env is not None:
-            video_env.agent.robot.set_qpos(current_qpos)
+            video_env.unwrapped.agent.robot.set_qpos(current_qpos)
             
         # Keep the arm still
         action = current_qpos[:7]
@@ -1786,7 +1817,17 @@ def _execute_open_loop_grasp(
             video_env.step(action)
             frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
 
-    print("--- [Phase 1] Grasp Execution Complete ---\n", flush=True)
+    # Post-grasp debug
+    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
+    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    current_rot_euler = Rotation.from_quat(
+        np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
+    ).as_euler('xyz', degrees=True)
+    
+    print("\n--- [Phase 1] Grasp Execution Complete ---", flush=True)
+    print(f"[Debug] Post-Grasp Cartesian Pos: {current_pos.tolist()}", flush=True)
+    print(f"[Debug] Post-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
+    print(f"[Debug] Post-Grasp Joint Angles: {current_qpos.tolist()}\n", flush=True)
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
