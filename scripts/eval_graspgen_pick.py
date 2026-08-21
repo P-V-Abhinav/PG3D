@@ -1073,11 +1073,21 @@ def _build_graspgen_constraint(
     adj_rot  = adjusted[:3, :3]
     adj_quat = _rot3x3_to_quat_wxyz(adj_rot)
 
-    if abs(z_offset) > 1e-6:
+    if getattr(args, "rerun", False):
+        args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"] = adj_pos
+        args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
+
+    # --- 8b. Create Pre-Grasp Pose ---
+    approach_offset = float(getattr(args, "grasp_approach_offset", 0.10))
+    # approach vector is the local Z axis of the adjusted rotation
+    approach_vec = adj_rot[:, 2]
+    # offset backward (negative approach_vec)
+    pregrasp_pos = adj_pos - approach_offset * approach_vec
+    
+    if abs(approach_offset) > 1e-6:
         print(
-            f"[GraspGen] Episode {spec.output_index}: after z_offset={z_offset:.4f}m:\n"
-            f"  position      = {adj_pos.tolist()}\n"
-            f"  quaternion    = {adj_quat.tolist()}  (wxyz)",
+            f"[GraspGen] Episode {spec.output_index}: applying approach offset={approach_offset:.4f}m:\n"
+            f"  pre-grasp position = {pregrasp_pos.tolist()}\n",
             flush=True,
         )
 
@@ -1087,12 +1097,12 @@ def _build_graspgen_constraint(
     weight   = float(getattr(args, "grasp_weight", 2.0))
 
     constraint = CartesianPoseConstraint(
-        target_position=adj_pos,
+        target_position=pregrasp_pos,
         target_orientation=adj_quat,   # (4,) wxyz quaternion
         position_tolerance=pos_tol,
         rotation_tolerance=rot_tol,
         weight=weight,
-        name="graspgen_pick",
+        name="graspgen_reach",
         metadata={
             "episode_output_index": spec.output_index,
             "episode_seed": spec.seed,
@@ -1687,6 +1697,97 @@ def resolve_checkpoint_path(checkpoint: Path | None, checkpoint_dir: Path | None
 #              and loads GraspGenSampler first.
 # ===========================================================================
 
+def _execute_open_loop_grasp(
+    sim_env: Any,
+    video_env: Any,
+    frames: list[np.ndarray],
+    timeline: list[dict[str, Any]],
+    method: str,
+):
+    import sapien.core as sapien
+    import rerun as rr
+    from pg3d.utils.arrays import frame_to_numpy as _frame_to_numpy
+    from scripts.eval_pointcloud_pose_steering_reach import _render_video_frame
+    
+    # Get pre-saved final grasp pose from args
+    global CURRENT_RERUN_DATA
+    if CURRENT_RERUN_DATA is None or "final_grasp_pos" not in CURRENT_RERUN_DATA:
+        return
+        
+    final_grasp_pos = CURRENT_RERUN_DATA["final_grasp_pos"]
+    final_grasp_quat = CURRENT_RERUN_DATA["final_grasp_quat"]
+    
+    print("\n--- [Phase 1] Executing Open-Loop Grasp Approach ---", flush=True)
+    
+    model = sim_env.agent.robot.create_pinocchio_model()
+    link_idx = sim_env.agent.robot.links_map[sim_env.agent.ee_link_name].get_index()
+    
+    current_qpos = sim_env.agent.robot.get_qpos()[0].cpu().numpy()
+    current_pos = sim_env.agent.tcp_pose.p[0].cpu().numpy()
+    
+    # 1. Cartesian interpolation for the approach
+    steps = 40
+    qpos_track = current_qpos.copy()
+    
+    active_mask = np.zeros(sim_env.agent.robot.dof, dtype=bool)
+    active_mask[:7] = True  # Only IK the 7 arm joints
+    
+    for i in range(1, steps + 1):
+        alpha = i / steps
+        target_p = current_pos + alpha * (final_grasp_pos - current_pos)
+        target_pose = sapien.Pose(p=target_p, q=final_grasp_quat)
+        
+        ik_qpos, success, error = model.compute_inverse_kinematics(
+            link_idx,
+            target_pose,
+            initial_qpos=qpos_track,
+            active_qmask=active_mask,
+            max_iterations=100,
+        )
+        
+        if success:
+            qpos_track = ik_qpos
+            
+        # Stepping the environment requires a 7-dim action in our absolute action space
+        action = qpos_track[:7]
+        
+        # Step the physics
+        sim_env.step(action)
+        if video_env is not None:
+            video_env.step(action)
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+            
+    print("--- [Phase 1] Closing Gripper ---", flush=True)
+    # 2. Close the passive gripper joints manually
+    arm_names = [f"joint{i}" for i in range(1, 8)]
+    gripper_indices = [
+        i for i, name in enumerate(sim_env.agent.robot.get_active_joint_names()) 
+        if name not in arm_names
+    ]
+    
+    # We will step physics and manually increase the joint position of gripper joints
+    close_steps = 30
+    for i in range(1, close_steps + 1):
+        # We incrementally set the qpos of the gripper joints. Max closed is roughly 0.85.
+        target_val = 0.85 * (i / close_steps)
+        current_qpos = sim_env.agent.robot.get_qpos()[0].cpu().numpy()
+        for idx in gripper_indices:
+            current_qpos[idx] = target_val
+        
+        # Teleport joints since they are passive/mimic and don't respond well to env.step()
+        sim_env.agent.robot.set_qpos(current_qpos)
+        if video_env is not None:
+            video_env.agent.robot.set_qpos(current_qpos)
+            
+        # Keep the arm still
+        action = current_qpos[:7]
+        sim_env.step(action)
+        if video_env is not None:
+            video_env.step(action)
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+
+    print("--- [Phase 1] Grasp Execution Complete ---\n", flush=True)
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     checkpoint_path = resolve_checkpoint_path(args.checkpoint, args.checkpoint_dir)
@@ -1931,6 +2032,7 @@ def main(argv: list[str] | None = None) -> int:
                         robot_clearance_stride=args.robot_clearance_stride,
                         zarr_context=zarr_context,
                         parallel_pool=None,
+                        post_episode_callback=_execute_open_loop_grasp,
                     )
                     rows.append(row)
                     with timer.time("json_write", artifact="metrics"):
@@ -2080,6 +2182,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Metres to shift the grasp contact point back along the approach "
                         "axis to account for gripper geometry difference. "
                         "0.0 for Robotiq 2F-140 (same as GraspGen training gripper).")
+    g.add_argument("--grasp-approach-offset", type=float, default=0.10,
+                   help="Distance (m) to offset the goal pose backwards along the approach "
+                        "axis to create a pre-grasp pose. The DP3 reach policy will be "
+                        "evaluated against this pre-grasp pose. (Phase 0 -> Phase 1)")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,

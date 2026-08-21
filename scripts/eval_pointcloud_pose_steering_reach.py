@@ -1206,6 +1206,7 @@ def run_eval_episode(
     robot_clearance_stride: int = 4,
     zarr_context: dict[str, Any] | None = None,
     parallel_pool: Any | None = None,
+    post_episode_callback: Callable | None = None,
 ) -> dict[str, Any]:
     # Defensive copy: obstacle_spawning appends to `constraints` as the episode
     # progresses, and the caller reuses the same initial list/pending_spawn across
@@ -1476,6 +1477,16 @@ def run_eval_episode(
                     break
             if terminated_or_truncated:
                 break
+                
+        if post_episode_callback is not None:
+            post_episode_callback(
+                sim_env=sim_env,
+                video_env=video_env,
+                frames=frames,
+                timeline=timeline,
+                method=method,
+            )
+            
     finally:
         if was_training:
             policy.train()
