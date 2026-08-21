@@ -395,14 +395,14 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
 class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     def _load_scene(self, options: dict[str, Any] | None) -> None:
         super()._load_scene(options)
-        model_id = "006_mustard_bottle"
+        model_id = "009_gelatin_box"
         try:
             builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
             builder.set_scene_idxs(None)
             self.cheezit = builder.build_kinematic(name="cheezit")
         except Exception as e:
             print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
-            self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 1, 0, 1], name="fallback_mustard", body_type="kinematic")
+            self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 0, 0, 1], name="fallback_jello", body_type="kinematic")
         _hide_marker_spheres(self)
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
