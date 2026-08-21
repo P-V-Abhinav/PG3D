@@ -554,11 +554,19 @@ def _run_graspgen(
     )
 
     result = run_graspmoe(
-        object_pc=centered_crop,
-        grasp_sampler=sampler,
+        centered_crop,
+        sampler,
         grasp_threshold=grasp_threshold,
         num_grasps=num_grasps,
-        topk_num_grasps=-1,
+        topk_num_grasps=num_grasps - 1,
+        num_yaws=36,
+        z_offsets_cm=(-8, -6, -4, -2, 0),
+        outlier_threshold=0.014,
+        outlier_k=20,
+        obb_mode="advanced",
+        skip_obb_rule="auto",
+        obb_density="sparse",
+        obb_position_spacing_m=0.01,
     )
     grasps_diff = result["grasps_diff"]   # (Nd, 4, 4) — translations in LOCAL frame
     scores_diff = result["scores_diff"]
@@ -644,8 +652,8 @@ def _rot3x3_to_quat_wxyz(rot: np.ndarray) -> np.ndarray:
 # Gripper geometry constants used for the pitchfork visualisation.
 # These match the Robotiq 2F-140 finger geometry that GraspGen was trained on.
 _GRASP_VIS_APPROACH_LEN  = 0.06   # length of the blue approach arrow (m)
-_GRASP_VIS_FINGER_WIDTH  = 0.08   # full span of the two finger lines (m)
-_GRASP_VIS_FINGER_DEPTH  = 0.04   # how far fingers project along approach from TCP
+_GRASP_VIS_FINGER_WIDTH  = 0.14   # Robotiq 2F-140 full span (140 mm)
+_GRASP_VIS_FINGER_DEPTH  = 0.065  # Robotiq 2F-140 finger length approx (65 mm)
 
 
 def _pitchfork_lines_for_grasp(
