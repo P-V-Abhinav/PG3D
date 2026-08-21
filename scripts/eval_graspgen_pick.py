@@ -1078,8 +1078,8 @@ def _build_graspgen_constraint(
         args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
     # --- 8b. Create Pre-Grasp Pose ---
-    # Hardcode approach offset to -2cm to prevent any command-line args from overriding it
-    approach_offset = -0.02
+    # Read the approach offset from CLI arguments (defaults to -0.02 if not provided)
+    approach_offset = float(getattr(args, "grasp_approach_offset", -0.02))
     # approach vector is the local Z axis of the adjusted rotation
     approach_vec = adj_rot[:, 2]
     # offset backward (negative approach_vec)
