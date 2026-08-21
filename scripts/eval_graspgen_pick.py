@@ -1796,8 +1796,8 @@ def _execute_open_loop_grasp(
     # 2. Close the passive gripper joints manually
     arm_names = [f"joint{i}" for i in range(1, 8)]
     gripper_indices = [
-        i for i, name in enumerate(sim_env.unwrapped.agent.robot.get_active_joint_names()) 
-        if name not in arm_names
+        i for i, joint in enumerate(sim_env.unwrapped.agent.robot.get_active_joints()) 
+        if joint.get_name() not in arm_names
     ]
     
     # We will step physics and manually increase the joint position of gripper joints
