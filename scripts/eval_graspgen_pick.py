@@ -991,16 +991,28 @@ def _build_graspgen_constraint(
         )
         return [constraint], None
 
-    # --- 6. Pick best grasp ---
-    best_idx   = int(np.argmax(all_scores))
+    # --- 6. Pick best grasp (Top-Down heuristic) ---
+    # We want grasps that approach from the top. The approach vector is the local Z
+    # axis of the grasp (column 2 of the rotation matrix), which points from the
+    # gripper base to the TCP. A perfectly top-down grasp points along world -Z
+    # (so approach_z = -1). We penalise grasps that approach from the side/bottom.
+    approach_zs = all_grasps[:, 2, 2]
+    
+    # Combined score = GraspGen score (0 to 1) - 0.2 * approach_z
+    # This gives up to a +0.2 boost to perfectly top-down grasps, and penalises
+    # bottom-up grasps by -0.2.
+    combined_scores = all_scores - 0.2 * approach_zs
+    
+    best_idx   = int(np.argmax(combined_scores))
     best_score = float(all_scores[best_idx])
     best_grasp = all_grasps[best_idx].astype(np.float32)  # (4, 4)
 
     print(
         f"[GraspGen] Episode {spec.output_index}: "
         f"total_grasps={all_grasps.shape[0]}  "
-        f"best_idx={best_idx}  best_score={best_score:.4f}  "
-        f"score_range=[{float(all_scores.min()):.4f}, {float(all_scores.max()):.4f}]",
+        f"best_idx={best_idx}  "
+        f"best_score={best_score:.4f} (combined={float(combined_scores[best_idx]):.4f}, approach_z={float(approach_zs[best_idx]):.2f})  "
+        f"raw_score_range=[{float(all_scores.min()):.4f}, {float(all_scores.max()):.4f}]",
         flush=True,
     )
 
