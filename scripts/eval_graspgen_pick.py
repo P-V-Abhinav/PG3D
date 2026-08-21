@@ -1780,7 +1780,14 @@ def _execute_pick_and_place(
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)
+        
+        # Add to video
         frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+        
+        # Add to rerun timeline
+        sim_obs = sim_env.unwrapped.get_obs()
+        sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
+        timeline.append(sim_entry)
 
     # Post-grasp debug
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
@@ -1842,7 +1849,8 @@ def _execute_pick_and_place(
         sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
         if video_env is not None:
             video_env.step(ema_sim_action)
-            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+            
+        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
             
         sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
         obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
@@ -1867,7 +1875,12 @@ def _execute_pick_and_place(
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)
-            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+            
+        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+        
+        sim_obs = sim_env.unwrapped.get_obs()
+        sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
+        timeline.append(sim_entry)
 
     print("[Phase 3] Pick and place complete!\n", flush=True)
 
