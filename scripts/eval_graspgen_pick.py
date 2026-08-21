@@ -533,28 +533,22 @@ def _run_graspgen(
         all_grasps : (N, 4, 4) float32 SE(3) matrices in **world frame**.
         all_scores : (N,)      float32 discriminator scores in [0, 1].
     """
-    # ── Coordinate debug ──────────────────────────────────────────────────────
-    # 'object_crop' must be in ManiSkill WORLD frame (same frame as actor.pose.p).
-    # We centre it here so GraspGen sees the object near the origin.
-    # The centroid is added back to the model's output translation so that
-    # all_grasps[:, :3, 3] end up in world frame.
-    centroid = np.mean(object_crop, axis=0)
-    centered_crop = object_crop - centroid
-    local_extent = centered_crop.max(axis=0) - centered_crop.min(axis=0)
+    extent = object_crop.max(axis=0) - object_crop.min(axis=0)
+    centroid = object_crop.mean(axis=0)
 
     print(
         f"\n[GraspGen DEBUG] Episode {episode_index} — coordinate pipeline\n"
         f"  crop shape          : {object_crop.shape}\n"
         f"  crop min  (world)   : {object_crop.min(axis=0).tolist()}\n"
         f"  crop max  (world)   : {object_crop.max(axis=0).tolist()}\n"
-        f"  centroid  (world)   : {centroid.tolist()}   ← sent to GraspGen as translation offset\n"
-        f"  local extent (m)    : {local_extent.tolist()}   ← object bounding box in local frame\n"
-        f"  (model input is centred at origin; centroid is re-added to output translations)",
+        f"  centroid  (world)   : {centroid.tolist()}\n"
+        f"  local extent (m)    : {extent.tolist()}\n"
+        f"  (passing world-frame crop; run_graspmoe centers internally and returns world-frame grasps)",
         flush=True,
     )
 
     result = run_graspmoe(
-        centered_crop,
+        object_crop,
         sampler,
         grasp_threshold=grasp_threshold,
         num_grasps=num_grasps,
@@ -568,24 +562,22 @@ def _run_graspgen(
         obb_density="sparse",
         obb_position_spacing_m=0.01,
     )
-    grasps_diff = result["grasps_diff"]   # (Nd, 4, 4) — translations in LOCAL frame
+    grasps_diff = result["grasps_diff"]   # (Nd, 4, 4) — translations in WORLD frame
     scores_diff = result["scores_diff"]
     grasps_obb  = result["grasps_obb"]
     scores_obb  = result["scores_obb"]
 
-    # Debug: show a sample of raw (local-frame) grasp translations before centroid is added
+    # Debug: show a sample raw grasp translation (already in world frame — no centroid needed)
     if grasps_diff.shape[0] > 0:
         sample = grasps_diff[0, :3, 3]
         print(
-            f"  sample grasp[0] local  (before centroid): {sample.tolist()}",
+            f"  sample grasp[0] world frame: {sample.tolist()}",
             flush=True,
         )
 
-    # Re-add centroid to convert translations from local → world frame.
-    if grasps_diff.shape[0] > 0:
-        grasps_diff[:, :3, 3] += centroid
-    if grasps_obb.shape[0] > 0:
-        grasps_obb[:, :3, 3] += centroid
+    # NOTE: Do NOT add centroid here. run_graspmoe returns grasps in the same
+    # coordinate frame as the input cloud (world frame). Adding centroid would
+    # double-count the translation and push grasps far from the object.
 
     if grasps_diff.shape[0] > 0 and grasps_obb.shape[0] > 0:
         all_grasps = np.concatenate([grasps_diff, grasps_obb], axis=0)
