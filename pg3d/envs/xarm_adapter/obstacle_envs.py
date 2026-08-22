@@ -399,7 +399,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
 
     def _load_scene(self, options: dict[str, Any] | None) -> None:
         super()._load_scene(options)
-        model_id = getattr(self, "ycb_model_id", "009_gelatin_box")
+        model_id = self.ycb_model_id
         try:
             builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
             builder.set_scene_idxs(None)
@@ -409,8 +409,11 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 0, 0, 1], name="fallback_jello", body_type="dynamic")
         _hide_marker_spheres(self)
 
+    # Workspace XY bounds for random object placement in jstbanana-v0.
+    # Tighter bounds to ensure the object spawns comfortably within robot reach.
     _JSTBANANA_X_RANGE = (-0.15, 0.07)
     _JSTBANANA_Y_RANGE = (-0.25, 0.07)
+    _JSTBANANA_Z     = 0.065  # table surface height for object base
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
@@ -431,8 +434,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
                 # Fallback: use centre of workspace
                 sx, sy = 0.30, 0.0
 
-            # Spawn 15cm above table and let physics settle it
-            pos_np = np.array([sx, sy, 0.15], dtype=np.float32)
+            pos_np = np.array([sx, sy, self._JSTBANANA_Z], dtype=np.float32)
             pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
             # Stand the object up (90 deg around X) then apply random Z rotation
@@ -446,27 +448,13 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             ).unsqueeze(0)
 
             self.cheezit.set_pose(Pose.create_from_pq(p=pos_t, q=q_t))
-            
-            # --- Settle Object ---
-            qpos = self.agent.robot.get_qpos()
-            qvel = self.agent.robot.get_qvel()
-            
-            # Run physics to let object fall and settle (500 physics steps = 1 second)
-            for _ in range(500):
-                self.scene.step()
-                
-            # Restore robot state so it doesn't collapse
-            self.agent.robot.set_qpos(qpos)
-            self.agent.robot.set_qvel(qvel)
-            
-            settled_pose = self.cheezit.pose
-            # Move the goal marker to exactly the cheezit centroid
-            self.goal_site.set_pose(settled_pose)
+            # Move the goal marker to exactly the cheezit centroid so the
+            # reach-policy goal marker (blue sphere) coincides with the object.
+            self.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
 
-            sp = settled_pose.p[0].cpu().numpy()
             print(
                 f"[jstbanana-v0] Episode seed={self._episode_seed}: "
-                f"YCB '{getattr(self, 'ycb_model_id', '009_gelatin_box')}' settled at ({sp[0]:.3f}, {sp[1]:.3f}, {sp[2]:.3f})",
+                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {self._JSTBANANA_Z:.3f})",
                 flush=True,
             )
 

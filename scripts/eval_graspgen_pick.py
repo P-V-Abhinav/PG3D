@@ -1413,7 +1413,6 @@ def _env_kwargs(
     *,
     render_mode: str | None,
     max_episode_steps: int | None = None,
-    ycb_model_id: str | None = None,
 ) -> dict[str, Any]:
     env_kwargs = dict(metadata["env_kwargs"])
     env_kwargs["obs_mode"] = "pointcloud"
@@ -1424,8 +1423,6 @@ def _env_kwargs(
         env_kwargs["render_mode"] = render_mode
     if max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = max_episode_steps
-    if ycb_model_id is not None and metadata.get("env_id") == "jstbanana-v0":
-        env_kwargs["ycb_model_id"] = ycb_model_id
     return env_kwargs
 
 
@@ -1435,13 +1432,11 @@ def _video_env_factory(
     metadata: dict[str, Any],
     enabled: bool,
     max_episode_steps: int | None = None,
-    ycb_model_id: str | None = None,
 ) -> Callable[[], Any] | None:
     if not enabled:
         return None
     env_kwargs = _env_kwargs(metadata, render_mode="rgb_array",
-                             max_episode_steps=max_episode_steps,
-                             ycb_model_id=ycb_model_id)
+                             max_episode_steps=max_episode_steps)
     def factory() -> Any:
         return gym.make(str(metadata["env_id"]), **env_kwargs)
     return factory
@@ -1889,6 +1884,19 @@ def _execute_pick_and_place(
 
     print("[Phase 3] Pick and place complete!\n", flush=True)
 
+YCB_OBJECTS = {
+    "mug": "025_mug",
+    "bowl": "024_bowl",
+    "tomato_soup": "005_tomato_soup_can",
+    "mustard": "006_mustard_bottle",
+    "cheezit": "009_gelatin_box",
+    "cracker_box": "003_cracker_box",
+    "sugar_box": "004_sugar_box",
+    "potted_meat": "010_potted_meat_can",
+    "banana": "011_banana",
+    "bleach": "021_bleach_cleanser"
+}
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     checkpoint_path = resolve_checkpoint_path(args.checkpoint, args.checkpoint_dir)
@@ -1926,6 +1934,13 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "kitchen_env", False):
         metadata["env_id"] = "PG3DReach-RealKitchen-v0"
         print(f"[graspgen_pick] env_id overridden to PG3DReach-RealKitchen-v0", flush=True)
+
+    if getattr(args, "ycb_object", None) is not None:
+        metadata["env_id"] = "jstbanana-v0"
+        if "env_kwargs" not in metadata:
+            metadata["env_kwargs"] = {}
+        metadata["env_kwargs"]["ycb_model_id"] = YCB_OBJECTS[args.ycb_object]
+        print(f"[graspgen_pick] env_id overridden to jstbanana-v0 with ycb_model_id {YCB_OBJECTS[args.ycb_object]}", flush=True)
 
     device = select_device(args.device)
     _seed_torch(args.seed)
@@ -2024,14 +2039,12 @@ def main(argv: list[str] | None = None) -> int:
                 metadata,
                 render_mode="rgb_array" if args.video else None,
                 max_episode_steps=args.max_episode_steps,
-                ycb_model_id=getattr(args, "ycb_model_id", None)
             ),
         )
         ghost_env = gym.make(
             str(metadata["env_id"]),
             **_env_kwargs(metadata, render_mode=None,
-                          max_episode_steps=args.max_episode_steps,
-                          ycb_model_id=getattr(args, "ycb_model_id", None)),
+                          max_episode_steps=args.max_episode_steps),
         )
 
         # ── Make marker spheres virtual ONLY in sim_env ─────────────────────
@@ -2128,7 +2141,6 @@ def main(argv: list[str] | None = None) -> int:
                             metadata=metadata,
                             enabled=write_video and args.constraint_overlay_video,
                             max_episode_steps=args.max_episode_steps,
-                            ycb_model_id=getattr(args, "ycb_model_id", None)
                         ),
                         constraint_overlay_alpha=args.constraint_overlay_alpha,
                         constraint_overlay_color=tuple(args.constraint_overlay_color),
@@ -2281,6 +2293,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Override the env_id from dataset metadata.")
     p.add_argument("--kitchen-env", action="store_true",
                    help="Force use of PG3DReach-RealKitchen-v0.")
+    p.add_argument("--ycb-object", type=str, choices=list(YCB_OBJECTS.keys()), default=None,
+                   help="YCB object name to use. Forces env_id to jstbanana-v0.")
 
     # ---------------------------------------------------------------------------
     # *** GraspGen-specific args (NEW) ***
@@ -2316,9 +2330,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--grasp-rotation-tolerance", type=float, default=0.1745,
                    help="Rotation tolerance (rad) for CartesianPoseConstraint.satisfied(). 0.1745 rad = 10 degrees.")
     g.add_argument("--graspgen-viser", action="store_true",
-                   help="Open a blocking Viser 3-D debug window after each GraspGen call.")
-    g.add_argument("--ycb-model-id", type=str, default="009_gelatin_box",
-                   help="The YCB model ID to load for the jstbanana-v0 environment.")
+                   help="Open a blocking Viser 3-D debug window after each GraspGen call, "
+                        "showing the object cloud and all grasp candidates as pitchforks. "
+                        "Close the browser tab or press Ctrl+C to continue.")
 
     # --- Episode / source ---
     p.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
