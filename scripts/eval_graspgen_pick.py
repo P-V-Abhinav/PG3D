@@ -1942,6 +1942,12 @@ def main(argv: list[str] | None = None) -> int:
         metadata["env_kwargs"]["ycb_model_id"] = YCB_OBJECTS[args.ycb_object]
         print(f"[graspgen_pick] env_id overridden to jstbanana-v0 with ycb_model_id {YCB_OBJECTS[args.ycb_object]}", flush=True)
 
+    if getattr(args, "ycb_yaw", None) is not None:
+        if "env_kwargs" not in metadata:
+            metadata["env_kwargs"] = {}
+        metadata["env_kwargs"]["ycb_yaw"] = args.ycb_yaw
+        print(f"[graspgen_pick] ycb_yaw set to {args.ycb_yaw}", flush=True)
+
     device = select_device(args.device)
     _seed_torch(args.seed)
     timer = TimingRecorder(
@@ -2295,6 +2301,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Force use of PG3DReach-RealKitchen-v0.")
     p.add_argument("--ycb-object", type=str, choices=list(YCB_OBJECTS.keys()), default=None,
                    help="YCB object name to use. Forces env_id to jstbanana-v0.")
+    p.add_argument("--ycb-yaw", type=float, default=None,
+                   help="Manual yaw angle (in radians) for the YCB object. If not provided, it is randomized.")
 
     # ---------------------------------------------------------------------------
     # *** GraspGen-specific args (NEW) ***

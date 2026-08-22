@@ -393,8 +393,9 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
 # ---------------------------------------------------------------------------
 @register_env("jstbanana-v0", max_episode_steps=100)
 class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
-    def __init__(self, *args, ycb_model_id="009_gelatin_box", **kwargs):
+    def __init__(self, *args, ycb_model_id="009_gelatin_box", ycb_yaw=None, **kwargs):
         self.ycb_model_id = ycb_model_id
+        self.ycb_yaw = ycb_yaw
         super().__init__(*args, **kwargs)
 
     def _load_scene(self, options: dict[str, Any] | None) -> None:
@@ -437,10 +438,13 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             pos_np = np.array([sx, sy, self._JSTBANANA_Z], dtype=np.float32)
             pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-            # Stand the object up (90 deg around X) then apply random Z rotation
-            theta = rng.uniform(0, 2 * np.pi)
+            # Apply random Z rotation (assume objects are upright by default)
+            if getattr(self, "ycb_yaw", None) is not None:
+                theta = float(self.ycb_yaw)
+            else:
+                theta = rng.uniform(0, 2 * np.pi)
             import scipy.spatial.transform
-            r = scipy.spatial.transform.Rotation.from_euler('xz', [np.pi/2, theta], degrees=False)
+            r = scipy.spatial.transform.Rotation.from_euler('z', theta, degrees=False)
             q_xyzw = r.as_quat()
             q_t = torch.tensor(
                 [q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]],
