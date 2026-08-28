@@ -402,7 +402,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         super()._load_scene(options)
         model_id = self.ycb_model_id
         if model_id == "cube_7cm":
-            self.cheezit = actors.build_box(self.scene, half_sizes=[0.035, 0.035, 0.035], color=[0, 1, 0, 1], name="cube_7cm", body_type="dynamic")
+            self.cheezit = actors.build_box(self.scene, half_sizes=[0.015, 0.015, 0.015], color=[0, 1, 0, 1], name="cube_7cm", body_type="dynamic")
         else:
             try:
                 builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
