@@ -1784,8 +1784,8 @@ def _descend_to_grasp(
             print_env_info=False,
         )
         # plan_screw expects pose as [px, py, pz, qw, qx, qy, qz] (wxyz)
-        # We use current_quat_wxyz so the orientation is strictly preserved during descent
-        target_pose_vec = np.concatenate([final_grasp_pos, current_quat_wxyz])
+        # Use final_grasp_quat_wxyz so the gripper rotates into the correct GraspGen orientation
+        target_pose_vec = np.concatenate([final_grasp_pos, final_grasp_quat_wxyz]).astype(np.float64)
         result = solver.planner.plan_screw(
             target_pose_vec,
             current_qpos_full[:7],                     # arm joints only (7-DOF)
@@ -1824,15 +1824,31 @@ def _descend_to_grasp(
             ik_waypoints: list[np.ndarray] = []
             q_seed = current_qpos_full[:7].copy()
 
+            # Pre-build SLERP over [0, 1] for the orientation interpolation
+            from scipy.spatial.transform import Slerp as _Slerp
+            
+            # Need to convert from wxyz to xyzw for scipy Slerp
+            current_quat_xyzw = np.roll(current_quat_wxyz, -1)
+            grasp_quat_xyzw = np.roll(final_grasp_quat_wxyz, -1)
+            
+            _key_times   = [0.0, 1.0]
+            _key_rots    = _Rotation.concatenate([
+                _Rotation.from_quat(current_quat_xyzw),
+                _Rotation.from_quat(grasp_quat_xyzw),
+            ])
+            _slerp       = _Slerp(_key_times, _key_rots)
+
             for i in range(1, n_descent_steps + 1):
                 alpha    = i / n_descent_steps
                 interp_p = current_pos + alpha * (final_grasp_pos - current_pos)
+                interp_q = _slerp(alpha).as_quat()  # xyzw
                 
                 # Build sapien pose for IK (sapien expects wxyz)
-                # Keep orientation strictly at current_quat_wxyz
+                q_wxyz = np.array([float(interp_q[3]), float(interp_q[0]), float(interp_q[1]), float(interp_q[2])])
+                q_wxyz = q_wxyz / (np.linalg.norm(q_wxyz) + 1e-8)
                 target_sapien = sapien.Pose(
                     p=interp_p.tolist(),
-                    q=current_quat_wxyz.tolist(),
+                    q=q_wxyz.tolist(),
                 )
                 result_ik = model.compute_inverse_kinematics(
                     tcp_link_idx,
