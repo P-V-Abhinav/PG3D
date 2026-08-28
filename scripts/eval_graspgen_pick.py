@@ -1266,11 +1266,26 @@ def _deg(*vals):
 # Joint index mapping (xArm7, arm-only, 0-based): 0=J1 base yaw,
 # 1=J2 shoulder, 2=J3 twist, 3=J4 elbow, 4=J5 twist, 5=J6 wrist, 6=J7 twist.
 # Only J1, J2, J4 (indices 0, 1, 3) are masked -- see ApproachPostureConstraint docstring.
+#
+# Sign conventions (from xarm7_robotiq.urdf, confirmed by right-hand rule):
+#   J1 (joint1): axis = 0 0 1 (world vertical Z).
+#       Positive J1 → CCW viewed from above → arm swings to robot's LEFT  (+Y world).
+#       Negative J1 → CW  viewed from above → arm swings to robot's RIGHT (-Y world).
+#   J2 (joint2): axis = 0 0 1 in link1 frame, which has rpy="-1.5708 0 0" from world.
+#       Negative J2 → shoulder rises (arm more upright / overhead).
+#       Rest pose: J2 = -0.4 rad (arm angled forward-down).
+#   J4 (joint4): elbow bend.
+#       Positive J4 → elbow bends (folds arm). Rest pose: J4 = 0.5 rad.
+#       Larger J4 → tighter elbow fold → arm arcs higher for an overhead approach.
 APPROACH_PRESETS: dict[str, dict[int, float]] = {
-    "middle": dict(zip([0, 1, 3], _deg(0, -40, 45))),
-    "left":   dict(zip([0, 1, 3], _deg(-35, -30, 55))),
-    "right":  dict(zip([0, 1, 3], _deg(35, -30, 55))),
-    "above":  dict(zip([0, 1, 3], _deg(0, -70, 90))),
+    # Neutral / straight-ahead approach (J1=0 → no lateral bias).
+    "middle": dict(zip([0, 1, 3], _deg(0,   -40,  45))),
+    # Left approach: J1 positive → arm base rotates CCW → elbow swings to robot's LEFT.
+    "left":   dict(zip([0, 1, 3], _deg(35,  -30,  55))),
+    # Right approach: J1 negative → arm base rotates CW → elbow swings to robot's RIGHT.
+    "right":  dict(zip([0, 1, 3], _deg(-35, -30,  55))),
+    # Above approach: shoulder raised (J2 more negative) + tighter elbow fold (J4 larger).
+    "above":  dict(zip([0, 1, 3], _deg(0,   -70,  90))),
 }
 
 
