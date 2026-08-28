@@ -1768,10 +1768,11 @@ def _descend_to_grasp(
             sim_env,
             vis=False,
             debug=False,
+            base_pose=sim_env.unwrapped.agent.robot.pose,
             print_env_info=False,
         )
-        # plan_screw takes pose as [px, py, pz, qx, qy, qz, qw] (xyzw)
-        target_pose_vec = np.concatenate([final_grasp_pos, grasp_quat_xyzw]).astype(np.float64)
+        # plan_screw expects pose as [px, py, pz, qw, qx, qy, qz] (wxyz)
+        target_pose_vec = np.concatenate([final_grasp_pos, final_grasp_quat_wxyz]).astype(np.float64)
         result = solver.planner.plan_screw(
             target_pose_vec,
             current_qpos_full[:7],                     # arm joints only (7-DOF)
@@ -1824,10 +1825,11 @@ def _descend_to_grasp(
                 interp_p = current_pos + alpha * (final_grasp_pos - current_pos)
                 interp_q = _slerp(alpha).as_quat()  # xyzw
                 # Build sapien pose for IK (sapien expects wxyz)
+                q_wxyz = np.array([float(interp_q[3]), float(interp_q[0]), float(interp_q[1]), float(interp_q[2])])
+                q_wxyz = q_wxyz / (np.linalg.norm(q_wxyz) + 1e-8)
                 target_sapien = sapien.Pose(
                     p=interp_p.tolist(),
-                    q=[float(interp_q[3]), float(interp_q[0]),
-                       float(interp_q[1]), float(interp_q[2])],
+                    q=q_wxyz.tolist(),
                 )
                 result_ik = model.compute_inverse_kinematics(
                     tcp_link_idx,
