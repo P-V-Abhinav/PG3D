@@ -1075,25 +1075,46 @@ def _build_graspgen_constraint(
 
     # Always store the final (pre-approach) grasp pose so _execute_pick_and_place
     # can use it for the Cartesian descent, regardless of whether --rerun is set.
+    # The descent target is: object centroid XY + grasp contact Z (no approach offset).
+    # This matches the pre-grasp anchor so the arm descends straight down over the object.
+    final_grasp_pos_for_descent = np.array([
+        target_xyz[0],   # object centroid X
+        target_xyz[1],   # object centroid Y
+        adj_pos[2],      # grasp contact Z (no offset)
+    ], dtype=np.float32)
     if not hasattr(args, "_graspgen_rerun_data"):
         args._graspgen_rerun_data = {}
     if spec.output_index not in args._graspgen_rerun_data:
         args._graspgen_rerun_data[spec.output_index] = {}
-    args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = adj_pos
+    args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = final_grasp_pos_for_descent
     args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
     # --- 8b. Create Pre-Grasp Pose ---
     # Read the approach offset from CLI arguments (defaults to -0.02 if not provided)
     approach_offset = float(getattr(args, "grasp_approach_offset", -0.02))
-    # approach vector is the local Z axis of the adjusted rotation
-    approach_vec = adj_rot[:, 2]
-    # offset backward (negative approach_vec)
-    pregrasp_pos = adj_pos - approach_offset * approach_vec
-    
+
+    # The pre-grasp goal position is anchored to the OBJECT CENTROID (target_xyz),
+    # not to the raw GraspGen TCP position (adj_pos). This ensures the goal marker
+    # always appears directly above the object regardless of where GraspGen placed
+    # the TCP contact point on the surface.
+    #
+    # We always approach from directly above (top-down), so the pre-grasp position is:
+    #   XY  = object centroid XY  (directly above the object)
+    #   Z   = grasp contact Z + approach_offset  (hover above the contact point)
+    #
+    # A positive approach_offset lifts the goal marker above the grasp contact.
+    pregrasp_pos = np.array([
+        target_xyz[0],                        # object centroid X
+        target_xyz[1],                        # object centroid Y
+        adj_pos[2] + approach_offset,         # grasp contact Z + hover height
+    ], dtype=np.float32)
+
     if abs(approach_offset) > 1e-6:
         print(
             f"[GraspGen] Episode {spec.output_index}: applying approach offset={approach_offset:.4f}m:\n"
-            f"  pre-grasp position = {pregrasp_pos.tolist()}\n",
+            f"  object centroid  = {target_xyz.tolist()}\n"
+            f"  grasp contact Z  = {adj_pos[2]:.4f}\n"
+            f"  pre-grasp pos    = {pregrasp_pos.tolist()}\n",
             flush=True,
         )
 
