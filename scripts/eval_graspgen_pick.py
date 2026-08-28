@@ -1163,6 +1163,25 @@ def _build_graspgen_constraint(
         )
         constraints.append(posture_constraint)
 
+    # --- 10. Optionally stack an approach-direction posture bias ---
+    # (EDIT 3) Masked to only the redundant joints so it doesn't fight the
+    # grasp pose's orientation requirement. Skipped for the default "middle"
+    # preset to preserve backward-compatibility with existing runs.
+    approach_direction = getattr(args, "approach_direction", "middle")
+    if approach_direction != "middle":
+        preset = APPROACH_PRESETS[approach_direction]
+        approach_constraint = ApproachPostureConstraint(
+            target_partial=preset,
+            weight=float(getattr(args, "approach_weight", 0.3)),
+            eval_timestep="all",
+        )
+        constraints.append(approach_constraint)
+        print(
+            f"[GraspGen] Episode {spec.output_index}: approach_direction="
+            f"{approach_direction!r}  weight={approach_constraint.weight:.2f}",
+            flush=True,
+        )
+
     return constraints, None   # None = no PendingObstacleSpawn
 
 
@@ -1174,6 +1193,85 @@ def _build_graspgen_constraint(
 class DummyRegion:
     def signed_distance(self, points: np.ndarray) -> np.ndarray:
         return np.full(points.shape[:-1], 1000.0, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Approach-direction posture bias  (EDIT 1 — masked null-space proxy)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ApproachPostureConstraint:
+    """Soft posture bias over a SUBSET of joints only.
+
+    This is the practical stand-in for arm-angle (Hollerbach/SEW)
+    parameterization: instead of solving the analytic null-space
+    circle, we bias only the joints that dominate 'which side the
+    elbow swings to' (base yaw J1, shoulder J2, elbow J4 for xArm7's
+    SRS structure) and leave the wrist joints (J3, J5, J6, J7) free
+    so they can still satisfy the exact grasp/target orientation.
+
+    target_partial: dict mapping joint index (0-based, arm-only,
+        7-DOF) -> target angle in RADIANS. Joints not present in this
+        dict are NOT penalized.
+    weight: overall scale on the cost (kept smaller than the grasp
+        CartesianPoseConstraint's weight so pose accuracy always wins
+        the tug-of-war; tune this, don't just copy the pose weight).
+    eval_timestep: "all" | "final" | "midpoint", same semantics as
+        JointPostureConstraint.
+    """
+
+    target_partial: dict
+    weight: float = 0.3
+    eval_timestep: str = "all"
+    name: str = "approach_posture"
+    constraint_type: str = "approach_posture"
+
+    def _selected_steps(self, horizon: int) -> list[int]:
+        if self.eval_timestep == "final":
+            return [horizon - 1]
+        if self.eval_timestep == "midpoint":
+            return [horizon // 2]
+        return list(range(horizon))
+
+    def cost(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> dict[str, float]:
+        q = np.asarray(rollout.q, dtype=np.float32)  # (horizon, 7)
+        if q.ndim != 2 or q.shape[0] == 0:
+            return {self.name: 0.0}
+        steps = self._selected_steps(q.shape[0])
+        idx = sorted(self.target_partial.keys())
+        target = np.array([self.target_partial[i] for i in idx], dtype=np.float32)
+        errs = q[np.ix_(steps, idx)] - target[None, :]
+        sq = np.mean(errs**2, axis=1)  # per-timestep mean sq error over masked joints
+        cost = float(self.weight * np.mean(sq))
+        return {self.name: cost, f"{self.name}_max": float(self.weight * np.max(sq))}
+
+    def satisfied(self, rollout: ImaginedRollout, scene: SceneContext | None = None) -> bool:
+        # Soft bias only -- never blocks a candidate as infeasible.
+        return True
+
+    def to_json(self) -> dict:
+        return {
+            "type": self.constraint_type,
+            "target_partial": {str(k): float(v) for k, v in self.target_partial.items()},
+            "weight": self.weight,
+            "eval_timestep": self.eval_timestep,
+        }
+
+
+def _deg(*vals):
+    """Convert degree values to radians."""
+    return [math.radians(v) for v in vals]
+
+
+# Joint index mapping (xArm7, arm-only, 0-based): 0=J1 base yaw,
+# 1=J2 shoulder, 2=J3 twist, 3=J4 elbow, 4=J5 twist, 5=J6 wrist, 6=J7 twist.
+# Only J1, J2, J4 (indices 0, 1, 3) are masked -- see ApproachPostureConstraint docstring.
+APPROACH_PRESETS: dict[str, dict[int, float]] = {
+    "middle": dict(zip([0, 1, 3], _deg(0, -40, 45))),
+    "left":   dict(zip([0, 1, 3], _deg(-35, -30, 55))),
+    "right":  dict(zip([0, 1, 3], _deg(35, -30, 55))),
+    "above":  dict(zip([0, 1, 3], _deg(0, -70, 90))),
+}
 
 
 @dataclass
@@ -2607,6 +2705,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--posture-weight", type=float, default=1.0)
     p.add_argument("--posture-eval-timestep", choices=["all", "final", "midpoint"],
                    default="all")
+
+    # --- Approach direction (EDIT 2: masked null-space posture bias) ---
+    p.add_argument(
+        "--approach-direction",
+        choices=["left", "right", "above", "middle"],
+        default="middle",
+        help=(
+            "Bias the redundant xArm7 joints (base yaw J1, shoulder J2, elbow J4) "
+            "toward a preset that approximates a left/right/above/middle approach "
+            "branch. The wrist joints (J3, J5, J6, J7) are left free so they can "
+            "still satisfy the exact grasp orientation. Skipped when 'middle' "
+            "(default) to preserve backward-compatibility."
+        ),
+    )
+    p.add_argument(
+        "--approach-weight",
+        type=float,
+        default=0.3,
+        help=(
+            "Weight for the masked approach-posture bias. Keep below "
+            "--grasp-weight so grasp pose accuracy is never sacrificed "
+            "for approach-direction preference."
+        ),
+    )
 
     # --- Video / Rerun ---
     p.add_argument("--video", action="store_true")
