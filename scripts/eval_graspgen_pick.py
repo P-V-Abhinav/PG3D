@@ -2071,6 +2071,12 @@ def _execute_pick_and_place(
     manual_descent_target = current_pos.copy()
     manual_descent_target[2] -= descent_offset
 
+    current_euler_graspgen = Rotation.from_quat(np.roll(final_grasp_quat, -1)).as_euler('xyz', degrees=True)
+    print(
+        f"[Descent] Gripper orientation — DP3 end: {current_euler.tolist()} deg"
+        f"  →  GraspGen target: {current_euler_graspgen.tolist()} deg",
+        flush=True,
+    )
     print(f"[Descent] Manual descent offset applied: {descent_offset:.4f}m downwards", flush=True)
     _descend_to_grasp(
         sim_env,
@@ -2078,7 +2084,7 @@ def _execute_pick_and_place(
         frames,
         timeline,
         final_grasp_pos=manual_descent_target,
-        final_grasp_quat_wxyz=current_quat,
+        final_grasp_quat_wxyz=final_grasp_quat,   # ← GraspGen orientation, not DP3 end quat
         gripper_open=gripper_open_val,
         crop_config=crop_config,
         render_video_frame_fn=_render_video_frame,
