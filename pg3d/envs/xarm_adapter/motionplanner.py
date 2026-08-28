@@ -248,9 +248,9 @@ class XArm7GripperMotionPlanningSolver(XArm7MotionPlanningSolverBase):
 
 
 class XArm7RobotiqMotionPlanningSolver(XArm7MotionPlanningSolverBase):
-    """mplib planner for ``xarm7_robotiq`` (TCP = ``eef``, 150 mm past the flange).
+    """mplib planner for ``xarm7_robotiq`` (TCP = ``link_tcp``, 150 mm past the flange).
 
-    Same 7-DOF contract as the xArm-gripper planner: the chain to ``eef`` runs
+    Same 7-DOF contract as the xArm-gripper planner: the chain to ``link_tcp`` runs
     through joint1-7 only (the Robotiq finger joints are side branches; gripper_fix
     and eef_joint are fixed), so mplib plans 7 DOFs and returns 7-dim waypoints, and
     the passive gripper adds no action dims. The combined URDF ships a sibling SRDF
@@ -258,7 +258,7 @@ class XArm7RobotiqMotionPlanningSolver(XArm7MotionPlanningSolverBase):
     ``setup_planner`` finds both and skips regeneration.
     """
 
-    MOVE_GROUP = "eef"
+    MOVE_GROUP = "link_tcp"
 
     def __init__(self, *args, visualize_target_grasp_pose: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
