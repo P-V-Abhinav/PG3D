@@ -1073,9 +1073,22 @@ def _build_graspgen_constraint(
     adj_rot  = adjusted[:3, :3]
     adj_quat = _rot3x3_to_quat_wxyz(adj_rot)
 
+    # Store the true grasp pose (before approach offset) so _execute_pick_and_place
+    # can descend to it with the mplib Cartesian planner.
+    true_grasp_pos  = adj_pos.copy()   # (3,) world-frame TCP contact point
+    true_grasp_quat = adj_quat.copy()  # (4,) wxyz quaternion
+
     if getattr(args, "rerun", False):
         args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"] = adj_pos
         args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
+
+    # Always store the true grasp pose on args regardless of rerun flag.
+    if not hasattr(args, "_graspgen_rerun_data"):
+        args._graspgen_rerun_data = {}
+    if spec.output_index not in args._graspgen_rerun_data:
+        args._graspgen_rerun_data[spec.output_index] = {}
+    args._graspgen_rerun_data[spec.output_index]["true_grasp_pos"]  = true_grasp_pos
+    args._graspgen_rerun_data[spec.output_index]["true_grasp_quat"] = true_grasp_quat
 
     # --- 8b. Create Pre-Grasp Pose ---
     # Read the approach offset from CLI arguments (defaults to -0.02 if not provided)
@@ -1706,6 +1719,28 @@ def resolve_checkpoint_path(checkpoint: Path | None, checkpoint_dir: Path | None
 #              and loads GraspGenSampler first.
 # ===========================================================================
 
+def _planner_step_env(
+    sim_env: Any,
+    video_env: Any,
+    frames: list,
+    timeline: list,
+    action: np.ndarray,
+    crop_config: Any,
+) -> None:
+    """Step sim_env (and optionally video_env) with the given joint-position action,
+    capture a video frame and append an observation entry to the timeline."""
+    from scripts.eval_pointcloud_pose_steering_reach import _render_video_frame
+    from pg3d.utils.arrays import frame_to_numpy as _frame_to_numpy
+
+    sim_env.step(action)
+    if video_env is not None:
+        video_env.step(action)
+    frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+    sim_obs = sim_env.unwrapped.get_obs()
+    sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
+    timeline.append(sim_entry)
+
+
 def _execute_pick_and_place(
     sim_env: Any,
     video_env: Any,
@@ -1719,170 +1754,234 @@ def _execute_pick_and_place(
     action_mode: Any,
     args: Any,
 ):
-    import sapien.core as sapien
-    import rerun as rr
+    """Phase 1-3 post-reach callback: descend to grasp → close gripper → lift.
+
+    Phase 0 (DP3 reach) has already moved the EEF to the pre-grasp offset pose
+    (``--grasp-approach-offset`` metres above the true grasp contact point).
+
+    This callback:
+      Phase 1a – Cartesian descent from the offset pose to the true grasp pose
+                 using mplib's ``move_to_pose_with_screw`` (straight-line screw
+                 motion, exactly as ManiSkill's pick-and-place tasks do it).
+      Phase 1b – Close the gripper.
+      Phase 2  – Lift the object by ``--grasp-descend-lift-height`` metres.
+    """
+    import sapien
     import torch
     from mani_skill.utils.structs.pose import Pose
-    from pg3d.utils.arrays import frame_to_numpy as _frame_to_numpy
-    from scripts.eval_pointcloud_pose_steering_reach import _render_video_frame
-    
-    # Get pre-saved final grasp pose from args
-    global CURRENT_RERUN_DATA
-    if CURRENT_RERUN_DATA is None or "final_grasp_pos" not in CURRENT_RERUN_DATA:
-        return
-        
-    print("\n--- [Phase 1] Executing Open-Loop Grasp Approach ---", flush=True)
-    
-    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    current_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()
     from scipy.spatial.transform import Rotation
-    current_rot_euler = Rotation.from_quat(
-        np.roll(current_quat, -1)
-    ).as_euler('xyz', degrees=True)
-    
-    print(f"[Debug] Pre-Approach Cartesian Pos: {current_pos.tolist()}", flush=True)
-    print(f"[Debug] Pre-Approach Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
-    print(f"[Debug] Pre-Approach Joint Angles: {current_qpos.tolist()}", flush=True)
-    
-    model = sim_env.unwrapped.agent.robot.create_pinocchio_model()
-    tcp_link_name = sim_env.unwrapped.agent.ee_link_name
-    links = [link.name for link in sim_env.unwrapped.agent.robot.get_links()]
-    link_idx = links.index(tcp_link_name)
-    
-    # 1. Skip the Cartesian descent entirely. The goal marker was placed 2cm above the object, 
-    # so the arm is already close enough. Just move straight to closing the gripper.
-    
-    # Post-approach debug
+    from scripts.eval_pointcloud_pose_steering_reach import _render_video_frame
+    from pg3d.utils.arrays import frame_to_numpy as _frame_to_numpy
+
+    # ── Retrieve stored true grasp pose ──────────────────────────────────────
+    global CURRENT_RERUN_DATA
+    if CURRENT_RERUN_DATA is None or "true_grasp_pos" not in CURRENT_RERUN_DATA:
+        print(
+            "[Phase 1] WARNING: no true_grasp_pos in CURRENT_RERUN_DATA — "
+            "skipping descend-and-grasp.",
+            flush=True,
+        )
+        return
+
+    true_grasp_pos  = np.asarray(CURRENT_RERUN_DATA["true_grasp_pos"],  dtype=np.float64)
+    true_grasp_quat = np.asarray(CURRENT_RERUN_DATA["true_grasp_quat"], dtype=np.float64)
+    # true_grasp_quat is wxyz; sapien.Pose expects wxyz → pass directly
+    true_grasp_pose = sapien.Pose(p=true_grasp_pos, q=true_grasp_quat)
+
+    lift_height = float(getattr(args, "grasp_descend_lift_height", 0.15))
+
+    # ── Debug: current EEF state after Phase 0 ───────────────────────────────
     current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    current_pos  = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    current_quat_wxyz = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()
     current_rot_euler = Rotation.from_quat(
+        np.roll(current_quat_wxyz, -1)  # wxyz → xyzw for scipy
+    ).as_euler("xyz", degrees=True)
+
+    print("\n--- [Phase 1a] Cartesian Descent to True Grasp Pose ---", flush=True)
+    print(f"  EEF pos  (pre-descend) : {current_pos.tolist()}", flush=True)
+    print(f"  EEF euler(pre-descend) : {current_rot_euler.tolist()} deg", flush=True)
+    print(f"  True grasp pos (target): {true_grasp_pos.tolist()}", flush=True)
+
+    # ── Build motion planner ──────────────────────────────────────────────────
+    # Detect robot variant from the URDF path / env agent.
+    planner = None
+    try:
+        robot_uid = str(
+            getattr(sim_env.unwrapped, "robot_uids", [None])
+        )
+        urdf_path = str(getattr(sim_env.unwrapped.agent, "urdf_path", ""))
+        if "robotiq" in urdf_path.lower():
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7RobotiqMotionPlanningSolver
+            planner_cls = XArm7RobotiqMotionPlanningSolver
+        elif "gripper" in urdf_path.lower():
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7GripperMotionPlanningSolver
+            planner_cls = XArm7GripperMotionPlanningSolver
+        else:
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7GripperMotionPlanningSolver
+            planner_cls = XArm7GripperMotionPlanningSolver
+
+        planner = planner_cls(
+            sim_env,
+            debug=False,
+            vis=False,
+            base_pose=sim_env.unwrapped.agent.robot.pose,
+            visualize_target_grasp_pose=False,
+            print_env_info=False,
+        )
+        print(
+            f"  [Planner] built {planner_cls.__name__} from {urdf_path}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"  [Planner] WARNING: could not build motion planner ({exc}). "
+            "Falling back to no-descent (close gripper immediately).",
+            flush=True,
+        )
+
+    # ── Phase 1a: Cartesian descent ───────────────────────────────────────────
+    # Snapshot the full qpos NOW (after DP3 reach, before descent).
+    # The gripper dims (indices >= 7) are frozen at this state for the entire
+    # descent — the planner only plans arm joints, so we conserve exactly the
+    # finger orientation/aperture that DP3 arrived with.
+    pre_descent_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy().copy()
+    action_dim = int(np.prod(sim_env.action_space.shape))
+    print(
+        f"  [Planner] frozen gripper dims: {pre_descent_qpos[7:].tolist() if len(pre_descent_qpos) > 7 else '(none)'}",
+        flush=True,
+    )
+
+    descent_success = False
+    if planner is not None:
+        try:
+            plan = planner.move_to_pose_with_screw(true_grasp_pose, dry_run=True)
+            if plan == -1 or "position" not in plan:
+                print(
+                    "  [Planner] move_to_pose_with_screw failed (no plan). "
+                    "Skipping descent.",
+                    flush=True,
+                )
+            else:
+                waypoints = np.asarray(plan["position"], dtype=np.float32)  # (N, 7)
+                print(
+                    f"  [Planner] descent plan: {waypoints.shape[0]} waypoints",
+                    flush=True,
+                )
+                for waypoint in waypoints:
+                    action = pre_descent_qpos.copy().astype(np.float32)  # start from full snapshot
+                    n_arm = min(waypoint.shape[0], action_dim)
+                    action[:n_arm] = waypoint[:n_arm]   # overwrite only arm joints
+                    # gripper dims (action[n_arm:]) remain from pre_descent_qpos — untouched
+                    _planner_step_env(
+                        sim_env, video_env, frames, timeline, action, crop_config
+                    )
+                descent_success = True
+                post_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+                print(
+                    f"  [Planner] descent complete. EEF pos: {post_pos.tolist()}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"  [Planner] ERROR during descent: {exc}. Skipping descent.",
+                flush=True,
+            )
+        finally:
+            planner.close()
+    else:
+        print(
+            "  [Planner] No planner available — skipping Cartesian descent.",
+            flush=True,
+        )
+
+    # ── Phase 1b: Close gripper ───────────────────────────────────────────────
+    print("\n--- [Phase 1b] Closing Gripper ---", flush=True)
+    pre_grasp_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    pre_grasp_euler = Rotation.from_quat(
         np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
-    ).as_euler('xyz', degrees=True)
-    
-    print("\n--- [Phase 1] Closing Gripper ---", flush=True)
-    print(f"[Debug] Pre-Grasp Cartesian Pos: {current_pos.tolist()}", flush=True)
-    print(f"[Debug] Pre-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
-    print(f"[Debug] Pre-Grasp Joint Angles: {current_qpos.tolist()}", flush=True)
-    
-    # 2. Close the gripper natively via the mimic controller!
+    ).as_euler("xyz", degrees=True)
+    print(f"  EEF pos (pre-close) : {pre_grasp_pos.tolist()}", flush=True)
+    print(f"  EEF euler(pre-close): {pre_grasp_euler.tolist()} deg", flush=True)
+
     close_steps = 30
+    action_dim = int(np.prod(sim_env.action_space.shape))
     for i in range(1, close_steps + 1):
         target_val = 0.85 * (i / close_steps)
         current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-            
-        # Keep the arm still, but command the gripper to close if it has an action dimension
-        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action = np.zeros(action_dim, dtype=np.float32)
         action[:7] = current_qpos[:7]
-        if action.shape[0] > 7:
+        if action_dim > 7:
             action[7:] = target_val
-            
-        sim_env.step(action)
-        if video_env is not None:
-            video_env.step(action)
-        
-        # Add to video
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
-        
-        # Add to rerun timeline
-        sim_obs = sim_env.unwrapped.get_obs()
-        sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
-        timeline.append(sim_entry)
+        _planner_step_env(sim_env, video_env, frames, timeline, action, crop_config)
 
-    # Post-grasp debug
-    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    current_rot_euler = Rotation.from_quat(
+    post_grasp_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+    post_grasp_euler = Rotation.from_quat(
         np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
-    ).as_euler('xyz', degrees=True)
-    
-    print("\n--- [Phase 1] Grasp Execution Complete ---", flush=True)
-    print(f"[Debug] Post-Grasp Cartesian Pos: {current_pos.tolist()}", flush=True)
-    print(f"[Debug] Post-Grasp Cartesian Euler (deg): {current_rot_euler.tolist()}", flush=True)
-    print(f"[Debug] Post-Grasp Joint Angles: {current_qpos.tolist()}\n", flush=True)
+    ).as_euler("xyz", degrees=True)
+    print(f"  EEF pos (post-close): {post_grasp_pos.tolist()}", flush=True)
+    print(f"  EEF euler(post-close): {post_grasp_euler.tolist()} deg", flush=True)
 
-    print("\n--- [Phase 2] Moving to Place Goal ---", flush=True)
-    
-    # 1. Define a new goal location (e.g. up and to the right)
-    new_goal_pos = np.array([0.2, 0.2, 0.25], dtype=np.float32)
-    print(f"[Debug] New Goal Pos: {new_goal_pos.tolist()}", flush=True)
+    # ── Phase 2: Lift ─────────────────────────────────────────────────────────
+    print(f"\n--- [Phase 2] Lifting Object by {lift_height:.3f} m ---", flush=True)
+    # Build the lift pose: same position/orientation as the true grasp, shifted up in world Z.
+    lift_pos  = true_grasp_pos.copy()
+    lift_pos[2] += lift_height
+    lift_pose = sapien.Pose(p=lift_pos, q=true_grasp_quat)
 
-    # Move the goal_site to the new goal position so the policy sees it in the point cloud
-    if hasattr(sim_env.unwrapped, "goal_site"):
-        pos_t = torch.tensor(new_goal_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
-        sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
-
-    # 2. Get fresh observation and init window
-    sim_obs = sim_env.unwrapped.get_obs()
-    sim_info = {}
-    sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
-    obs_window = make_initial_obs_window(sim_entry, n_obs_steps=int(policy.n_obs_steps))
-    timeline.append(sim_entry)
-
-    # 3. Run policy for 50 steps
-    place_steps = 50
-    rng = np.random.default_rng(args.seed)
-    ema_sim_action = None
-    action_ema_alpha = args.action_ema_alpha
-
-    for step in range(place_steps):
-        chunks = adapter.sample_action_chunks(obs_window, k=1, rng=rng)
-        selected_chunk = chunks[0]
-        
-        policy_action = selected_chunk.actions[0]
-        
-        sim_action = policy_action_to_sim_action(
-            policy_action,
-            np.asarray(sim_entry["agent_pos"], dtype=np.float32),
-            action_mode=action_mode,
-            sim_action_dim=int(np.prod(sim_env.action_space.shape)),
-            low=getattr(sim_env.action_space, "low", None),
-            high=getattr(sim_env.action_space, "high", None),
-            gripper_open=0.85,  # Keep gripper closed
-        )
-        
-        if ema_sim_action is None or action_ema_alpha >= 1.0:
-            ema_sim_action = sim_action
+    planner_lift = None
+    lift_success = False
+    try:
+        if "robotiq" in str(getattr(sim_env.unwrapped.agent, "urdf_path", "")).lower():
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7RobotiqMotionPlanningSolver
+            planner_lift_cls = XArm7RobotiqMotionPlanningSolver
         else:
-            ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
-            
-        sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
-        if video_env is not None:
-            video_env.step(ema_sim_action)
-            
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
-            
-        sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
-        obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
-        timeline.append(sim_entry)
-        
-        tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
-        if np.linalg.norm(tcp_pos - new_goal_pos) < 0.05:
-            print(f"[Phase 2] Reached new goal at step {step}!", flush=True)
-            break
-            
-    print("\n--- [Phase 3] Releasing Object ---", flush=True)
-    open_steps = 20
-    for i in range(1, open_steps + 1):
-        target_val = 0.85 * (1.0 - i / open_steps)
-        current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-            
-        action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        action[:7] = current_qpos[:7]
-        if action.shape[0] > 7:
-            action[7:] = target_val
-            
-        sim_env.step(action)
-        if video_env is not None:
-            video_env.step(action)
-            
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
-        
-        sim_obs = sim_env.unwrapped.get_obs()
-        sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
-        timeline.append(sim_entry)
+            from pg3d.envs.xarm_adapter.motionplanner import XArm7GripperMotionPlanningSolver
+            planner_lift_cls = XArm7GripperMotionPlanningSolver
 
-    print("[Phase 3] Pick and place complete!\n", flush=True)
+        planner_lift = planner_lift_cls(
+            sim_env,
+            debug=False,
+            vis=False,
+            base_pose=sim_env.unwrapped.agent.robot.pose,
+            visualize_target_grasp_pose=False,
+            print_env_info=False,
+        )
+        lift_plan = planner_lift.move_to_pose_with_screw(lift_pose, dry_run=True)
+        if lift_plan == -1 or "position" not in lift_plan:
+            print("  [Planner] lift plan failed — skipping lift.", flush=True)
+        else:
+            lift_waypoints = np.asarray(lift_plan["position"], dtype=np.float32)
+            print(
+                f"  [Planner] lift plan: {lift_waypoints.shape[0]} waypoints",
+                flush=True,
+            )
+            gripper_closed_val = 0.85
+            for waypoint in lift_waypoints:
+                action = np.zeros(action_dim, dtype=np.float32)
+                n_arm = min(waypoint.shape[0], action_dim)
+                action[:n_arm] = waypoint[:n_arm]
+                if action_dim > n_arm:
+                    action[n_arm:] = gripper_closed_val  # keep gripper closed during lift
+                _planner_step_env(
+                    sim_env, video_env, frames, timeline, action, crop_config
+                )
+            lift_success = True
+            post_lift_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+            print(
+                f"  [Planner] lift complete. EEF pos: {post_lift_pos.tolist()}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"  [Planner] ERROR during lift: {exc}.", flush=True)
+    finally:
+        if planner_lift is not None:
+            planner_lift.close()
+
+    print(
+        f"\n[Pick & Place] descent={descent_success}  lift={lift_success}\n",
+        flush=True,
+    )
 
 YCB_OBJECTS = {
     "mug": "025_mug",
@@ -2323,6 +2422,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Distance (m) to offset the goal pose backwards along the approach "
                         "axis to create a pre-grasp pose. The DP3 reach policy will be "
                         "evaluated against this pre-grasp pose. (Phase 0 -> Phase 1)")
+    g.add_argument("--grasp-descend-lift-height", type=float, default=0.15,
+                   help="How many metres to lift the object after grasping it (Phase 2). "
+                        "Default: 0.15 m.")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
