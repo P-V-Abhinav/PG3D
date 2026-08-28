@@ -252,6 +252,17 @@ class XArm7Gripper(BaseAgent):
     # so this applies uniformly to dataset generation and live rollout/eval.
     agent_pos_joint_indices = list(range(7))
     urdf_path = _XARM7_GRIPPER_COLORED_URDF
+    # High-friction contact material on finger tip surfaces so grasped objects
+    # do not slip out. Mirrors the Robotiq agent's urdf_config.
+    urdf_config = dict(
+        _materials=dict(
+            gripper_finger=dict(static_friction=2.0, dynamic_friction=2.0, restitution=0.0)
+        ),
+        link=dict(
+            left_finger=dict(material="gripper_finger", patch_radius=0.05, min_patch_radius=0.02),
+            right_finger=dict(material="gripper_finger", patch_radius=0.05, min_patch_radius=0.02),
+        ),
+    )
 
     # drive_joint is the sole actuated gripper DOF; the other 5 are followers that
     # mimic it 1:1 (see the URDF's own <mimic joint="drive_joint" .../> tags) --
@@ -270,16 +281,16 @@ class XArm7Gripper(BaseAgent):
         for joint_name in gripper_joint_names[1:]
     }
     # Gains match ManiSkill's own xarm6_robotiq mimic gripper exactly (stiffness=1e5,
-    # damping=2000, force_limit=0.1) -- this codebase's closest precedent for a
-    # mimic-driven xArm-family gripper. force_limit is the critical one: a 1e5-rad/s^2
-    # spring with no meaningful force cap can deliver unbounded torque on any real
-    # target change, which is what produced a qvel blowup (~100 rad/s) when this was
-    # first tried at force_limit=50 (copied from the old *static*-hold config, which
-    # never actually moved its target so a high cap was never exercised).
+    # damping=2000) -- this codebase's closest precedent for a mimic-driven xArm-family
+    # gripper. force_limit is raised to 5.0 Nm (from the original 0.1) so the fingers
+    # can resist contact forces when grasping. At 0.1 the PD spring was so weak the
+    # contact normal easily pushed the finger back open (the "floppy finger" issue).
+    # The original 0.1 was set to prevent a qvel blowup that was actually caused by
+    # the normalize_action=True issue (now fixed); 5.0 is safe with normalize_action=False.
     gripper_stiffness = 1e5
     gripper_damping = 2000
-    gripper_force_limit = 50.0
-    gripper_friction = 1
+    gripper_force_limit = 5.0
+    gripper_friction = 2
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding
     # the drive target AT the hard stop makes the PD spring and the limit constraint
