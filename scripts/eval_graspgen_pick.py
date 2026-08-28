@@ -2111,7 +2111,8 @@ YCB_OBJECTS = {
     "sugar_box": "004_sugar_box",
     "potted_meat": "010_potted_meat_can",
     "banana": "011_banana",
-    "bleach": "021_bleach_cleanser"
+    "bleach": "021_bleach_cleanser",
+    "cube": "cube_7cm"
 }
 
 def main(argv: list[str] | None = None) -> int:
