@@ -1791,8 +1791,10 @@ def _descend_to_grasp(
                 flush=True,
             )
     except Exception as exc:
+        import traceback
         print(
-            f"[Descent] mplib plan_screw raised {type(exc).__name__}: {exc} — "
+            f"[Descent] mplib plan_screw raised {type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}\n"
             "falling back to pinocchio IK interpolation",
             flush=True,
         )
