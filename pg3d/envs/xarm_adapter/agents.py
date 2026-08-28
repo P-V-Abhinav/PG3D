@@ -428,6 +428,7 @@ class XArm7Gripper(BaseAgent):
             force_limit=self.gripper_force_limit,
             friction=self.gripper_friction,
             mimic=self._gripper_mimic,
+            normalize_action=False,
         )
 
         controller_configs = dict(
