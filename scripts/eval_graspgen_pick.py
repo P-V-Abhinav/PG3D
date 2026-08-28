@@ -2083,9 +2083,38 @@ def _execute_pick_and_place(
     manual_descent_target[2] -= descent_offset
 
     current_euler_graspgen = Rotation.from_quat(np.roll(final_grasp_quat, -1)).as_euler('xyz', degrees=True)
+
+    # ── Build a TOP-DOWN + correct wrist quaternion ───────────────────────────
+    # GraspGen's quaternion encodes a full 6-DoF grasp orientation which may
+    # assume a SIDE approach (approach axis ≠ world -Z). If we blindly feed that
+    # quaternion to a straight-down descent, mplib rotates the wrist far past the
+    # correct finger alignment, giving the worst possible grasp orientation.
+    #
+    # What we actually want for a top-down descent is:
+    #   • Gripper pointing STRAIGHT DOWN  → approach = world [0, 0, -1]
+    #   • Fingers spread along the correct direction in the XY plane
+    #
+    # The finger-spread axis is column 0 (X-axis) of GraspGen's rotation matrix.
+    # Project it onto the XY plane to get the wrist yaw angle, then build a
+    # clean top-down quaternion with just that yaw.
+    graspgen_rot = Rotation.from_quat(np.roll(final_grasp_quat, -1))  # xyzw
+    graspgen_mat = graspgen_rot.as_matrix()  # (3,3)
+    # Column 0 = GraspGen's finger-spread (baseline) axis in world frame
+    finger_spread_world = graspgen_mat[:, 0]
+    wrist_yaw = float(np.arctan2(finger_spread_world[1], finger_spread_world[0]))
+    # Top-down = 180° X flip (gripper tip faces -Z), then wrist yaw on Z
+    topdown_quat_wxyz = (
+        Rotation.from_euler('z', wrist_yaw) *
+        Rotation.from_euler('x', np.pi)
+    ).as_quat()  # xyzw → convert to wxyz
+    topdown_quat_wxyz = np.roll(topdown_quat_wxyz, 1).astype(np.float32)  # wxyz
+
+    topdown_euler = Rotation.from_quat(np.roll(topdown_quat_wxyz, -1)).as_euler('xyz', degrees=True)
     print(
-        f"[Descent] Gripper orientation — DP3 end: {current_euler.tolist()} deg"
-        f"  →  GraspGen target: {current_euler_graspgen.tolist()} deg",
+        f"[Descent] Gripper orientation:\n"
+        f"  DP3 end         : {current_euler.tolist()} deg\n"
+        f"  GraspGen raw    : {current_euler_graspgen.tolist()} deg\n"
+        f"  Finger-spread XY: [{np.degrees(wrist_yaw):.1f}°]  →  top-down target: {topdown_euler.tolist()} deg",
         flush=True,
     )
     print(f"[Descent] Manual descent offset applied: {descent_offset:.4f}m downwards", flush=True)
@@ -2095,7 +2124,7 @@ def _execute_pick_and_place(
         frames,
         timeline,
         final_grasp_pos=manual_descent_target,
-        final_grasp_quat_wxyz=final_grasp_quat,   # ← GraspGen orientation, not DP3 end quat
+        final_grasp_quat_wxyz=topdown_quat_wxyz,   # ← top-down + correct wrist yaw
         gripper_open=gripper_open_val,
         crop_config=crop_config,
         render_video_frame_fn=_render_video_frame,
