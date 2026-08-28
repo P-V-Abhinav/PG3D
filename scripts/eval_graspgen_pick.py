@@ -1995,6 +1995,7 @@ def _descend_to_grasp(
 
     # ── Step 3: execute the descent waypoints ────────────────────────────────
     action_dim = int(np.prod(sim_env.action_space.shape))
+    log_every = max(1, len(waypoints_qpos) // 5)  # print ~5 diagnostic lines during descent
     for step_i, qpos_wp in enumerate(waypoints_qpos):
         action = np.zeros(action_dim, dtype=np.float32)
         action[:7] = qpos_wp.astype(np.float32)
@@ -2007,6 +2008,16 @@ def _descend_to_grasp(
         sim_obs   = sim_env.unwrapped.get_obs()
         sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
         timeline.append(sim_entry)
+
+        if step_i % log_every == 0 or step_i == len(waypoints_qpos) - 1:
+            _eef_pos  = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
+            _eef_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()  # wxyz
+            _eef_euler = _Rotation.from_quat(np.roll(_eef_quat, -1)).as_euler('xyz', degrees=True)
+            print(
+                f"  [Descent wp {step_i:3d}/{len(waypoints_qpos)-1}] "
+                f"z={_eef_pos[2]:.4f}m  euler={[round(e,2) for e in _eef_euler.tolist()]} deg",
+                flush=True,
+            )
 
     final_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
     print(
