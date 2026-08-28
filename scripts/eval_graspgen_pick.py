@@ -1100,20 +1100,19 @@ def _build_graspgen_constraint(
     #
     # We always approach from directly above (top-down), so the pre-grasp position is:
     #   XY  = object centroid XY  (directly above the object)
-    #   Z   = grasp contact Z + approach_offset  (hover above the contact point)
+    #   Z   = object centroid Z + abs(approach_offset) (hover strictly above object centroid)
     #
-    # A positive approach_offset lifts the goal marker above the grasp contact.
+    # This anchors the goal marker completely to the object.
     pregrasp_pos = np.array([
         target_xyz[0],                        # object centroid X
         target_xyz[1],                        # object centroid Y
-        adj_pos[2] + approach_offset,         # grasp contact Z + hover height
+        target_xyz[2] + abs(approach_offset), # object centroid Z + hover height
     ], dtype=np.float32)
 
     if abs(approach_offset) > 1e-6:
         print(
-            f"[GraspGen] Episode {spec.output_index}: applying approach offset={approach_offset:.4f}m:\n"
+            f"[GraspGen] Episode {spec.output_index}: applying approach offset={abs(approach_offset):.4f}m:\n"
             f"  object centroid  = {target_xyz.tolist()}\n"
-            f"  grasp contact Z  = {adj_pos[2]:.4f}\n"
             f"  pre-grasp pos    = {pregrasp_pos.tolist()}\n",
             flush=True,
         )
@@ -1936,13 +1935,21 @@ def _execute_pick_and_place(
 
     # ── Phase 1b: Cartesian descent to the grasp contact pose ────────────────
     print("\n--- [Phase 1b] Cartesian Descent to Grasp Contact Pose ---", flush=True)
+
+    # Manually define the offset mplib has to plan for, descending exactly
+    # from wherever the arm is currently positioned.
+    descent_offset = abs(float(getattr(args, "mplib_descent_offset", 0.15)))
+    manual_descent_target = current_pos.copy()
+    manual_descent_target[2] -= descent_offset
+
+    print(f"[Descent] Manual descent offset applied: {descent_offset:.4f}m downwards", flush=True)
     _descend_to_grasp(
         sim_env,
         video_env,
         frames,
         timeline,
-        final_grasp_pos=final_grasp_pos,
-        final_grasp_quat_wxyz=final_grasp_quat,
+        final_grasp_pos=manual_descent_target,
+        final_grasp_quat_wxyz=current_quat,
         gripper_open=gripper_open_val,
         crop_config=crop_config,
         render_video_frame_fn=_render_video_frame,
@@ -2517,6 +2524,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Distance (m) to offset the goal pose backwards along the approach "
                         "axis to create a pre-grasp pose. The DP3 reach policy will be "
                         "evaluated against this pre-grasp pose. (Phase 0 -> Phase 1)")
+    g.add_argument("--mplib-descent-offset", type=float, default=0.15,
+                   help="Distance (m) mplib should manually descend straight down from "
+                        "wherever the arm ended up after Phase 1a. Decoupled from grasp_approach_offset.")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
