@@ -289,7 +289,7 @@ class XArm7Gripper(BaseAgent):
     # the normalize_action=True issue (now fixed); 5.0 is safe with normalize_action=False.
     gripper_stiffness = 1e5
     gripper_damping = 2000
-    gripper_force_limit = 5.0
+    gripper_force_limit = 0.7
     gripper_friction = 2
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding
