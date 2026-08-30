@@ -23,7 +23,11 @@ from pg3d.envs.maniskill_adapter.dataset import (
     write_reach_zarr,
 )
 from pg3d.envs.maniskill_adapter.reach_config import REACH_TASK_SPECS, reach_task_metadata
-from pg3d.policies.dp3.goal_markers import goal_marker_points as _goal_marker_points
+from pg3d.policies.dp3.goal_markers import (
+    DEFAULT_GOAL_MARKER_STYLE,
+    GOAL_MARKER_STYLES,
+    build_goal_marker as _build_goal_marker,
+)
 from pg3d.utils.arrays import (
     bool_any as _bool_any,
 )
@@ -45,6 +49,7 @@ class PointCloudSaliencyConfig:
     goal_marker_radius: float = 0.055
     tcp_marker_points: int = 32
     tcp_marker_radius: float = 0.025
+    goal_marker_style: str = DEFAULT_GOAL_MARKER_STYLE
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -52,6 +57,7 @@ class PointCloudSaliencyConfig:
             "goal_marker_radius": float(self.goal_marker_radius),
             "tcp_marker_points": int(self.tcp_marker_points),
             "tcp_marker_radius": float(self.tcp_marker_radius),
+            "goal_marker_style": str(self.goal_marker_style),
         }
 
 
@@ -169,6 +175,13 @@ def main(argv: list[str] | None = None) -> int:
             viewer_step_delay=args.viewer_step_delay if args.viewer else 0.0,
             random_orientation=args.random_orientation,
             orientation_mode=args.orientation_mode,
+            orientation_cone_half_angle_deg=args.orientation_cone_half_angle_deg,
+            orientations_per_goal=args.orientations_per_goal,
+            configs_per_goal_pose=args.configs_per_goal_pose,
+            config_match_position_tol_m=args.config_match_position_tol_m,
+            config_match_orientation_tol_deg=args.config_match_orientation_tol_deg,
+            config_min_joint_separation_rad=args.config_min_joint_separation_rad,
+            max_configs_per_start_goal=args.max_configs_per_start_goal,
             action_ema_alpha=args.action_ema_alpha,
         )
 
@@ -205,7 +218,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.num_workers > 0:
             import ray
             from ray.util.actor_pool import ActorPool
-            from pathlib import Path
             script_dir = str(Path(__file__).parent.resolve())
             ray.init(num_cpus=args.num_workers, ignore_reinit_error=True)
 
@@ -368,6 +380,30 @@ def main(argv: list[str] | None = None) -> int:
                 "DP3 training observations."
             ),
         },
+        "orientation_sampling": {
+            "type": "equal_area_cone",
+            "cone_half_angle_deg": args.orientation_cone_half_angle_deg,
+            "orientations_per_goal": args.orientations_per_goal,
+            "note": (
+                "Goal wrist orientations are sampled equal-area over a down-facing "
+                "cone (cos(theta) ~ U[cos(half_angle), 1], phi ~ U[0, 2pi)); the first "
+                "orientation per pose is always straight-down."
+            ),
+        },
+        "pose_multimodality": {
+            "type": "nullspace",
+            "configs_per_goal_pose": args.configs_per_goal_pose,
+            "config_match_position_tol_m": args.config_match_position_tol_m,
+            "config_match_orientation_tol_deg": args.config_match_orientation_tol_deg,
+            "config_min_joint_separation_rad": args.config_min_joint_separation_rad,
+            "max_configs_per_start_goal": args.max_configs_per_start_goal,
+            "note": (
+                "For each feasible 6D goal pose, multiple distinct arm configurations "
+                "(null-space / self-motion solutions) that reach the same wrist pose are "
+                "sampled by reseeding the planner; each config is expanded by the "
+                "trajectory families. Per-episode metadata carries nullspace_config_id."
+            ),
+        },
         "task": reach_task_metadata(args.env_id),
         "crop": crop_config.to_json(),
         "point_cloud_saliency": _point_cloud_saliency_config(args).to_json(),
@@ -518,12 +554,75 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "miss e.g. downward_arc for a seed"
         ),
     )
-    _cone_mode_names = _cone_orientation_names(max_tilt_deg=60, tilt_steps=3, azimuth_steps=8)
     parser.add_argument(
         "--orientation-mode",
         default="all",
-        choices=["all", "downward", "pitch_30", "pitch_45", "pitch_60", "horizontal_front"] + _cone_mode_names,
-        help="Generate data for a specific orientation mode, or 'all' for the full cone set."
+        choices=["all"],
+        help=(
+            "retained for backward compatibility; goal wrist orientations are now "
+            "always sampled equal-area over the down-facing cone (see "
+            "--orientation-cone-half-angle-deg and --orientations-per-goal). Use "
+            "--random-orientation for a single random orientation per pose."
+        ),
+    )
+    parser.add_argument(
+        "--orientation-cone-half-angle-deg",
+        type=float,
+        default=60.0,
+        help=(
+            "half-angle (degrees) of the down-facing cone from which goal wrist "
+            "orientations are sampled equal-area. 60 covers a ~120-degree solid angle."
+        ),
+    )
+    parser.add_argument(
+        "--orientations-per-goal",
+        type=int,
+        default=25,
+        help=(
+            "number of goal wrist orientations to sample equal-area per start/goal "
+            "pose (the first is always straight-down). Each feasible orientation is "
+            "expanded by null-space configs and trajectory families."
+        ),
+    )
+    parser.add_argument(
+        "--configs-per-goal-pose",
+        type=int,
+        default=3,
+        help=(
+            "number of distinct arm configurations (j1..j7) to find that all reach "
+            "the same 6D goal pose (null-space / self-motion multimodality). 1 disables "
+            "extra configs (single solution per pose)."
+        ),
+    )
+    parser.add_argument(
+        "--config-match-position-tol-m",
+        type=float,
+        default=0.01,
+        help="max TCP position error (m) for a null-space config to count as reaching the goal",
+    )
+    parser.add_argument(
+        "--config-match-orientation-tol-deg",
+        type=float,
+        default=3.0,
+        help="max TCP orientation error (deg) for a null-space config to count as reaching the goal",
+    )
+    parser.add_argument(
+        "--config-min-joint-separation-rad",
+        type=float,
+        default=0.35,
+        help=(
+            "minimum joint-space L2 distance (rad) between two accepted null-space "
+            "configs so they are genuinely different arm solutions"
+        ),
+    )
+    parser.add_argument(
+        "--max-configs-per-start-goal",
+        type=int,
+        default=60,
+        help=(
+            "cap on the total number of null-space configs expanded per start/goal "
+            "pair (across all orientations), to bound dataset size"
+        ),
     )
     parser.add_argument(
         "--action-ema-alpha",
@@ -643,6 +742,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=64,
         help="number of saved point-cloud slots reserved for structured goal marker points",
+    )
+    parser.add_argument(
+        "--goal-marker-style",
+        default=DEFAULT_GOAL_MARKER_STYLE,
+        choices=list(GOAL_MARKER_STYLES),
+        help=(
+            "shape of the baked goal marker. 'triad' bakes an oriented coordinate-frame "
+            "marker that encodes the full 6D goal pose (position + orientation); 'sphere' "
+            "is the legacy position-only marker (orientation-blind)."
+        ),
     )
     parser.add_argument(
         "--goal-marker-radius",
@@ -823,6 +932,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("--viewer-step-delay must be non-negative")
     if args.viewer_hold_seconds < 0:
         raise ValueError("--viewer-hold-seconds must be non-negative")
+    if not 0.0 < args.orientation_cone_half_angle_deg <= 180.0:
+        raise ValueError("--orientation-cone-half-angle-deg must be in (0, 180]")
+    if args.orientations_per_goal <= 0:
+        raise ValueError("--orientations-per-goal must be positive")
+    if args.configs_per_goal_pose <= 0:
+        raise ValueError("--configs-per-goal-pose must be positive")
+    if args.config_match_position_tol_m <= 0:
+        raise ValueError("--config-match-position-tol-m must be positive")
+    if args.config_match_orientation_tol_deg <= 0:
+        raise ValueError("--config-match-orientation-tol-deg must be positive")
+    if args.config_min_joint_separation_rad <= 0:
+        raise ValueError("--config-min-joint-separation-rad must be positive")
+    if args.max_configs_per_start_goal <= 0:
+        raise ValueError("--max-configs-per-start-goal must be positive")
     return args
 
 
@@ -850,6 +973,7 @@ def _point_cloud_saliency_config(args: argparse.Namespace) -> PointCloudSaliency
         goal_marker_radius=args.goal_marker_radius,
         tcp_marker_points=args.tcp_marker_points,
         tcp_marker_radius=args.tcp_marker_radius,
+        goal_marker_style=args.goal_marker_style,
     )
 
 
@@ -909,6 +1033,7 @@ def _collect_episode(
         positions=np.asarray(plan["position"], dtype=np.float32),
         saliency_config=saliency_config,
         viewer_step_delay=viewer_step_delay,
+        goal_quat=np.asarray(goal_pose.q, dtype=np.float32).reshape(4),
         metadata={
             "seed": seed,
             "planner_status": str(plan.get("status", "unknown")),
@@ -962,6 +1087,13 @@ def _collect_multimodal_episodes(
     viewer_step_delay: float = 0.0,
     random_orientation: bool = False,
     orientation_mode: str = "all",
+    orientation_cone_half_angle_deg: float = 60.0,
+    orientations_per_goal: int = 25,
+    configs_per_goal_pose: int = 3,
+    config_match_position_tol_m: float = 0.01,
+    config_match_orientation_tol_deg: float = 3.0,
+    config_min_joint_separation_rad: float = 0.35,
+    max_configs_per_start_goal: int = 60,
     action_ema_alpha: float = 0.6,
 ) -> list[ReachEpisodeData]:
     obs, info = env.reset(seed=seed, options={"reconfigure": True})
@@ -1033,55 +1165,20 @@ def _collect_multimodal_episodes(
             return []
         start_qpos, start_tcp_pose, start_metadata = start_sample
         if random_orientation:
-            # Option C: Sample a random approach vector pointing generally downwards.
-            # Downward is [0, 0, -1] in world space.
-            # We sample a direction within a cone of say 60 degrees from downward.
-            phi = rng.uniform(0, 2 * np.pi)
-            costheta = rng.uniform(np.cos(np.radians(60)), 1.0)
-            theta = np.arccos(costheta)
-            
-            x = np.sin(theta) * np.cos(phi)
-            y = np.sin(theta) * np.sin(phi)
-            z = np.cos(theta)
-            
-            # The sampled vector (x,y,z) is relative to the +Z axis. We want it relative to -Z (downward).
-            # We can construct a rotation matrix that rotates [0, 0, 1] to [x, y, z],
-            # and apply it to a base downward orientation.
-            # Or easier: just use scipy.spatial.transform.Rotation
-            from scipy.spatial.transform import Rotation
-            
-            # The default gripper pointing downward has Z-axis pointing up from the fingers.
-            # Wait, downward approach means the gripper's +Z (or -Z) points down. 
-            # In Maniskill, downward for xarm/panda usually means quaternion [0, 1, 0, 0].
-            base_rot = Rotation.from_quat([0, 1, 0, 0])
-            
-            # Rotate this base orientation by a random axis-angle where axis is in XY plane
-            # to tilt it up to 60 degrees.
-            tilt_axis = np.array([np.cos(phi), np.sin(phi), 0.0])
-            tilt_rot = Rotation.from_rotvec(tilt_axis * theta)
-            
-            final_rot = tilt_rot * base_rot
-            ori_quat = final_rot.as_quat().astype(np.float32)
-            
-            # Reorder from scipy (x,y,z,w) to Sapien (w,x,y,z)
-            ori_quat_sapien = np.array([ori_quat[3], ori_quat[0], ori_quat[1], ori_quat[2]], dtype=np.float32)
-            
-            target_orientations = {
-                "random": ori_quat_sapien
-            }
+            # Single random goal orientation sampled equal-area over the cone.
+            target_orientations = sample_equal_area_cone_orientations(
+                rng, half_angle_deg=orientation_cone_half_angle_deg, count=1
+            )
+            # Rename the single entry so downstream metadata reads "random".
+            target_orientations = {"random": next(iter(target_orientations.values()))}
         else:
-            all_orientations = _build_cone_orientations(max_tilt_deg=60, tilt_steps=3, azimuth_steps=8)
-            # Add legacy named modes for backward compatibility.
-            all_orientations.update({
-                "pitch_30": np.array([0.0000, 0.9659, 0.0000, -0.2588], dtype=np.float32),
-                "pitch_45": np.array([0.0000, 0.9239, 0.0000, -0.3827], dtype=np.float32),
-                "pitch_60": np.array([0.0000, 0.8660, 0.0000, -0.5000], dtype=np.float32),
-                "horizontal_front": np.array([0.0000, 0.7071, 0.0000, -0.7071], dtype=np.float32),
-            })
-            if orientation_mode == "all":
-                target_orientations = all_orientations
-            else:
-                target_orientations = {orientation_mode: all_orientations[orientation_mode]}
+            # Equal-area coverage of the down-facing cone: sample a set of goal
+            # wrist orientations uniformly over the spherical cap (rim not starved).
+            target_orientations = sample_equal_area_cone_orientations(
+                rng,
+                half_angle_deg=orientation_cone_half_angle_deg,
+                count=orientations_per_goal,
+            )
 
         print(
             f"[seed {seed}] start accepted after attempt={start_metadata.get('attempt')} "
@@ -1089,6 +1186,7 @@ def _collect_multimodal_episodes(
             flush=True,
         )
         variants = []
+        total_configs_used = 0
         for ori_name, ori_quat in target_orientations.items():
             goal_pose = _pose_with_orientation(
                 sapien,
@@ -1113,50 +1211,111 @@ def _collect_multimodal_episodes(
                 f"[seed {seed}] goal reachable from start for {ori_name}: status={goal_reachability[1]}",
                 flush=True,
             )
-            ori_start_metadata = {
-                **start_metadata,
-                "goal_reachable_from_start": True,
-                "goal_reachability_status": goal_reachability[1],
-                "orientation_mode": ori_name,
-            }
-            _set_robot_qpos(env, start_qpos)
-            _set_start_site_pose(env, start_tcp_pose[:3])
-            ori_variants = generate_multimodal_waypoints(
-                current_tcp_pose=start_tcp_pose,
+
+            # Null-space pose multimodality: find distinct arm configurations that
+            # all reach this same 6D goal pose. Each config becomes a separate
+            # start configuration (its seed) so the replayed episodes converge to
+            # genuinely different elbow/shoulder solutions for the identical wrist
+            # pose. Attempt 0 is always the original sampled start.
+            configs = sample_nullspace_configs(
                 goal_pose=goal_pose,
-                workspace_bounds=waypoint_bounds,
-                robot_base_position=robot_base_position,
+                start_qpos=start_qpos,
+                num_configs=configs_per_goal_pose,
+                pos_tol_m=config_match_position_tol_m,
+                rot_tol_deg=config_match_orientation_tol_deg,
+                min_joint_sep_rad=config_min_joint_separation_rad,
+                rng=rng,
                 planner=planner,
                 env=env,
                 sapien=sapien,
-                rng=rng,
-                variants_per_reset=variants_per_reset,
-                max_attempts=waypoint_attempts,
-                min_base_clearance=min_base_clearance,
-                waypoint_xy_noise=waypoint_xy_noise,
-                waypoint_z_noise=waypoint_z_noise,
-                lateral_z_offset=lateral_z_offset,
-                vertical_lateral_offset=vertical_lateral_offset,
-                min_curve_offset=min_curve_offset,
-                max_joint_step=max_joint_step,
-                max_joint_accel=max_joint_accel,
-                max_raw_plan_multiplier=max_raw_plan_multiplier,
-                progress_interval=progress_interval,
-                max_replay_plan_steps=max(1, max_steps - settle_steps),
-                seed=seed,
-                start_qpos=start_qpos,
                 suppress_planner_output=suppress_planner_output,
-                smooth_trajectory=smooth_trajectory,
-                curved_paths=curved_paths,
-                curvature_std=curvature_std,
-                verbose_waypoints=verbose_waypoints,
             )
-            for v in ori_variants:
-                v["name"] = f"{v['name']}_{ori_name}"
-                v["orientation_mode"] = ori_name
-                v["start_sampling"] = ori_start_metadata
-                v["goal_pose"] = goal_pose
-            variants.extend(ori_variants)
+            if not configs:
+                # Fall back to the original start as a single config so behavior
+                # never regresses below one solution per feasible orientation.
+                configs = [
+                    {
+                        "config_id": 0,
+                        "seed_qpos": np.asarray(start_qpos, dtype=np.float32),
+                        "qpos": np.asarray(start_qpos, dtype=np.float32),
+                        "position_error_m": 0.0,
+                        "orientation_error_deg": 0.0,
+                    }
+                ]
+            print(
+                f"[seed {seed}] {ori_name}: {len(configs)} null-space config(s) found",
+                flush=True,
+            )
+
+            for config in configs:
+                if total_configs_used >= max_configs_per_start_goal:
+                    print(
+                        f"[seed {seed}] reached --max-configs-per-start-goal="
+                        f"{max_configs_per_start_goal}; stopping config expansion",
+                        flush=True,
+                    )
+                    break
+                total_configs_used += 1
+                config_id = int(config.get("config_id", 0))
+                config_seed_qpos = np.asarray(config["seed_qpos"], dtype=np.float32)
+                # Recover the start TCP pose implied by this config's seed.
+                _set_robot_qpos(env, config_seed_qpos)
+                config_start_tcp_pose = _tcp_pose(env.unwrapped)
+                config_start_metadata = {
+                    **start_metadata,
+                    "goal_reachable_from_start": True,
+                    "goal_reachability_status": goal_reachability[1],
+                    "orientation_mode": ori_name,
+                    "nullspace_config_id": config_id,
+                    "nullspace_final_qpos": np.asarray(
+                        config.get("qpos", config_seed_qpos), dtype=np.float32
+                    ).tolist(),
+                    "nullspace_position_error_m": float(config.get("position_error_m", 0.0)),
+                    "nullspace_orientation_error_deg": float(
+                        config.get("orientation_error_deg", 0.0)
+                    ),
+                }
+                _set_robot_qpos(env, config_seed_qpos)
+                _set_start_site_pose(env, config_start_tcp_pose[:3])
+                ori_variants = generate_multimodal_waypoints(
+                    current_tcp_pose=config_start_tcp_pose,
+                    goal_pose=goal_pose,
+                    workspace_bounds=waypoint_bounds,
+                    robot_base_position=robot_base_position,
+                    planner=planner,
+                    env=env,
+                    sapien=sapien,
+                    rng=rng,
+                    variants_per_reset=variants_per_reset,
+                    max_attempts=waypoint_attempts,
+                    min_base_clearance=min_base_clearance,
+                    waypoint_xy_noise=waypoint_xy_noise,
+                    waypoint_z_noise=waypoint_z_noise,
+                    lateral_z_offset=lateral_z_offset,
+                    vertical_lateral_offset=vertical_lateral_offset,
+                    min_curve_offset=min_curve_offset,
+                    max_joint_step=max_joint_step,
+                    max_joint_accel=max_joint_accel,
+                    max_raw_plan_multiplier=max_raw_plan_multiplier,
+                    progress_interval=progress_interval,
+                    max_replay_plan_steps=max(1, max_steps - settle_steps),
+                    seed=seed,
+                    start_qpos=config_seed_qpos,
+                    suppress_planner_output=suppress_planner_output,
+                    smooth_trajectory=smooth_trajectory,
+                    curved_paths=curved_paths,
+                    curvature_std=curvature_std,
+                    verbose_waypoints=verbose_waypoints,
+                )
+                for v in ori_variants:
+                    v["name"] = f"{v['name']}_{ori_name}_cfg{config_id}"
+                    v["orientation_mode"] = ori_name
+                    v["nullspace_config_id"] = config_id
+                    v["start_sampling"] = config_start_metadata
+                    v["start_qpos"] = config_seed_qpos
+                    v["start_tcp_pose"] = config_start_tcp_pose
+                    v["goal_pose"] = goal_pose
+                variants.extend(ori_variants)
     finally:
         planner.close()
 
@@ -1178,8 +1337,14 @@ def _collect_multimodal_episodes(
             flush=True,
         )
         obs, info = env.reset(seed=seed, options={"reconfigure": False})
-        _set_robot_qpos(env, start_qpos)
-        _set_start_site_pose(env, start_tcp_pose[:3])
+        variant_start_qpos = np.asarray(
+            variant.get("start_qpos", start_qpos), dtype=np.float32
+        )
+        variant_start_tcp = np.asarray(
+            variant.get("start_tcp_pose", start_tcp_pose), dtype=np.float32
+        )
+        _set_robot_qpos(env, variant_start_qpos)
+        _set_start_site_pose(env, variant_start_tcp[:3])
         obs, info = _refresh_obs_after_manual_qpos(
             env,
             info=info,
@@ -1211,6 +1376,9 @@ def _collect_multimodal_episodes(
             saliency_config=saliency_config,
             action_ema_alpha=action_ema_alpha,
             viewer_step_delay=viewer_step_delay,
+            goal_quat=np.asarray(
+                variant.get("goal_pose", goal_pose).q, dtype=np.float32
+            ).reshape(4),
             metadata={
                 "seed": seed,
                 "planner_status": variant["planner_status"],
@@ -1221,10 +1389,11 @@ def _collect_multimodal_episodes(
                 "trajectory_waypoints": variant["waypoints"],
                 "trajectory_waypoint_metadata": variant["waypoint_metadata"],
                 "trajectory_quality": variant["quality"],
-                "start_tcp_pose": start_tcp_pose.astype(np.float32).tolist(),
+                "start_tcp_pose": variant_start_tcp.astype(np.float32).tolist(),
                 "goal_pose": _pose_to_list(variant.get("goal_pose", goal_pose)),
                 "start_sampling": variant.get("start_sampling", start_metadata),
                 "orientation_mode": variant.get("orientation_mode", "downward"),
+                "nullspace_config_id": int(variant.get("nullspace_config_id", 0)),
             },
         )
         if episode is not None:
@@ -1272,6 +1441,7 @@ def _replay_planned_positions_as_episode(
     metadata: dict[str, Any],
     viewer_step_delay: float = 0.0,
     action_ema_alpha: float = 0.6,
+    goal_quat: np.ndarray | None = None,
 ) -> ReachEpisodeData | None:
     unwrapped = env.unwrapped
     rows: list[dict[str, np.ndarray]] = []
@@ -1299,6 +1469,7 @@ def _replay_planned_positions_as_episode(
             action_mode=action_mode,
             crop_config=crop_config,
             saliency_config=saliency_config,
+            goal_quat=goal_quat,
         )
         obs, _reward, terminated, truncated, info = env.step(sim_action)
         _render_viewer_frame(env, viewer_step_delay)
@@ -1334,6 +1505,7 @@ def _replay_planned_positions_as_episode(
             action_mode=action_mode,
             crop_config=crop_config,
             saliency_config=saliency_config,
+            goal_quat=goal_quat,
         )
         obs, _reward, _terminated, truncated, info = env.step(sim_action)
         _render_viewer_frame(env, viewer_step_delay)
@@ -1366,6 +1538,7 @@ def _replay_planned_positions_as_episode(
             action_mode=action_mode,
             crop_config=crop_config,
             saliency_config=saliency_config,
+            goal_quat=goal_quat,
         )
         obs, _reward, _terminated, truncated, info = env.step(sim_action)
         _render_viewer_frame(env, viewer_step_delay)
@@ -1751,6 +1924,145 @@ def _sample_reachable_start(
     )
     _set_robot_qpos(env, reset_qpos)
     return None
+
+
+def _quat_angular_distance_deg(q1: np.ndarray, q2: np.ndarray) -> float:
+    """Return the geodesic angle (degrees) between two quaternions (any layout, unit).
+
+    Uses ``angle = 2*acos(|<q1,q2>|)`` which is layout-agnostic (works for both
+    SAPIEN [w,x,y,z] and scipy [x,y,z,w] as long as both use the same layout).
+    """
+    a = np.asarray(q1, dtype=np.float64).reshape(4)
+    b = np.asarray(q2, dtype=np.float64).reshape(4)
+    a = a / max(np.linalg.norm(a), 1e-12)
+    b = b / max(np.linalg.norm(b), 1e-12)
+    dot = float(np.clip(abs(np.dot(a, b)), -1.0, 1.0))
+    return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def _dedup_configs_by_joint_distance(
+    candidates: list[dict[str, Any]],
+    *,
+    min_joint_sep_rad: float,
+) -> list[dict[str, Any]]:
+    """Greedily keep configs whose joint vectors are >= ``min_joint_sep_rad`` apart.
+
+    ``candidates`` is an ordered list of dicts each with a ``"qpos"`` array (arm
+    joints). The first candidate is always kept; each subsequent candidate is kept
+    only if its minimum joint-space distance (L2 over the arm joints) to all
+    already-accepted configs is at least ``min_joint_sep_rad``.
+    """
+    accepted: list[dict[str, Any]] = []
+    for cand in candidates:
+        q = np.asarray(cand["qpos"], dtype=np.float64).reshape(-1)
+        is_distinct = True
+        for kept in accepted:
+            kq = np.asarray(kept["qpos"], dtype=np.float64).reshape(-1)
+            n = min(q.shape[0], kq.shape[0])
+            if float(np.linalg.norm(q[:n] - kq[:n])) < min_joint_sep_rad:
+                is_distinct = False
+                break
+        if is_distinct:
+            accepted.append(cand)
+    return accepted
+
+
+def sample_nullspace_configs(
+    *,
+    goal_pose: Any,
+    start_qpos: np.ndarray,
+    num_configs: int,
+    pos_tol_m: float,
+    rot_tol_deg: float,
+    min_joint_sep_rad: float,
+    rng: np.random.Generator,
+    seed_jitter_rad: float = 0.6,
+    max_attempts: int | None = None,
+    plan_fn: Any = None,
+    tcp_of_qpos_fn: Any = None,
+    planner: Any = None,
+    env: Any = None,
+    sapien: Any = None,
+    suppress_planner_output: bool = True,
+) -> list[dict[str, Any]]:
+    """Find up to ``num_configs`` distinct arm configs reaching the same 6D pose.
+
+    Robot-agnostic: both Panda and xArm7 are 7-DOF with a 6-DOF task, leaving a
+    1-DOF self-motion manifold, so multiple joint configurations reach the same
+    TCP pose. We sample by reseeding the planner from jittered seed configs (around
+    ``start_qpos``), planning to the identical ``goal_pose``, keeping solutions whose
+    final TCP pose matches within (``pos_tol_m``, ``rot_tol_deg``), and deduping by
+    joint-space distance (``min_joint_sep_rad``). The straight (unjittered) plan is
+    always attempted first.
+
+    Dependency injection for testability: pass ``plan_fn(seed_qpos) -> final_qpos|None``
+    and ``tcp_of_qpos_fn(qpos) -> [x,y,z,qw,qx,qy,qz]`` to unit-test the tolerance/dedup
+    logic with a fake planner. Otherwise supply ``planner``/``env``/``sapien`` and the
+    real planner + FK are used.
+    """
+    if num_configs <= 0:
+        return []
+    goal_xyz = np.asarray(goal_pose.p, dtype=np.float64).reshape(-1, 3)[0]
+    goal_quat = np.asarray(goal_pose.q, dtype=np.float64).reshape(4)
+    start_qpos = np.asarray(start_qpos, dtype=np.float64).reshape(-1)
+
+    if plan_fn is None:
+        if planner is None or env is None:
+            raise ValueError("sample_nullspace_configs requires plan_fn or planner+env")
+
+        def plan_fn(seed_qpos: np.ndarray):  # type: ignore[misc]
+            result = _plan_to_pose(
+                planner=planner,
+                env=env,
+                pose=goal_pose,
+                start_qpos=seed_qpos,
+                suppress_planner_output=suppress_planner_output,
+            )
+            return None if result is None else result[0]
+
+    if tcp_of_qpos_fn is None:
+        if env is None:
+            raise ValueError("sample_nullspace_configs requires tcp_of_qpos_fn or env")
+
+        def tcp_of_qpos_fn(qpos: np.ndarray):  # type: ignore[misc]
+            _set_robot_qpos(env, qpos)
+            return _tcp_pose(env.unwrapped)
+
+    if max_attempts is None:
+        max_attempts = max(8, num_configs * 6)
+
+    candidates: list[dict[str, Any]] = []
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            seed_qpos = start_qpos.copy()
+        else:
+            jitter = rng.uniform(-seed_jitter_rad, seed_jitter_rad, size=start_qpos.shape[0])
+            seed_qpos = start_qpos + jitter
+        final_qpos = plan_fn(seed_qpos)
+        if final_qpos is None:
+            continue
+        final_qpos = np.asarray(final_qpos, dtype=np.float64).reshape(-1)
+        tcp = np.asarray(tcp_of_qpos_fn(final_qpos), dtype=np.float64).reshape(-1)
+        if tcp.shape[0] < 7:
+            continue
+        pos_err = float(np.linalg.norm(tcp[:3] - goal_xyz))
+        rot_err = _quat_angular_distance_deg(tcp[3:7], goal_quat)
+        if pos_err > pos_tol_m or rot_err > rot_tol_deg:
+            continue
+        candidates.append(
+            {
+                "qpos": final_qpos.astype(np.float32),
+                "seed_qpos": seed_qpos.astype(np.float32),
+                "position_error_m": pos_err,
+                "orientation_error_deg": rot_err,
+                "attempt": attempt,
+            }
+        )
+
+    deduped = _dedup_configs_by_joint_distance(candidates, min_joint_sep_rad=min_joint_sep_rad)
+    for idx, cfg in enumerate(deduped):
+        cfg["config_id"] = idx
+    return deduped[:num_configs]
 
 
 def _trajectory_variant_specs(
@@ -2357,6 +2669,7 @@ def _dataset_row_from_obs(
     action_mode: ActionMode,
     crop_config: PointCloudCropConfig,
     saliency_config: PointCloudSaliencyConfig | None,
+    goal_quat: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     adapted = adapt_observation(obs, info=info, env=env, task_name=env_id)
     row = observation_to_dataset_row(
@@ -2370,6 +2683,7 @@ def _dataset_row_from_obs(
             row,
             saliency_config=saliency_config,
             crop_bounds=crop_config.bounds,
+            goal_quat=goal_quat,
         )
     return row
 
@@ -2379,6 +2693,7 @@ def _inject_point_cloud_saliency(
     *,
     saliency_config: PointCloudSaliencyConfig,
     crop_bounds: np.ndarray,
+    goal_quat: np.ndarray | None = None,
 ) -> None:
     points = row["point_cloud"]
     valid_mask = row["point_valid_mask"]
@@ -2389,8 +2704,16 @@ def _inject_point_cloud_saliency(
     reserved_goal_count = 0
     if saliency_config.goal_marker_points > 0 and np.all(np.isfinite(target_position)):
         goal_count = min(points.shape[0], int(saliency_config.goal_marker_points))
-        goal_markers = _goal_marker_points(
+        style = saliency_config.goal_marker_style
+        # 'triad' encodes the goal orientation and requires a quaternion; fall
+        # back to the position-only 'sphere' marker if none is available so the
+        # writer never crashes on a missing pose.
+        if style == "triad" and goal_quat is None:
+            style = "sphere"
+        goal_markers = _build_goal_marker(
             target_position,
+            None if style == "sphere" else np.asarray(goal_quat, dtype=np.float32),
+            style=style,
             num_points=goal_count,
             radius=saliency_config.goal_marker_radius,
         ).reshape(goal_count, 3)
@@ -2541,71 +2864,50 @@ def _pose_with_orientation(sapien: Any, *, position: np.ndarray, quat: np.ndarra
     )
 
 
-def _build_cone_orientations(
-    max_tilt_deg: float = 60.0,
-    tilt_steps: int = 3,
-    azimuth_steps: int = 8,
-) -> dict[str, np.ndarray]:
-    """Build a dictionary of SAPIEN [w,x,y,z] quaternions covering a cone of approach angles.
+def _quat_downward_tilt(theta_rad: float, phi_rad: float) -> np.ndarray:
+    """Return a SAPIEN [w,x,y,z] quaternion: gripper-down tilted by theta at azimuth phi.
 
-    The base orientation is gripper-downward (SAPIEN [0,1,0,0]).  Each entry tilts it
-    by ``theta`` degrees away from vertical, in ``azimuth_steps`` equally-spaced compass
-    directions.  Downward (theta=0) is always included as the "downward" key.
-
-    Args:
-        max_tilt_deg: Half-angle of the cone in degrees (e.g. 60).
-        tilt_steps: Number of discrete tilt levels between 0 and max_tilt_deg (exclusive
-            of 0 — downward is added separately).
-        azimuth_steps: Number of equally-spaced compass azimuths per tilt level.
-
-    Returns:
-        Ordered dict: ``{"downward": ..., "cone_t20_p000": ..., ...}``
+    The base orientation points the gripper straight down (SAPIEN [0,1,0,0]).
+    A tilt of ``theta_rad`` away from vertical is applied about an axis in the
+    world XY plane at azimuth ``phi_rad``. theta=0 returns straight-down.
     """
     from scipy.spatial.transform import Rotation
 
-    orientations: dict[str, np.ndarray] = {}
-    # Base downward orientation in scipy [x,y,z,w] (180° around X-axis).
-    base_rot = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])
+    base_rot = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])  # scipy [x,y,z,w] == 180deg about X
+    tilt_axis = np.array([np.cos(phi_rad), np.sin(phi_rad), 0.0])
+    tilt_rot = Rotation.from_rotvec(tilt_axis * theta_rad)
+    q = (tilt_rot * base_rot).as_quat()  # scipy [x,y,z,w]
+    return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
 
-    # Straight downward — always included.
-    q_scipy = base_rot.as_quat()  # [x,y,z,w]
-    orientations["downward"] = np.array(
-        [q_scipy[3], q_scipy[0], q_scipy[1], q_scipy[2]], dtype=np.float32
-    )
 
-    tilt_angles = np.linspace(0, max_tilt_deg, tilt_steps + 1)[1:]  # exclude 0°
-    azimuth_angles = np.linspace(0, 360, azimuth_steps, endpoint=False)
+def sample_equal_area_cone_orientations(
+    rng: np.random.Generator,
+    *,
+    half_angle_deg: float,
+    count: int,
+) -> dict[str, np.ndarray]:
+    """Sample ``count`` goal wrist orientations equal-area over a down-facing cone.
 
-    for theta_deg in tilt_angles:
-        theta_rad = np.deg2rad(theta_deg)
-        for phi_deg in azimuth_angles:
-            phi_rad = np.deg2rad(phi_deg)
-            # Tilt axis lies in the XY plane at azimuth phi.
-            tilt_axis = np.array([np.cos(phi_rad), np.sin(phi_rad), 0.0])
-            tilt_rot = Rotation.from_rotvec(tilt_axis * theta_rad)
-            final_rot = tilt_rot * base_rot
-            q = final_rot.as_quat()  # scipy [x,y,z,w]
-            # Convert to SAPIEN [w,x,y,z].
-            sapien_q = np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
-            name = f"cone_t{int(round(theta_deg)):02d}_p{int(round(phi_deg)):03d}"
-            orientations[name] = sapien_q
+    Directions are drawn uniformly over the spherical cap of half-angle
+    ``half_angle_deg`` by sampling ``cos(theta) ~ U[cos(half_angle), 1]`` and
+    ``phi ~ U[0, 2*pi)``. This gives uniform density over the cap (the rim is not
+    starved as it is with an equal-angle tilt grid). ``theta=0`` is straight-down.
 
+    Returns an ordered dict of ``{name: SAPIEN [w,x,y,z] quaternion}``. The first
+    entry is always exact straight-down ("downward") so every pose set includes it.
+    """
+    if count <= 0:
+        return {}
+    half_angle_rad = float(np.radians(half_angle_deg))
+    cos_min = float(np.cos(half_angle_rad))
+    orientations: dict[str, np.ndarray] = {"downward": _quat_downward_tilt(0.0, 0.0)}
+    for idx in range(1, count):
+        cos_theta = float(rng.uniform(cos_min, 1.0))
+        theta = float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+        phi = float(rng.uniform(0.0, 2.0 * np.pi))
+        name = f"cone_{idx:03d}"
+        orientations[name] = _quat_downward_tilt(theta, phi)
     return orientations
-
-
-def _cone_orientation_names(
-    max_tilt_deg: float = 60.0,
-    tilt_steps: int = 3,
-    azimuth_steps: int = 8,
-) -> list[str]:
-    """Return just the string keys that ``_build_cone_orientations`` would produce."""
-    names = ["downward"]
-    tilt_angles = np.linspace(0, max_tilt_deg, tilt_steps + 1)[1:]
-    azimuth_angles = np.linspace(0, 360, azimuth_steps, endpoint=False)
-    for theta_deg in tilt_angles:
-        for phi_deg in azimuth_angles:
-            names.append(f"cone_t{int(round(theta_deg)):02d}_p{int(round(phi_deg)):03d}")
-    return names
 
 
 def _tcp_pose(unwrapped_env: Any) -> np.ndarray:
@@ -2858,6 +3160,16 @@ def _ensure_goal_observation_aliases(dataset_path: Path) -> dict[str, dict[str, 
         "goal_relative": (goal_pos - eef_pos).astype(np.float32, copy=False),
         "eef_pos": eef_pos,
     }
+
+    # Per-step goal orientation quaternion (SAPIEN [w,x,y,z]), constant within an
+    # episode. Sourced from each episode's metadata ``goal_pose`` (p+q). This is
+    # what inference/training uses to bake the oriented triad goal marker so the
+    # deployed marker matches the dataset marker exactly. Falls back to identity
+    # when an episode lacks a stored goal pose.
+    goal_quat = _build_goal_quat_array(dataset_path, total_steps=goal_pos.shape[0])
+    if goal_quat is not None:
+        arrays["goal_quat"] = goal_quat
+
     summaries: dict[str, dict[str, Any]] = {}
     for key, value in arrays.items():
         if key in data:
@@ -2866,6 +3178,47 @@ def _ensure_goal_observation_aliases(dataset_path: Path) -> dict[str, dict[str, 
         data.array(name=key, data=value, chunks=chunks)
         summaries[key] = {"shape": list(value.shape), "dtype": str(value.dtype)}
     return summaries
+
+
+def _build_goal_quat_array(dataset_path: Path, *, total_steps: int) -> np.ndarray | None:
+    """Build a per-step goal-orientation quaternion array from episode metadata.
+
+    Reads ``metadata.json`` episodes (each with a ``goal_pose`` = [px,py,pz,qw,qx,qy,qz])
+    and ``meta/episode_ends`` to expand the per-episode constant goal quaternion into a
+    per-step ``[T, 4]`` array. Returns None if metadata is unavailable.
+    """
+    import json
+
+    import zarr
+
+    meta_path = dataset_path / "metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    episodes = meta.get("episodes", [])
+    root = zarr.open_group(str(dataset_path), mode="r")
+    episode_ends = np.asarray(root["meta"]["episode_ends"][:], dtype=np.int64)
+    if episode_ends.size == 0:
+        return None
+
+    identity = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    goal_quat = np.tile(identity, (total_steps, 1)).astype(np.float32)
+    start = 0
+    for idx, end in enumerate(episode_ends.tolist()):
+        quat = identity
+        if idx < len(episodes):
+            pose = episodes[idx].get("goal_pose")
+            if pose is not None and len(pose) >= 7:
+                q = np.asarray(pose[3:7], dtype=np.float32)
+                norm = float(np.linalg.norm(q))
+                if norm > 1e-8:
+                    quat = (q / norm).astype(np.float32)
+        goal_quat[start:end] = quat
+        start = end
+    return goal_quat
 
 
 def _tcp_to_goal_distance(unwrapped_env: Any) -> float:

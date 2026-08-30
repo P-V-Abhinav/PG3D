@@ -1,6 +1,6 @@
 # pg3d status
 
-Last updated: 2026-07-06
+Last updated: 2026-08-30
 
 ## Current objective
 
@@ -95,6 +95,22 @@ DP3 reach dataset loading now matches the generated Zarr schema with 1024-point 
 7D arm actions, and `target_position`/`goal_pos` goal aliases; normalizer fitting uses a bounded
 deterministic timestep subset by default so large Zarr datasets can begin training without reading
 the full point-cloud tensor into memory.
+P12 adds 6D goal-pose conditioning and pose multimodality to the pose-reach path (see ADR 0010).
+The baked goal marker can now be an oriented **triad** (`--goal-marker-style triad`, default) that
+encodes the full 6D goal pose with no rotational symmetry, replacing the orientation-blind sphere;
+the total `goal_marker_points` slot count is unchanged so the encoder is architecturally
+compatible but checkpoints must be **retrained** to use orientation. A shared `build_goal_marker`
+routes both the dataset writer and inference-time baking, and a per-step `goal_quat` array is
+stored so deployment reproduces the exact training marker. Goal wrist orientations are now sampled
+equal-area over a down-facing cone (`--orientation-cone-half-angle-deg`, `--orientations-per-goal`),
+replacing the pole-biased tilt grid. `sample_nullspace_configs` finds multiple distinct arm
+configurations (null-space / self-motion solutions) that reach the same 6D pose, wired into the
+episode collector as a config x trajectory-family cross-product with caps
+(`--configs-per-goal-pose`, `--config-match-position-tol-m`, `--config-match-orientation-tol-deg`,
+`--config-min-joint-separation-rad`, `--max-configs-per-start-goal`). `diagnose_reach_dataset.py`
+now reports per-pose config counts and an equal-area cone-coverage histogram of feasible
+orientations. New CPU-only tests cover the triad geometry, writer/inference parity, equal-area
+sampler uniformity, null-space dedup/tolerance, and the diagnostics.
 
 ## Immediate next steps
 

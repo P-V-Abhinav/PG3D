@@ -261,6 +261,7 @@ def run_policy_rollout(
     write_rerun: bool = True,
     trajectory_family_id: int | None = None,
     trajectory_family_count: int | None = None,
+    goal_quat: np.ndarray | None = None,
 ) -> dict[str, Any]:
     obs, info = env.reset(seed=spec.seed, options={"reconfigure": True})
     frames = [_frame_to_numpy(env.render())]
@@ -287,6 +288,8 @@ def run_policy_rollout(
                 device=device,
                 goal_marker_points=int(policy.goal_marker_points),
                 goal_marker_radius=float(policy.goal_marker_radius),
+                goal_marker_style=getattr(policy, "goal_marker_style", "sphere"),
+                goal_quat=goal_quat,
                 trajectory_family_id=trajectory_family_id,
                 trajectory_family_count=trajectory_family_count,
             )
@@ -478,6 +481,8 @@ def obs_window_to_torch(
     device: torch.device,
     goal_marker_points: int = 0,
     goal_marker_radius: float = DEFAULT_GOAL_MARKER_RADIUS,
+    goal_marker_style: str = "sphere",
+    goal_quat: np.ndarray | None = None,
     trajectory_family_id: int | None = None,
     trajectory_family_count: int | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -485,11 +490,24 @@ def obs_window_to_torch(
     point_cloud = np.stack([entry["point_cloud"] for entry in window], axis=0)
     if goal_marker_points:
         target_position = np.stack([entry["target_position"] for entry in window], axis=0)
+        style = goal_marker_style
+        quat = None
+        if style == "triad":
+            if goal_quat is not None:
+                # Broadcast the (episode-constant) goal quaternion across the window.
+                quat = np.broadcast_to(
+                    np.asarray(goal_quat, dtype=np.float32).reshape(4),
+                    (target_position.shape[0], 4),
+                ).copy()
+            else:
+                style = "sphere"
         point_cloud = insert_goal_marker_points(
             point_cloud,
             target_position,
             num_points=goal_marker_points,
             radius=goal_marker_radius,
+            style=style,
+            quat=quat,
         )
     agent_pos = np.stack([entry["agent_pos"] for entry in window], axis=0)
     goal_xyz = np.stack([entry["target_position"] for entry in window], axis=0)

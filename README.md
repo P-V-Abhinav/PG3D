@@ -123,10 +123,11 @@ Pass `--help` for the full flag set.
 | Script | What it does |
 | --- | --- |
 | `write_maniskill_reach_dataset.py` | Primary dataset writer — generates a structured, multimodal pg3d ManiSkill reach dataset in Zarr (7D Panda labels for DP3 + full sim actions for replay, optional hold-pose chunk after success). |
+| `write_maniskill_pose_reach_dataset.py` | 6D **pose**-reach dataset writer. Adds oriented-triad goal markers (`--goal-marker-style {sphere,triad}`, default `triad`), equal-area goal-orientation sampling over a down-facing cone (`--orientation-cone-half-angle-deg`, `--orientations-per-goal`), and null-space **pose multimodality** — multiple distinct arm configurations that reach the same 6D pose (`--configs-per-goal-pose`, `--config-match-position-tol-m`, `--config-match-orientation-tol-deg`, `--config-min-joint-separation-rad`, `--max-configs-per-start-goal`). See `docs/adr/0010-6d-goal-marker-and-pose-multimodality.md`. |
 | `replay_maniskill_reach_dataset.py` | Replays stored simulator actions from a reach Zarr and writes videos + Rerun timelines. |
 | `trajectory_curved_datageneration.py` | Generates a reach dataset by smoothing existing multimodal waypoint paths into curved trajectories. |
 | `convert_reach_zarr_abs_to_delta.py` | Copies a reach Zarr converting `/data/action` from `abs_joint` to `delta_joint` (`--plot-only` just plots delta magnitudes). |
-| `diagnose_reach_dataset.py` | Reports target distribution and P11 goal-marker diagnostics for a reach Zarr. |
+| `diagnose_reach_dataset.py` | Reports target distribution, goal-marker diagnostics, per-pose null-space config counts, and an equal-area cone-coverage histogram of feasible goal orientations for a reach Zarr. |
 | `audit_goal_consistency.py` | Audits consistency between stored goal markers, `target_position`, and TCP pose. |
 | `multimodality.py` | Diversity / multimodality audit for a pg3d reach Zarr dataset. |
 

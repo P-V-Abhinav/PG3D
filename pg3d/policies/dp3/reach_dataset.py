@@ -13,6 +13,8 @@ import zarr
 from pg3d.policies.dp3.goal_markers import (
     DEFAULT_GOAL_MARKER_POINTS,
     DEFAULT_GOAL_MARKER_RADIUS,
+    DEFAULT_GOAL_MARKER_STYLE,
+    GOAL_MARKER_STYLES,
     insert_goal_marker_points,
 )
 from pg3d.policies.dp3.normalizer import LinearNormalizer
@@ -35,6 +37,7 @@ class ReachDatasetConfig:
     max_train_episodes: int | None = None
     goal_marker_points: int = DEFAULT_GOAL_MARKER_POINTS
     goal_marker_radius: float = DEFAULT_GOAL_MARKER_RADIUS
+    goal_marker_style: str = DEFAULT_GOAL_MARKER_STYLE
     use_goal_encoder: bool = False
     normalizer_max_steps: int | None = 4_096
     normalize_mode: Literal["standardize", "minmax"] = "minmax"
@@ -54,6 +57,11 @@ class ReachDatasetConfig:
             raise ValueError("goal_marker_points must be non-negative")
         if self.goal_marker_radius < 0:
             raise ValueError("goal_marker_radius must be non-negative")
+        if self.goal_marker_style not in GOAL_MARKER_STYLES:
+            raise ValueError(
+                f"goal_marker_style must be one of {GOAL_MARKER_STYLES}, "
+                f"got {self.goal_marker_style!r}"
+            )
         if self.normalizer_max_steps is not None and self.normalizer_max_steps <= 0:
             raise ValueError("normalizer_max_steps must be positive or None")
         if self.normalize_mode not in {"standardize", "minmax"}:
@@ -93,6 +101,7 @@ class ReachSequenceDataset(torch.utils.data.Dataset):
         self.metadata = _load_metadata(self.config.dataset_path)
         self.episode_ends = np.asarray(self.root["meta"]["episode_ends"][:], dtype=np.int64)
         self.target_position_key = _target_position_key(self.root["data"])
+        self.has_goal_quat = "goal_quat" in self.root["data"]
         self._validate_arrays()
         episode_mask = self._episode_mask(split)
         self.indices = create_sequence_indices(
@@ -140,11 +149,14 @@ class ReachSequenceDataset(torch.utils.data.Dataset):
         )
         point_cloud = np.asarray(data["point_cloud"].get_orthogonal_selection(row_indices))
         if self.config.goal_marker_points:
+            style, quat = self._marker_style_and_quat(data, row_indices)
             point_cloud = insert_goal_marker_points(
                 point_cloud,
                 np.asarray(data[self.target_position_key].get_orthogonal_selection(row_indices)),
                 num_points=self.config.goal_marker_points,
                 radius=self.config.goal_marker_radius,
+                style=style,
+                quat=quat,
             )
         normalizer_data = {
             "point_cloud": point_cloud,
@@ -174,11 +186,24 @@ class ReachSequenceDataset(torch.utils.data.Dataset):
         sample = self._sample_sequence(idx)
         point_cloud = sample["point_cloud"].astype(np.float32)
         if self.config.goal_marker_points:
+            style = self.config.goal_marker_style
+            quat = None
+            if style == "triad":
+                if "goal_quat" in sample:
+                    # Goal orientation is constant within an episode; use the
+                    # window's first step. Shape [4].
+                    gq = np.asarray(sample["goal_quat"], dtype=np.float32)
+                    quat = gq.reshape(-1, 4)[0]
+                else:
+                    # Dataset predates goal_quat: fall back to position-only sphere.
+                    style = "sphere"
             point_cloud = insert_goal_marker_points(
                 point_cloud,
                 sample["target_position"].astype(np.float32),
                 num_points=self.config.goal_marker_points,
                 radius=self.config.goal_marker_radius,
+                style=style,
+                quat=quat,
             )
         obs = {
             "point_cloud": torch.from_numpy(point_cloud),
@@ -255,6 +280,12 @@ class ReachSequenceDataset(torch.utils.data.Dataset):
             keys.append(self.target_position_key)
         if self.config.use_goal_encoder:
             keys.append("tcp_pose")
+        if (
+            self.config.goal_marker_points
+            and self.config.goal_marker_style == "triad"
+            and self.has_goal_quat
+        ):
+            keys.append("goal_quat")
         keys = tuple(keys)
         sample = {
             key: sample_padded_sequence(
@@ -270,6 +301,24 @@ class ReachSequenceDataset(torch.utils.data.Dataset):
         if self.config.goal_marker_points and self.target_position_key != "target_position":
             sample["target_position"] = sample[self.target_position_key]
         return sample
+
+    def _marker_style_and_quat(
+        self, data: Any, row_indices: np.ndarray
+    ) -> tuple[str, np.ndarray | None]:
+        """Resolve marker style and per-row goal quaternions for a batch of rows.
+
+        Returns ``("sphere", None)`` unless triad is configured and a ``goal_quat``
+        array is present, in which case the per-row quaternions are returned so
+        the normalizer bake matches the per-episode goal orientations.
+        """
+        if self.config.goal_marker_style != "triad":
+            return "sphere", None
+        if not self.has_goal_quat:
+            # Triad requested but dataset predates goal_quat: fall back to sphere
+            # so old datasets still load (they simply lack orientation info).
+            return "sphere", None
+        quat = np.asarray(data["goal_quat"].get_orthogonal_selection(row_indices), dtype=np.float32)
+        return "triad", quat
 
 
 def reach_shape_meta(

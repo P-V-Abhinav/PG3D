@@ -72,6 +72,7 @@ class SimpleDP3(BasePolicy):
         pointcloud_encoder_cfg: Mapping[str, object] | None = None,
         goal_marker_points: int = 0,
         goal_marker_radius: float = DEFAULT_GOAL_MARKER_RADIUS,
+        goal_marker_style: str = "sphere",
         goal_marker_feature_dim: int = 32,
         use_goal_encoder: bool = False,
         goal_encoder_output_dim: int = 64,
@@ -88,6 +89,7 @@ class SimpleDP3(BasePolicy):
         self.obs_as_global_cond = obs_as_global_cond
         self.goal_marker_points = int(goal_marker_points)
         self.goal_marker_radius = float(goal_marker_radius)
+        self.goal_marker_style = str(goal_marker_style)
         self.use_goal_encoder = bool(use_goal_encoder)
         if self.goal_marker_points < 0:
             raise ValueError("goal_marker_points must be non-negative")
