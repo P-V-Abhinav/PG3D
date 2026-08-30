@@ -21,6 +21,7 @@ from pg3d.policies.dp3.checkpoint import (
 from pg3d.policies.dp3.goal_markers import (
     DEFAULT_GOAL_MARKER_POINTS,
     DEFAULT_GOAL_MARKER_RADIUS,
+    DEFAULT_GOAL_MARKER_STYLE,
 )
 from pg3d.policies.dp3.modules import EMAModel
 from pg3d.policies.dp3.reach_dataset import reach_shape_meta
@@ -45,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             max_train_episodes=args.max_train_episodes,
             goal_marker_points=args.goal_marker_points,
             goal_marker_radius=args.goal_marker_radius,
+            goal_marker_style=args.goal_marker_style,
             use_goal_encoder=args.use_goal_encoder,
             normalizer_max_steps=args.normalizer_max_steps,
             normalize_mode=args.normalize_mode,
@@ -307,6 +309,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--goal-marker-style",
+        type=str,
+        default=None,
+        choices=[None, "sphere", "triad"],
+        help=(
+            "goal-marker style. Default: read point_cloud_saliency.goal_marker_style from the "
+            "dataset metadata so the policy is trained (and later deployed) with the same marker "
+            "the dataset baked. 'triad' encodes the full 6D goal pose; 'sphere' is position-only."
+        ),
+    )
+    parser.add_argument(
         "--use-goal-encoder",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -468,6 +481,7 @@ def _resolve_goal_marker_config(args: argparse.Namespace) -> None:
 
     baked_points = saliency.get("goal_marker_points")
     baked_radius = saliency.get("goal_marker_radius")
+    baked_style = saliency.get("goal_marker_style")
 
     if args.goal_marker_points is None:
         args.goal_marker_points = (
@@ -483,6 +497,14 @@ def _resolve_goal_marker_config(args: argparse.Namespace) -> None:
         radius_src = "metadata" if baked_radius is not None else "fallback-default"
     else:
         radius_src = "cli-override"
+    if args.goal_marker_style is None:
+        args.goal_marker_style = (
+            str(baked_style) if baked_style is not None else DEFAULT_GOAL_MARKER_STYLE
+        )
+        style_src = "metadata" if baked_style is not None else "fallback-default"
+    else:
+        style_src = "cli-override"
+    print(f"goal-marker style: {args.goal_marker_style} ({style_src})", flush=True)
 
     print(
         "goal-marker alignment: "
@@ -531,6 +553,7 @@ def _policy_kwargs(
         "n_groups": args.n_groups,
         "goal_marker_points": args.goal_marker_points,
         "goal_marker_radius": args.goal_marker_radius,
+        "goal_marker_style": args.goal_marker_style,
         "use_goal_encoder": args.use_goal_encoder,
         "log_goal_encoder_shapes": args.log_goal_encoder_shapes,
         "pointcloud_encoder_cfg": {

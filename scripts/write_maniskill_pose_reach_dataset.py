@@ -43,6 +43,27 @@ from pg3d.utils.arrays import (
 from pg3d.utils.serialization import jsonable as _jsonable
 
 
+# --------------------------------------------------------------------------- #
+# Orientation-sampling knobs (module-level globals, intentionally NOT CLI flags).
+# --------------------------------------------------------------------------- #
+
+# In-place gripper roll about the TARGET approach axis (link_tcp +z), sampled
+# per goal orientation as psi ~ U[0, GRASP_ROLL_RANGE_DEG). 180 covers every
+# distinct 2-finger parallel-jaw grasp angle exactly once -- a 180-degree roll of
+# a symmetric jaw is the same physical grasp, so we stop at 180 to avoid the
+# duplicate. Set to 0.0 to disable roll (single wrist orientation per approach).
+# CHANGE THE ROLL RANGE HERE.
+GRASP_ROLL_RANGE_DEG = 180.0
+
+# Start-pose approach cone: every episode begins with the gripper pointing within
+# this many degrees of straight-down (world -Z), i.e. the start link_tcp +z axis
+# is constrained to a down-cone. Widened from 10 to 30 deg so the policy sees a
+# broader start-orientation distribution (reduces distribution shift when a
+# downstream segment -- e.g. pick-and-place "place" -- begins from a tilted
+# post-grasp pose). CHANGE THE START-CONE HALF-ANGLE HERE.
+START_APPROACH_CONE_HALF_ANGLE_DEG = 30.0
+
+
 @dataclass(frozen=True)
 class PointCloudSaliencyConfig:
     goal_marker_points: int = 64
@@ -1845,7 +1866,6 @@ def _sample_reachable_start(
         )
 
     goal_xyz = np.asarray(goal_pose.p, dtype=np.float64).reshape(-1, 3)[0]
-    reset_quat = np.asarray(reset_tcp_pose[3:7], dtype=np.float32)
     bounds = np.asarray(start_bounds, dtype=np.float64).reshape(3, 2)
     robot_base_position = _robot_base_position(env.unwrapped)
     reject_counts = {
@@ -1868,7 +1888,12 @@ def _sample_reachable_start(
         if float(np.linalg.norm(sampled_xyz - goal_xyz)) < min_start_goal_distance:
             reject_counts["sampled_too_close"] += 1
             continue
-        sampled_pose = sapien.Pose(p=sampled_xyz.astype(np.float32), q=reset_quat)
+        # Start-pose orientation: gripper pointing within the down-cone (the
+        # 10-degree cone is set by START_APPROACH_CONE_HALF_ANGLE_DEG at module top),
+        # rather than reusing the reset TCP orientation. A fresh sample per attempt
+        # keeps the start approach axis near straight-down while still varying.
+        start_quat = _sample_start_orientation_in_cone(rng)
+        sampled_pose = sapien.Pose(p=sampled_xyz.astype(np.float32), q=start_quat)
         plan = _plan_to_pose(
             planner=planner,
             env=env,
@@ -1903,6 +1928,10 @@ def _sample_reachable_start(
                 "sampled_position": sampled_xyz.astype(np.float32).tolist(),
                 "actual_position": actual_tcp_pose[:3].astype(np.float32).tolist(),
                 "planner_status": planner_status,
+                "start_approach_quat": np.asarray(start_quat, dtype=np.float32).tolist(),
+                "start_approach_cone_half_angle_deg": float(
+                    START_APPROACH_CONE_HALF_ANGLE_DEG
+                ),
                 "horizontal_base_clearance": float(
                     np.linalg.norm(actual_tcp_pose[:2] - robot_base_position[:2])
                 ),
@@ -2864,20 +2893,46 @@ def _pose_with_orientation(sapien: Any, *, position: np.ndarray, quat: np.ndarra
     )
 
 
-def _quat_downward_tilt(theta_rad: float, phi_rad: float) -> np.ndarray:
-    """Return a SAPIEN [w,x,y,z] quaternion: gripper-down tilted by theta at azimuth phi.
+def _quat_downward_tilt_roll(theta_rad: float, phi_rad: float, psi_rad: float) -> np.ndarray:
+    """Return a SAPIEN [w,x,y,z] quaternion for a down-facing, tilted, rolled grasp.
 
-    The base orientation points the gripper straight down (SAPIEN [0,1,0,0]).
-    A tilt of ``theta_rad`` away from vertical is applied about an axis in the
-    world XY plane at azimuth ``phi_rad``. theta=0 returns straight-down.
+    Builds the target ``link_tcp`` frame directly from the approach/roll synthesis:
+
+        z_EEF = [sin(theta)cos(phi), sin(theta)sin(phi), -cos(theta)]   (approach axis)
+        x_ref = [-sin(phi), cos(phi), 0]
+        y_ref = z_EEF x x_ref
+        x_EEF = x_ref cos(psi) + y_ref sin(psi)                         (in-place roll)
+        y_EEF = z_EEF x x_EEF
+        R_target = [x_EEF | y_EEF | z_EEF]  (columns are the frame axes in world)
+
+    ``theta`` tilts the approach axis away from straight-down (world -Z), ``phi``
+    is the azimuth of that tilt, and ``psi`` rolls the gripper about its own
+    approach axis (spins the finger line). theta=phi=psi=0 -> straight-down.
     """
     from scipy.spatial.transform import Rotation
 
-    base_rot = Rotation.from_quat([1.0, 0.0, 0.0, 0.0])  # scipy [x,y,z,w] == 180deg about X
-    tilt_axis = np.array([np.cos(phi_rad), np.sin(phi_rad), 0.0])
-    tilt_rot = Rotation.from_rotvec(tilt_axis * theta_rad)
-    q = (tilt_rot * base_rot).as_quat()  # scipy [x,y,z,w]
+    st, ct = np.sin(theta_rad), np.cos(theta_rad)
+    sp, cp = np.sin(phi_rad), np.cos(phi_rad)
+    z_eef = np.array([st * cp, st * sp, -ct], dtype=np.float64)
+    x_ref = np.array([-sp, cp, 0.0], dtype=np.float64)
+    y_ref = np.cross(z_eef, x_ref)
+    x_eef = x_ref * np.cos(psi_rad) + y_ref * np.sin(psi_rad)
+    x_eef = x_eef / max(np.linalg.norm(x_eef), 1e-12)
+    y_eef = np.cross(z_eef, x_eef)
+    y_eef = y_eef / max(np.linalg.norm(y_eef), 1e-12)
+    z_eef = z_eef / max(np.linalg.norm(z_eef), 1e-12)
+    r_target = np.column_stack([x_eef, y_eef, z_eef])  # [3,3], columns = axes
+    q = Rotation.from_matrix(r_target).as_quat()  # scipy [x,y,z,w]
     return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+
+
+def _quat_downward_tilt(theta_rad: float, phi_rad: float) -> np.ndarray:
+    """Return a SAPIEN [w,x,y,z] quaternion: gripper-down tilted by theta at azimuth phi.
+
+    Thin wrapper over :func:`_quat_downward_tilt_roll` with zero in-place roll, so
+    the R_target synthesis is the single source of truth for orientation building.
+    """
+    return _quat_downward_tilt_roll(theta_rad, phi_rad, 0.0)
 
 
 def sample_equal_area_cone_orientations(
@@ -2888,26 +2943,48 @@ def sample_equal_area_cone_orientations(
 ) -> dict[str, np.ndarray]:
     """Sample ``count`` goal wrist orientations equal-area over a down-facing cone.
 
-    Directions are drawn uniformly over the spherical cap of half-angle
-    ``half_angle_deg`` by sampling ``cos(theta) ~ U[cos(half_angle), 1]`` and
-    ``phi ~ U[0, 2*pi)``. This gives uniform density over the cap (the rim is not
-    starved as it is with an equal-angle tilt grid). ``theta=0`` is straight-down.
+    Approach directions are drawn uniformly over the spherical cap of half-angle
+    ``half_angle_deg`` (``cos(theta) ~ U[cos(half_angle), 1]``, ``phi ~ U[0, 2*pi)``),
+    so the rim is not starved. In addition, each orientation gets a random in-place
+    roll ``psi ~ U[0, GRASP_ROLL_RANGE_DEG)`` about its own approach axis, so the
+    samples jointly cover all approach directions AND all distinct 2-finger grasp
+    angles (see ``GRASP_ROLL_RANGE_DEG``). Roll folds into ``count`` -- there is no
+    separate roll-count knob.
 
     Returns an ordered dict of ``{name: SAPIEN [w,x,y,z] quaternion}``. The first
-    entry is always exact straight-down ("downward") so every pose set includes it.
+    entry is always exact straight-down with zero roll ("downward"), a canonical
+    reference pose; every ``cone_*`` entry carries the sampled tilt + roll.
     """
     if count <= 0:
         return {}
     half_angle_rad = float(np.radians(half_angle_deg))
     cos_min = float(np.cos(half_angle_rad))
-    orientations: dict[str, np.ndarray] = {"downward": _quat_downward_tilt(0.0, 0.0)}
+    roll_range_rad = float(np.radians(max(GRASP_ROLL_RANGE_DEG, 0.0)))
+    # Canonical reference: straight-down, zero roll.
+    orientations: dict[str, np.ndarray] = {"downward": _quat_downward_tilt_roll(0.0, 0.0, 0.0)}
     for idx in range(1, count):
         cos_theta = float(rng.uniform(cos_min, 1.0))
         theta = float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
         phi = float(rng.uniform(0.0, 2.0 * np.pi))
+        psi = float(rng.uniform(0.0, roll_range_rad)) if roll_range_rad > 0.0 else 0.0
         name = f"cone_{idx:03d}"
-        orientations[name] = _quat_downward_tilt(theta, phi)
+        orientations[name] = _quat_downward_tilt_roll(theta, phi, psi)
     return orientations
+
+
+def _sample_start_orientation_in_cone(rng: np.random.Generator) -> np.ndarray:
+    """Return a SAPIEN [w,x,y,z] start orientation within the down-facing start cone.
+
+    The start ``link_tcp`` approach axis (link_tcp +z) is constrained to within
+    ``START_APPROACH_CONE_HALF_ANGLE_DEG`` of straight-down (world -Z), sampled
+    equal-area over that small cap; roll is left at zero for the start pose.
+    """
+    half_angle_rad = float(np.radians(START_APPROACH_CONE_HALF_ANGLE_DEG))
+    cos_min = float(np.cos(half_angle_rad))
+    cos_theta = float(rng.uniform(cos_min, 1.0))
+    theta = float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+    phi = float(rng.uniform(0.0, 2.0 * np.pi))
+    return _quat_downward_tilt_roll(theta, phi, 0.0)
 
 
 def _tcp_pose(unwrapped_env: Any) -> np.ndarray:
