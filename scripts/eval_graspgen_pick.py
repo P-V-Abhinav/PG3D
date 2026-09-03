@@ -2076,11 +2076,24 @@ def _execute_pick_and_place(
     # ── Phase 1b: Cartesian descent to the grasp contact pose ────────────────
     print("\n--- [Phase 1b] Cartesian Descent to Grasp Contact Pose ---", flush=True)
 
-    # Manually define the offset mplib has to plan for, descending exactly
-    # from wherever the arm is currently positioned.
-    descent_offset = abs(float(getattr(args, "mplib_descent_offset", 0.15)))
+    # ── Compute descent target ────────────────────────────────────────────────
+    # Use the GraspGen contact Z as the descent target (the Z of the actual
+    # grasp contact point, stored by _run_graspgen_for_episode).
+    # XY stays at the current arm position (we go straight down).
+    # We clamp to at least 1cm above the table to avoid going through the floor.
+    z_extra_margin = float(getattr(args, "mplib_descent_z_margin", 0.01))
+    contact_z = float(final_grasp_pos[2])
+    target_z  = max(contact_z + z_extra_margin, 0.01)
+
     manual_descent_target = current_pos.copy()
-    manual_descent_target[2] -= descent_offset
+    manual_descent_target[2] = target_z
+
+    descent_dist = current_pos[2] - target_z
+    print(
+        f"[Descent] Target Z = GraspGen contact ({contact_z:.4f}m) + margin ({z_extra_margin:.3f}m) = {target_z:.4f}m  "
+        f"(descending {descent_dist:.4f}m from current Z={current_pos[2]:.4f}m)",
+        flush=True,
+    )
 
     current_euler_graspgen = Rotation.from_quat(np.roll(final_grasp_quat, -1)).as_euler('xyz', degrees=True)
 
@@ -2701,8 +2714,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "axis to create a pre-grasp pose. The DP3 reach policy will be "
                         "evaluated against this pre-grasp pose. (Phase 0 -> Phase 1)")
     g.add_argument("--mplib-descent-offset", type=float, default=0.15,
-                   help="Distance (m) mplib should manually descend straight down from "
-                        "wherever the arm ended up after Phase 1a. Decoupled from grasp_approach_offset.")
+                   help="[DEPRECATED] Previously: distance (m) down from current arm Z. "
+                        "Now ignored; use --mplib-descent-z-margin instead.")
+    g.add_argument("--mplib-descent-z-margin", type=float, default=0.01,
+                   help="Extra clearance (m) above the GraspGen contact Z for the descent target. "
+                        "Descent lands at: GraspGen_contact_Z + this_margin. Default 0.01m (1cm above contact).")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
