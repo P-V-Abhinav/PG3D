@@ -160,6 +160,16 @@ from pg3d.envs.maniskill_adapter.dataset import (
 )
 from pg3d.envs.maniskill_adapter.reach_env import PG3DReachEnv
 from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
+from pg3d.envs.xarm_adapter.agents import XArm7Gripper
+
+# Fully-closed gripper drive target. NOT 0.85 (the joint's hard limit): the
+# gripper controller is built with normalize_action=False, and ManiSkill only
+# clips actions when normalize_action is True (see BaseController.
+# _preprocess_action), so a commanded 0.85 reaches the drive as-is and pins the
+# PD spring against the joint-limit constraint solver -- the runaway documented
+# on XArm7Gripper._GRIPPER_LIMIT_MARGIN (gripper |qvel| 0.2 -> 57 rad/s in 8
+# steps, jerking the arm). Use the agent's own backed-off constant instead.
+GRIPPER_CLOSED_TARGET = float(XArm7Gripper._GRIPPER_CLOSED)
 from pg3d.eval import (
     AvoidOverlayConfig,
     EpisodePath,
@@ -2030,10 +2040,10 @@ def _execute_pick_and_place(
     )
 
     # ── Phase 1c: Close gripper ───────────────────────────────────────────────
-    # Ramp gripper from open → 0.85 over 30 steps; arm stays still.
+    # Ramp gripper from open → fully closed over 30 steps; arm stays still.
     close_steps = 30
     for i in range(1, close_steps + 1):
-        target_val   = 0.85 * (i / close_steps)
+        target_val   = GRIPPER_CLOSED_TARGET * (i / close_steps)
         current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
         action       = np.zeros(sim_env.action_space.shape, dtype=np.float32)
         action[:7]   = current_qpos[:7]
@@ -2098,7 +2108,7 @@ def _execute_pick_and_place(
             sim_action_dim=int(np.prod(sim_env.action_space.shape)),
             low=getattr(sim_env.action_space, "low", None),
             high=getattr(sim_env.action_space, "high", None),
-            gripper_open=0.85,  # Keep gripper closed
+            gripper_open=GRIPPER_CLOSED_TARGET,  # Keep gripper closed
         )
         
         if ema_sim_action is None or action_ema_alpha >= 1.0:
@@ -2124,7 +2134,7 @@ def _execute_pick_and_place(
     print("\n--- [Phase 3] Releasing Object ---", flush=True)
     open_steps = 20
     for i in range(1, open_steps + 1):
-        target_val = 0.85 * (1.0 - i / open_steps)
+        target_val = GRIPPER_CLOSED_TARGET * (1.0 - i / open_steps)
         current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
             
         action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
