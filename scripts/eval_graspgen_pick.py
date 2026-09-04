@@ -793,6 +793,39 @@ def _gripper_stick_figure_lines_for_grasp(
     return [cp_world[i:i + 2].astype(np.float32) for i in range(cp_world.shape[0] - 1)]
 
 
+def _grasp_fingertip_contact_world(
+    grasp_T: np.ndarray,
+    gripper_name: str,
+) -> np.ndarray:
+    """Return the world-frame midpoint between the two fingertips for a grasp.
+
+    GraspGen's SE(3) frame origin is the WRIST (palm back), NOT the contact
+    point.  The local Z axis points from the wrist toward the fingertips:
+
+        control points (7, 3):
+          index 0  [+0.068, 0, 0.195]  right fingertip
+          index 3  [    0,  0, 0.000]  wrist / SE(3) origin  ← grasp_T[:3,3]
+          index 6  [-0.068, 0, 0.195]  left  fingertip
+
+    The fingertip mid-point in local frame is the average of indices 0 and 6:
+        [0, 0, 0.195]  (the 0.195m depth along the local Z axis)
+
+    In world frame:
+        contact_world = R @ [0, 0, 0.195] + t
+
+    This is the correct position for the goal marker and CartesianPoseConstraint.
+    """
+    grasp_T  = np.asarray(grasp_T, dtype=np.float32)   # (4, 4)
+    cp_local = _get_gripper_control_points(gripper_name)
+    cp_local = np.asarray(cp_local, dtype=np.float32)
+    while cp_local.ndim > 2:
+        cp_local = cp_local.squeeze(0)
+
+    # First and last control points are the two fingertips in local frame.
+    fingertip_mid_local = ((cp_local[0] + cp_local[-1]) / 2.0).astype(np.float32)  # (3,)
+    return (grasp_T[:3, :3] @ fingertip_mid_local) + grasp_T[:3, 3]  # (3,)
+
+
 def _log_graspgen_rerun(
     all_grasps: np.ndarray,
     all_scores: np.ndarray,
@@ -830,27 +863,27 @@ def _log_graspgen_rerun(
         rr.LineStrips3D(best_lines, colors=[255, 255, 0, 255], radii=0.003),
         static=True,
     )
-    # Best grasp origin point (this is the WRIST frame, not the contact
-    # point — see module docstring's Z-offset section)
+
+    # Wrist origin — small orange sphere (informational; NOT the contact point)
     rr.log(
-        "world/graspgen/best_grasp_origin",
+        "world/graspgen/wrist_origin",
         rr.Points3D(
             all_grasps[best_idx:best_idx + 1, :3, 3],
-            colors=[255, 80, 0], radii=0.008,
+            colors=[255, 120, 0], radii=0.005,
         ),
         static=True,
     )
 
-    # --- Selected grasp contact point on the object ---
-    # This is the raw GraspGen centroid (no offsets applied). Show it as a
-    # large bright-red sphere and draw the 3 local axes so the full 6-DOF
-    # orientation is visible.
+    # --- Actual fingertip contact centroid ---
+    # grasp_T[:3,3] is the WRIST. The real contact point is the mid-point
+    # between the two fingertips, which lies 0.195 m forward along the
+    # local Z axis (derived from GraspGen's own control points).
     grasp_T   = all_grasps[best_idx]
-    grasp_pos = grasp_T[:3, 3]          # XYZ contact centroid
     grasp_R   = grasp_T[:3, :3]         # rotation: cols = local X, Y, Z axes
+    grasp_pos = _grasp_fingertip_contact_world(grasp_T, gripper_name)  # (3,)
     axis_len  = 0.06                    # 6 cm arrows
 
-    # Contact centroid — large red sphere
+    # Contact centroid — large bright-red sphere
     rr.log(
         "world/graspgen/selected_grasp_contact",
         rr.Points3D(grasp_pos.reshape(1, 3), colors=[255, 30, 30], radii=0.012),
@@ -873,11 +906,14 @@ def _log_graspgen_rerun(
         static=True,
     )
 
-    # Local Z axis (approach direction) — blue arrow, longer to show approach
-    z_end = grasp_pos + grasp_R[:, 2] * axis_len * 1.5
+    # Local Z axis (approach direction, pointing wrist→fingertips) — blue arrow
+    # Draw it from the WRIST backward (away from object) to show the approach direction.
+    wrist_pos = np.asarray(grasp_T[:3, 3], dtype=np.float32)
+    z_start = wrist_pos
+    z_end   = wrist_pos - grasp_R[:, 2] * axis_len * 1.5  # backward along approach
     rr.log(
         "world/graspgen/selected_grasp_axis_z_approach",
-        rr.LineStrips3D([np.stack([grasp_pos, z_end])], colors=[60, 60, 255], radii=0.004),
+        rr.LineStrips3D([np.stack([z_start, z_end])], colors=[60, 60, 255], radii=0.004),
         static=True,
     )
 
@@ -1167,13 +1203,16 @@ def _build_graspgen_constraint(
             "gripper_name": gripper_name,
         }
 
-    # --- 8. Grasp pose: use the raw GraspGen output directly ---
-    # GraspGen now predicts grasps ON the object itself, so no z-offset
-    # (wrist→fingertip correction) or approach-offset (hover standoff) is
-    # needed. The goal marker and CartesianPoseConstraint both target the
-    # raw grasp centroid exactly.
-    adj_pos  = best_grasp[:3, 3].astype(np.float32)
+    # --- 8. Grasp pose: compute the FINGERTIP CONTACT centroid ---
+    # IMPORTANT: grasp_T[:3,3] is the WRIST (SE(3) origin), NOT the contact
+    # point. GraspGen's local Z axis points from the wrist toward the
+    # fingertips, which sit 0.195 m forward (derived from control points).
+    # The goal marker and CartesianPoseConstraint must target the fingertip
+    # midpoint so the policy drives the EEF to the correct place.
     adj_rot  = best_grasp[:3, :3].astype(np.float32)
+    adj_pos  = _grasp_fingertip_contact_world(
+        best_grasp, gripper_name
+    )  # wrist + R @ [0,0,0.195] — the actual contact centroid
     adj_quat = _rot3x3_to_quat_wxyz(adj_rot)
 
     # Store for _execute_pick_and_place / Rerun logging.
