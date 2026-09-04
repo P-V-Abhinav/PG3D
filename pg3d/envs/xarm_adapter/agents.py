@@ -295,11 +295,21 @@ class XArm7Gripper(BaseAgent):
     # mimic-driven xArm-family gripper. force_limit is the critical one: a 1e5-rad/s^2
     # spring with no meaningful force cap can deliver unbounded torque on any real
     # target change, which is what produced a qvel blowup (~100 rad/s) when this was
-    # first tried at force_limit=50 (copied from the old *static*-hold config, which
-    # never actually moved its target so a high cap was never exercised).
+    # first tried at force_limit=50 alongside the ORIGINAL damping=2000 (copied from
+    # the old *static*-hold config, which never actually moved its target so a high
+    # cap was never exercised): the gripper's own self-collision/mimic-loop chatter
+    # (see _no_self_collision_links below) generates a small constant joint-velocity
+    # "error" that's harmless at low force_limit (clipped to near-zero torque) but,
+    # multiplied by damping=2000, demands a torque large enough that a force_limit=50
+    # ceiling lets almost all of it through -- reflecting a jolt into link7/the arm
+    # every time the arm is actively moving (which is when that chatter gets excited;
+    # it's quiescent while the arm holds still to close on an object). damping=500
+    # (4x lower) keeps the demanded torque well under the 50 N*m cap for typical
+    # chatter, so force_limit=50 (needed -- 0.1-0.5 N*m was too weak to hold objects
+    # during transport) can be raised without the ceiling actually being hit.
     gripper_stiffness = 1e5
-    gripper_damping = 2000
-    gripper_force_limit = 0.5 # bumped from 0.1 — 0.1 N·m was too low to hold objects during transport
+    gripper_damping = 500
+    gripper_force_limit = 50
     gripper_friction = 1
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding
