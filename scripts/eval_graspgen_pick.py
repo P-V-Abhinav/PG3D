@@ -333,6 +333,22 @@ def save_rerun_timeline(
                         "world/predicted_trajectories/selected",
                         rr.LineStrips3D([selected_path], colors=[0, 255, 255, 255], radii=0.003),
                     )
+
+        # Goal-marker cluster: draw the 64 synthetic goal points as a magenta
+        # sphere cluster so it's clearly distinct from the object point cloud.
+        if np.all(np.isfinite(target)):
+            from pg3d.policies.dp3.goal_markers import DEFAULT_GOAL_MARKER_RADIUS
+            goal_marker_pts_count = 64
+            goal_marker_radius = DEFAULT_GOAL_MARKER_RADIUS
+            rng_gm = np.random.default_rng(step_idx)
+            offsets = rng_gm.standard_normal((goal_marker_pts_count, 3)).astype(np.float32)
+            norms = np.linalg.norm(offsets, axis=1, keepdims=True)
+            offsets = offsets / np.maximum(norms, 1e-6) * goal_marker_radius
+            goal_marker_cloud = target + offsets
+            rr.log(
+                "world/goal_marker_cluster",
+                rr.Points3D(goal_marker_cloud, colors=[255, 0, 255], radii=0.003),
+            )
     rr.disconnect()
 
 
@@ -1142,7 +1158,6 @@ def _build_graspgen_constraint(
             "graspgen_best_score": best_score,
             "graspgen_total_grasps": int(all_grasps.shape[0]),
             "graspgen_best_idx": best_idx,
-            "z_offset": z_offset,
         },
     )
     print(
