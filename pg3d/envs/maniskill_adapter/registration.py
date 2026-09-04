@@ -10,5 +10,8 @@ def register_pg3d_reach_envs() -> None:
         return
     import pg3d.envs.maniskill_adapter.reach_env  # noqa: F401
     import pg3d.envs.xarm_adapter.reach_env  # noqa: F401
+    # Eval environments (25 deterministic envs for 10-task benchmark)
+    from pg3d.envs.xarm_adapter.eval_envs import register_pg3d_eval_envs
+    register_pg3d_eval_envs()
 
     _REGISTERED_REACH_ENVS = True

@@ -23,10 +23,18 @@ Architecture
    * Score each by CartesianPoseConstraint cost + goal_distance + smoothness.
    * Execute the chunk whose imagined EEF path gets closest to the grasp pose.
 4. Debug visualisations (--graspgen-viser / --rerun):
-   * Viser: launches a local 3-D server showing the object point cloud and
-     ALL GraspGen candidate grasps as pitchfork frames.
-   * Rerun: logs the best grasp AND all candidates as pitchfork line strips
-     (approach arm + two finger-span lines) inside the existing timeline.
+   * Viser: launches GraspGen's OWN visualizer (grasp_gen.utils.viser_utils
+     — create_visualizer / visualize_pointcloud / visualize_grasp), the same
+     one used by scripts/demo_object_pc.py. This renders the actual gripper
+     mesh at each grasp pose. Previously this used a homegrown "pitchfork"
+     line-drawing with a hardcoded, WRONG finger depth (6.5cm) — see the
+     Z-offset section below for why that was actively misleading.
+   * Rerun: logs the best grasp AND all candidates as simplified stick-figure
+     line strips (approach arm + finger-span), now built from GraspGen's
+     ACTUAL control-point geometry (see _gripper_stick_figure_lines_for_grasp) instead
+     of guessed numbers. Rerun has no native GraspGen mesh renderer, so this
+     remains a simplified approximation — trust the Viser view for anything
+     that matters.
 
 Gripper masking
 ===============
@@ -39,12 +47,42 @@ Confirmed GraspGen output schema (from server probe):
            Position = T[:3, 3], Rotation = T[:3, :3].
   scores : (N,)      float32 discriminator confidences in [0, 1].
 
-Z-offset
-========
-The project's xarm7_robotiq.urdf uses the exact Robotiq 2F-140 geometry that
-GraspGen was trained for → Z_OFFSET = 0.0 by default. If you ever swap the
-physical gripper, measure the new fingertip depth from the URDF and pass
---graspgen-z-offset.
+Z-offset — CORRECTED (previous value of 0.0 was wrong)
+========================================================
+GraspGen's SE(3) translation is the gripper's WRIST/PALM frame, not the
+fingertip contact point. This was confirmed directly from GraspGen's own
+geometry via:
+
+    from grasp_gen.grasp_server import load_grasp_cfg
+    from grasp_gen.utils.viser_utils import load_control_points_for_visualization
+    load_control_points_for_visualization("robotiq_2f_140")
+
+which returns 7 control points describing the gripper's stick-figure shape
+in its own local frame:
+
+    [[ 0.068,  0,  0.195],   # right fingertip
+     [ 0.068,  0,  0.0975],  # right finger root
+     [ 0,      0,  0.0975],  # crossbar center
+     [ 0,      0,  0     ],  # <-- SE(3) ORIGIN (wrist/palm base)
+     [ 0,      0,  0.0975],
+     [-0.068,  0,  0.0975],  # left finger root
+     [-0.068,  0,  0.195]]   # left fingertip
+
+The origin is 0.195m BEHIND the fingertips along the local +Z (approach)
+axis. `Z_OFFSET = 0.0` (the previous default, based on the incorrect
+assumption that "gripper geometry matches training gripper" implies no
+offset is needed) sends the arm's target TCP to the WRIST position, roughly
+0.195m short of the actual object contact point. The corrected default
+below moves the target forward along the approach axis by that amount:
+
+    --graspgen-z-offset -0.195
+
+(sign convention: `_apply_z_offset` computes
+`T[:3,3] -= z_offset * approach_axis`; since we need to ADD 0.195 *
+approach_axis to go from wrist to fingertip, z_offset must be NEGATIVE).
+VERIFY this sign empirically on your setup with --graspgen-viser before
+trusting it blindly — confirm the rendered gripper mesh's fingers land on
+the object's surface, not the wrist marker.
 
 Phase 1 (gripper close) is a separate step. This script only steers the arm.
 """
@@ -230,6 +268,7 @@ def save_rerun_timeline(
             _graspgen_rerun_data["best_idx"],
             _graspgen_rerun_data["object_cloud"],
             episode_index=_graspgen_rerun_data.get("episode_index", 0),
+            gripper_name=_graspgen_rerun_data.get("gripper_name", "robotiq_2f_140"),
         )
 
     if constraints:
@@ -413,6 +452,7 @@ def load_graspgen_sampler(config_path: str | Path) -> Any:
     cfg = load_grasp_cfg(config_path)
     sampler = GraspGenSampler(cfg)
     gripper = getattr(getattr(cfg, "data", cfg), "gripper_name", "unknown")
+    sampler.gripper_name = gripper  # stashed so downstream viz code doesn't need the cfg again
     print(f"[GraspGen] Sampler ready. gripper={gripper}", flush=True)
     return sampler
 
@@ -653,52 +693,72 @@ def _rot3x3_to_quat_wxyz(rot: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Viser / Rerun pitchfork grasp visualisation helpers
+# Grasp visualisation helpers
+#
+# CORRECTED (previously used a homegrown "pitchfork" with a WRONG, guessed
+# finger depth of 6.5cm — see the module docstring's "Z-offset" section).
+# The Viser debug view now calls GraspGen's OWN visualizer
+# (grasp_gen.utils.viser_utils), the same one scripts/demo_object_pc.py
+# uses, which renders the real gripper mesh. The Rerun logger has no native
+# GraspGen mesh support, so it still draws a simplified stick-figure line
+# strip, but now built from GraspGen's ACTUAL control-point geometry
+# (fetched via load_control_points_for_visualization) instead of guessed
+# numbers, so it is at least geometrically correct.
 # ---------------------------------------------------------------------------
 
-# Gripper geometry constants used for the pitchfork visualisation.
-# These match the Robotiq 2F-140 finger geometry that GraspGen was trained on.
-_GRASP_VIS_APPROACH_LEN  = 0.06   # length of the blue approach arrow (m)
-_GRASP_VIS_FINGER_WIDTH  = 0.14   # Robotiq 2F-140 full span (140 mm)
-_GRASP_VIS_FINGER_DEPTH  = 0.065  # Robotiq 2F-140 finger length approx (65 mm)
+_control_points_cache: dict[str, np.ndarray] = {}
 
 
-def _pitchfork_lines_for_grasp(
+def _get_gripper_control_points(gripper_name: str) -> np.ndarray:
+    """Fetch GraspGen's own (7, 3) control-point stick-figure for a gripper.
+
+    Cached per gripper_name since this hits disk/config on first call.
+    Falls back to a small warning + a conservative guess only if GraspGen's
+    own utility is unavailable — should not normally happen since this
+    script already imports grasp_gen at the top.
+    """
+    if gripper_name in _control_points_cache:
+        return _control_points_cache[gripper_name]
+    try:
+        from grasp_gen.utils.viser_utils import load_control_points_for_visualization
+        cp = np.asarray(load_control_points_for_visualization(gripper_name), dtype=np.float32)
+    except Exception as exc:
+        print(
+            f"[GraspGen] WARNING: could not load real control points for "
+            f"gripper '{gripper_name}' ({exc!r}); falling back to a rough "
+            "guess. Fix this before trusting any grasp visualisation.",
+            flush=True,
+        )
+        cp = np.array(
+            [[0.068, 0, 0.195], [0.068, 0, 0.0975], [0, 0, 0.0975],
+             [0, 0, 0], [0, 0, 0.0975], [-0.068, 0, 0.0975], [-0.068, 0, 0.195]],
+            dtype=np.float32,
+        )
+    _control_points_cache[gripper_name] = cp
+    return cp
+
+
+def _gripper_stick_figure_lines_for_grasp(
     grasp_T: np.ndarray,
-    *,
-    approach_len: float = _GRASP_VIS_APPROACH_LEN,
-    finger_width: float = _GRASP_VIS_FINGER_WIDTH,
-    finger_depth: float = _GRASP_VIS_FINGER_DEPTH,
+    gripper_name: str,
 ) -> list[np.ndarray]:
-    """Return line segments that form a T-bar / pitchfork for one grasp SE(3)."""
-    grasp_T = np.asarray(grasp_T, dtype=np.float32)
-    origin   = grasp_T[:3, 3]           # TCP / grasp contact centre
-    approach = grasp_T[:3, 2]           # local Z column (points FROM base TO TCP)
-    finger   = grasp_T[:3, 0]           # local X column
+    """Return world-frame line segments tracing GraspGen's own control-point
+    stick figure for one grasp SE(3), for Rerun logging (no mesh support).
 
-    # TCP is exactly at 'origin'.
-    # The base of the fingers (crossbar) is 'finger_depth' behind the TCP.
-    finger_root = origin - approach * finger_depth
-    
-    # Handle / approach line (from the finger root, backwards)
-    handle_end = finger_root - approach * approach_len
-    
-    # Crossbar
-    half_width = finger_width / 2.0
-    left_root = finger_root - finger * half_width
-    right_root = finger_root + finger * half_width
-    
-    # Prongs (from the root, forwards to the tips at the TCP plane)
-    left_tip = origin - finger * half_width
-    right_tip = origin + finger * half_width
-    
-    lines = [
-        np.stack([finger_root, handle_end], axis=0),   # handle
-        np.stack([left_root, right_root], axis=0),     # crossbar
-        np.stack([left_root, left_tip], axis=0),       # left prong
-        np.stack([right_root, right_tip], axis=0),     # right prong
-    ]
-    return [l.astype(np.float32) for l in lines]
+    This replaces the old `_pitchfork_lines_for_grasp` (deleted), which hardcoded a
+    finger depth of 0.065m — appropriate for a small Panda-like hand, but
+    wrong for the Robotiq 2F-140 (whose real control points span 0.195m
+    from the SE(3) origin to the fingertips). Using GraspGen's own control
+    points here means this is correct for whichever gripper config is
+    actually loaded, not just Robotiq 2F-140.
+    """
+    grasp_T = np.asarray(grasp_T, dtype=np.float32)
+    cp_local = _get_gripper_control_points(gripper_name)  # (7, 3) local frame
+    cp_world = (grasp_T[:3, :3] @ cp_local.T).T + grasp_T[:3, 3]  # (7, 3)
+    # Consecutive control points form the stick figure (right tip -> right
+    # root -> crossbar center -> origin -> crossbar center -> left root ->
+    # left tip). Draw each consecutive segment.
+    return [cp_world[i:i + 2].astype(np.float32) for i in range(cp_world.shape[0] - 1)]
 
 
 def _log_graspgen_rerun(
@@ -708,6 +768,7 @@ def _log_graspgen_rerun(
     object_cloud: np.ndarray,
     *,
     episode_index: int,
+    gripper_name: str = "robotiq_2f_140",
 ) -> None:
     """Log all grasp candidates + object cloud to an open Rerun session.
 
@@ -731,13 +792,14 @@ def _log_graspgen_rerun(
     # (Disabled: user requested ONLY the best grasp to be shown in Rerun)
 
     # Best grasp — bright yellow lines, thicker
-    best_lines = _pitchfork_lines_for_grasp(all_grasps[best_idx])
+    best_lines = _gripper_stick_figure_lines_for_grasp(all_grasps[best_idx], gripper_name)
     rr.log(
         "world/graspgen/best_grasp",
         rr.LineStrips3D(best_lines, colors=[255, 255, 0, 255], radii=0.003),
         static=True,
     )
-    # Best grasp origin point
+    # Best grasp origin point (this is the WRIST frame, not the contact
+    # point — see module docstring's Z-offset section)
     rr.log(
         "world/graspgen/best_grasp_origin",
         rr.Points3D(
@@ -760,94 +822,56 @@ def _show_graspgen_viser(
     object_cloud: np.ndarray,
     *,
     episode_index: int,
+    gripper_name: str = "robotiq_2f_140",
     block: bool = True,
 ) -> None:
-    """Open a local Viser window with the object PC and all grasp candidates.
+    """Open GraspGen's OWN Viser visualizer (grasp_gen.utils.viser_utils) —
+    the same one scripts/demo_object_pc.py uses — showing the object point
+    cloud and every grasp candidate rendered as the REAL gripper mesh.
 
-    Visualises each grasp as a pitchfork (approach + finger lines) coloured
-    from blue (low score) to green (high score). The best grasp is bright red.
-    Set block=True to pause until the user closes the window (default), or
-    block=False to return immediately (window keeps running in the background).
+    This replaces the previous homegrown "pitchfork" renderer, which used a
+    hardcoded, wrong finger-depth constant (0.065m) and made every grasp
+    look like it was floating ~0.13-0.2m away from the object — a rendering
+    artifact, not a real bug in the underlying GraspGen output. See the
+    module docstring's "Z-offset" section for the full story.
     """
     try:
-        import viser
-        import viser.transforms as vtf
-    except ImportError:
+        from grasp_gen.utils.viser_utils import (
+            create_visualizer,
+            get_color_from_score,
+            visualize_grasp,
+            visualize_pointcloud,
+        )
+    except ImportError as exc:
         print(
-            "[GraspGen] viser not installed — skipping debug window. "
-            "Install with: pip install viser",
+            f"[GraspGen] could not import grasp_gen.utils.viser_utils ({exc!r}) "
+            "— skipping debug window.",
             flush=True,
         )
         return
 
-    server = viser.ViserServer()
-    server.scene.world_axes.visible = False
+    vis = create_visualizer()
+    vis.scene.reset()
 
-    # Object point cloud
     if object_cloud.shape[0] > 0:
-        server.scene.add_point_cloud(
-            "object_cloud",
-            points=object_cloud,
-            colors=np.tile([255, 200, 50], (object_cloud.shape[0], 1)),
-            point_size=0.004,
-        )
+        visualize_pointcloud(vis, "object_cloud", object_cloud, [255, 200, 50], size=0.004)
 
-    # Score range for colour mapping
-    s_min = float(all_scores.min())
-    s_max = float(all_scores.max())
-    s_range = max(s_max - s_min, 1e-6)
-
-    for i, (grasp_T, score) in enumerate(zip(all_grasps, all_scores)):
-        pos = grasp_T[:3, 3]
-
-        if i == best_idx:
-            color = (255, 80, 0)
-            node_name = "grasps/best"
-            line_width = 3.0
-            radius = 0.015
-        else:
-            normalized_score = float((score - s_min) / s_range)
-            # Interpolate between blue (lowest score) and green (highest score)
-            color = (0, int(255 * normalized_score), int(255 * (1 - normalized_score)))
-            node_name = f"grasps/candidate_{i}"
-            line_width = 1.0
-            radius = 0.005
-
-        # ── 1. Plain sphere at TCP position ──────────────────────────────────
-        # This makes it immediately obvious whether the POSITION is correct
-        # regardless of orientation/pitchfork rendering artifacts.
-        server.scene.add_icosphere(
-            f"{node_name}/tcp_sphere",
-            radius=radius,
-            color=color,
-            position=pos,
-        )
-
-        # ── 2. Pitchfork lines (approach + finger bars) ───────────────────────
-        lines = _pitchfork_lines_for_grasp(grasp_T)
-        for j, seg in enumerate(lines):
-            server.scene.add_line_segments(
-                f"{node_name}/{j}",
-                points=np.expand_dims(seg, 0),
-                colors=color,
-                line_width=line_width,
+    if all_grasps.shape[0] > 0:
+        colors = get_color_from_score(all_scores, use_255_scale=True)
+        for i, grasp_T in enumerate(all_grasps):
+            name = "grasps/best/grasp" if i == best_idx else f"grasps/{i:03d}/grasp"
+            visualize_grasp(
+                vis,
+                name,
+                grasp_T,
+                color=(255, 80, 0) if i == best_idx else colors[i],
+                gripper_name=gripper_name,
+                linewidth=1.2 if i == best_idx else 0.6,
             )
 
-    # ── 3. Actor centroid marker (magenta) ────────────────────────────────────
-    # Shows where _get_object_actor_xyz reported the object to be.
-    # If this overlaps the cheezit point cloud, the centroid read is correct.
-    if object_cloud.shape[0] > 0:
-        cloud_centroid = object_cloud.mean(axis=0)
-        server.scene.add_icosphere(
-            "debug/cloud_centroid",
-            radius=0.012,
-            color=(220, 0, 220),
-            position=cloud_centroid,
-        )
-
     print(
-        f"[GraspGen Viser] Episode {episode_index}: showing {all_grasps.shape[0]} grasps. "
-        f"Open browser at http://localhost:8080 — close the window or Ctrl+C to continue.",
+        f"[GraspGen Viser] Episode {episode_index}: showing {all_grasps.shape[0]} grasps "
+        f"as real '{gripper_name}' gripper meshes. Ctrl+C to continue.",
         flush=True,
     )
     if block:
@@ -857,7 +881,6 @@ def _show_graspgen_viser(
                 time.sleep(0.5)
         except KeyboardInterrupt:
             pass
-    server.stop()
 
 
 def _build_graspgen_constraint(
@@ -1043,15 +1066,17 @@ def _build_graspgen_constraint(
         flush=True,
     )
 
-    # --- 7b. Debug visualisations (Viser + Rerun pitchforks) ---
+    # --- 7b. Debug visualisations (Viser via GraspGen's own renderer + Rerun) ---
+    gripper_name = getattr(graspgen_sampler, "gripper_name", "robotiq_2f_140")
     if getattr(args, "graspgen_viser", False):
         _show_graspgen_viser(
             all_grasps, all_scores, best_idx, object_crop,
             episode_index=spec.output_index,
+            gripper_name=gripper_name,
             block=True,
         )
 
-    # Rerun pitchfork logging: deferred — logged inside save_rerun_timeline.
+    # Rerun stick-figure logging: deferred — logged inside save_rerun_timeline.
     # Store on args so run_eval_episode can pass them through.
     if getattr(args, "rerun", False):
         # Attach the grasp data as a per-episode attribute on args so that the
@@ -1064,10 +1089,19 @@ def _build_graspgen_constraint(
             "all_scores": all_scores,
             "best_idx": best_idx,
             "object_cloud": object_crop,
+            "gripper_name": gripper_name,
         }
 
-    # --- 8. Apply Z-offset for XArm7 gripper geometry ---
-    z_offset = float(getattr(args, "graspgen_z_offset", 0.0))
+    # --- 8. Apply Z-offset: wrist frame (GraspGen's SE(3) origin) -> fingertip ---
+    # CORRECTED: was defaulting to 0.0, which is wrong — see module docstring's
+    # "Z-offset" section. GraspGen's own control-point geometry for
+    # robotiq_2f_140 places the SE(3) origin 0.195m behind the fingertips
+    # along the local approach (+Z) axis. --graspgen-z-offset now defaults to
+    # -0.195 (see _apply_z_offset's sign convention docstring). If you use a
+    # different --graspgen-config/gripper, re-derive this number from
+    # grasp_gen.utils.viser_utils.load_control_points_for_visualization(gripper_name)
+    # instead of assuming -0.195 carries over.
+    z_offset = float(getattr(args, "graspgen_z_offset", -0.195))
     adjusted = _apply_z_offset(best_grasp, z_offset)
     adj_pos  = adjusted[:3, 3]
     adj_rot  = adjusted[:3, :3]
@@ -1649,7 +1683,7 @@ def _constraint_source_summary(args: argparse.Namespace) -> dict[str, Any]:
         "graspgen_config": str(getattr(args, "graspgen_config", None)),
         "graspgen_threshold": float(getattr(args, "graspgen_threshold", 0.8)),
         "graspgen_num_grasps": int(getattr(args, "graspgen_num_grasps", 200)),
-        "graspgen_z_offset": float(getattr(args, "graspgen_z_offset", 0.0)),
+        "graspgen_z_offset": float(getattr(args, "graspgen_z_offset", -0.195)),
         "grasp_object_crop_radius": float(getattr(args, "grasp_object_crop_radius", 0.10)),
         "grasp_object_index": int(getattr(args, "grasp_object_index", -1)),
         "grasp_weight": float(getattr(args, "grasp_weight", 2.0)),
@@ -2705,10 +2739,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Discriminator score threshold for keeping grasp candidates.")
     g.add_argument("--graspgen-num-grasps", type=int, default=200,
                    help="Number of diffusion grasp samples per inference call.")
-    g.add_argument("--graspgen-z-offset", type=float, default=0.0,
-                   help="Metres to shift the grasp contact point back along the approach "
-                        "axis to account for gripper geometry difference. "
-                        "0.0 for Robotiq 2F-140 (same as GraspGen training gripper).")
+    g.add_argument("--graspgen-z-offset", type=float, default=-0.195,
+                   help="Metres to shift the grasp target along the approach axis, "
+                        "converting GraspGen's SE(3) output (the gripper's WRIST/PALM "
+                        "frame) into an actual fingertip/contact-point target. "
+                        "CORRECTED from a previous default of 0.0, which incorrectly "
+                        "assumed the SE(3) origin itself was the contact point. "
+                        "-0.195 was derived from "
+                        "grasp_gen.utils.viser_utils.load_control_points_for_visualization"
+                        "('robotiq_2f_140'), whose control points place the fingertips "
+                        "0.195m ahead of the origin along the local +Z axis. Re-derive "
+                        "this number from that same function if you switch grippers.")
     g.add_argument("--grasp-approach-offset", type=float, default=0.10,
                    help="Distance (m) to offset the goal pose backwards along the approach "
                         "axis to create a pre-grasp pose. The DP3 reach policy will be "

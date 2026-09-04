@@ -180,14 +180,19 @@ class PG3DReachXArm7GripperEnv(PG3DReachXArm7Env):
 
     def _setup_sensors(self, options: dict | None = None) -> None:
         super()._setup_sensors(options)
-        
-        # Add wrist camera directly to the environment's instantiated sensors
+
+        # Add wrist camera only when the gripper is loaded (link_tcp exists).
+        # xarm7_nogripper has no link_tcp — skip silently so the env can be
+        # instantiated with robot_uids="xarm7_nogripper" for local checks.
+        if "link_tcp" not in self.agent.robot.links_map:
+            return
+
         from mani_skill.sensors.camera import CameraConfig, Camera
         import sapien
-        
+
         # 87 degrees FOV matching RealSense D455 depth camera.
         # SAPIEN Camera looks along +X axis.
-        pose = sapien.Pose([0.05, 0, 0]) # 5cm ahead of TCP
+        pose = sapien.Pose([0.05, 0, 0])  # 5 cm ahead of TCP
         wrist_cam_config = CameraConfig(
             "cam_wrist",
             pose=pose,
@@ -196,10 +201,12 @@ class PG3DReachXArm7GripperEnv(PG3DReachXArm7Env):
             fov=float(np.deg2rad(87)),
             near=0.1,
             far=10.0,
-            mount=self.agent.robot.links_map["link_tcp"]
+            mount=self.agent.robot.links_map["link_tcp"],
         )
         self._sensor_configs["cam_wrist"] = wrist_cam_config
-        self._sensors["cam_wrist"] = Camera(wrist_cam_config, self.scene, articulation=self.agent.robot)
+        self._sensors["cam_wrist"] = Camera(
+            wrist_cam_config, self.scene, articulation=self.agent.robot
+        )
         self.scene.sensors = self._sensors
 
 
