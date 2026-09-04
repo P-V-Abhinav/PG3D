@@ -45,6 +45,42 @@ def _hide_marker_spheres(env: Any) -> None:
                         body.disable()
 
 
+def _ycb_rest_z_offset(model_id: str) -> float | None:
+    """Height (m) above an object's local-frame origin down to the lowest point
+    of its collision mesh -- i.e. the world-frame z that ``pose.p.z`` must be
+    set to so the object's underside just touches the table surface.
+
+    ManiSkill's YCB actors (``mani_skill.utils.building.actors.ycb.get_ycb_builder``)
+    are built directly from the raw ``collision.ply`` / ``textured.obj`` files
+    with whatever local origin the dataset authored -- this is *not* centred on
+    the object and varies per model (e.g. the banana's origin sits much closer
+    to its surface than the gelatin box's does), so a single hardcoded spawn
+    height cannot be correct for every YCB model. This reads the same
+    ``info_pick_v0.json`` bbox metadata ManiSkill itself uses when building the
+    actor and derives the correct per-model offset from it.
+
+    Also see ``mani_skill.utils.scene_builder.table.TableSceneBuilder``, which
+    places the table's top surface at world z=0 -- the datum this offset is
+    relative to.
+
+    Returns ``None`` if the model can't be found in the YCB metadata (caller
+    should fall back to a conservative default).
+    """
+    try:
+        import mani_skill
+        from mani_skill.utils.io_utils import load_json
+
+        info = load_json(
+            mani_skill.ASSET_DIR / "assets/mani_skill2_ycb/info_pick_v0.json"
+        )
+        meta = info[model_id]
+        scale = meta.get("scales", [1.0])[0]
+        return float(-meta["bbox"]["min"][2] * scale)
+    except Exception as e:
+        print(f"[_ycb_rest_z_offset] Could not read YCB bbox for {model_id!r}: {e}", flush=True)
+        return None
+
+
 def _create_cone_obj(
     filepath: str,
     radius: float = 0.05,
@@ -403,6 +439,9 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         model_id = self.ycb_model_id
         if model_id == "cube_7cm":
             self.cheezit = actors.build_box(self.scene, half_sizes=[0.035, 0.035, 0.035], color=[0, 1, 0, 1], name="cube_7cm", body_type="dynamic")
+            # build_box's pose.p is its geometric centre, so half the side length
+            # is exactly the offset from the origin down to its underside.
+            self._cheezit_z_offset = 0.035
         else:
             try:
                 builder = actors.get_actor_builder(self.scene, id=f"ycb:{model_id}")
@@ -411,12 +450,30 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
             except Exception as e:
                 print(f"[PG3DReachJustBananaEnv] Failed to load YCB {model_id}: {e}")
                 self.cheezit = actors.build_box(self.scene, half_sizes=[0.04, 0.04, 0.04], color=[1, 0, 0, 1], name="fallback_jello", body_type="dynamic")
+                model_id = None  # skip the YCB bbox lookup below, we built a plain box instead
+                self._cheezit_z_offset = 0.04
+
+            if model_id is not None:
+                offset = _ycb_rest_z_offset(model_id)
+                if offset is None:
+                    print(
+                        f"[PG3DReachJustBananaEnv] Falling back to default spawn "
+                        f"height for {model_id!r}; object may spawn above the table.",
+                        flush=True,
+                    )
+                    offset = self._JSTBANANA_Z
+                self._cheezit_z_offset = offset
         _hide_marker_spheres(self)
 
     # Workspace XY bounds for random object placement in jstbanana-v0.
     # Tighter bounds to ensure the object spawns comfortably within robot reach.
     _JSTBANANA_X_RANGE = (-0.15, 0.07)
     _JSTBANANA_Y_RANGE = (-0.25, 0.07)
+    # Only used if a YCB model's bbox metadata can't be read (see _ycb_rest_z_offset).
+    _JSTBANANA_Z = 0.065
+    # Small clearance above the exact contact height so the object doesn't spawn
+    # interpenetrating the table mesh (which can cause a small physics "pop").
+    _JSTBANANA_Z_CLEARANCE = 0.002
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
@@ -437,34 +494,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
                 # Fallback: use centre of workspace
                 sx, sy = 0.30, 0.0
 
-            # Calculate actual Z height so object rests perfectly on the table (Z=0).
-            # The original 0.065 hardcoded value was leaving objects floating, causing them to fall mid-episode.
-            model_id = getattr(self, "ycb_model_id", "")
-            if "cube_7cm" in model_id:
-                obj_z = 0.035
-            elif "banana" in model_id:
-                obj_z = 0.020
-            elif "cracker_box" in model_id:
-                obj_z = 0.030 
-            elif "gelatin_box" in model_id:
-                obj_z = 0.015
-            elif "mug" in model_id:
-                obj_z = 0.042
-            elif "mustard_bottle" in model_id:
-                obj_z = 0.095
-            elif "tomato_soup_can" in model_id:
-                obj_z = 0.051
-            elif "bleach_cleanser" in model_id:
-                obj_z = 0.115
-            elif "potted_meat_can" in model_id:
-                obj_z = 0.043
-            elif "sugar_box" in model_id:
-                obj_z = 0.088
-            elif "bowl" in model_id:
-                obj_z = 0.033
-            else:
-                obj_z = 0.035  # Fallback
-
+            obj_z = self._cheezit_z_offset + self._JSTBANANA_Z_CLEARANCE
             pos_np = np.array([sx, sy, obj_z], dtype=np.float32)
             pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
@@ -488,7 +518,8 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
 
             print(
                 f"[jstbanana-v0] Episode seed={self._episode_seed}: "
-                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {obj_z:.3f})",
+                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {obj_z:.3f}) "
+                f"[rest_offset={self._cheezit_z_offset:.4f}]",
                 flush=True,
             )
 
