@@ -1107,15 +1107,15 @@ def _build_graspgen_constraint(
     adj_rot  = adjusted[:3, :3]
     adj_quat = _rot3x3_to_quat_wxyz(adj_rot)
 
-    # Always store the final (pre-approach) grasp pose so _execute_pick_and_place
-    # can use it for the Cartesian descent, regardless of whether --rerun is set.
-    # The descent target is: object centroid XY + grasp contact Z (no approach offset).
-    # This matches the pre-grasp anchor so the arm descends straight down over the object.
-    final_grasp_pos_for_descent = np.array([
-        target_xyz[0],   # object centroid X
-        target_xyz[1],   # object centroid Y
-        adj_pos[2],      # grasp contact Z (no offset)
-    ], dtype=np.float32)
+    # Store the final grasp pose so _execute_pick_and_place can use it for
+    # the Cartesian descent, regardless of whether --rerun is set.
+    #
+    # CHANGED: previously this mixed object-centroid XY with grasp-contact Z,
+    # because the raw grasp XY position couldn't be trusted (the wrist/
+    # fingertip offset bug — see module docstring). Now that adj_pos is the
+    # actual corrected fingertip/contact position, use it directly for both
+    # XY and Z — no more anchoring to the object centroid as a workaround.
+    final_grasp_pos_for_descent = adj_pos.astype(np.float32)
     if not hasattr(args, "_graspgen_rerun_data"):
         args._graspgen_rerun_data = {}
     if spec.output_index not in args._graspgen_rerun_data:
@@ -1123,31 +1123,35 @@ def _build_graspgen_constraint(
     args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = final_grasp_pos_for_descent
     args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
-    # --- 8b. Create Pre-Grasp Pose ---
-    # Read the approach offset from CLI arguments (defaults to -0.02 if not provided)
-    approach_offset = float(getattr(args, "grasp_approach_offset", -0.02))
-
-    # The pre-grasp goal position is anchored to the OBJECT CENTROID (target_xyz),
-    # not to the raw GraspGen TCP position (adj_pos). This ensures the goal marker
-    # always appears directly above the object regardless of where GraspGen placed
-    # the TCP contact point on the surface.
-    #
-    # We always approach from directly above (top-down), so the pre-grasp position is:
-    #   XY  = object centroid XY  (directly above the object)
-    #   Z   = object centroid Z + abs(approach_offset) (hover strictly above object centroid)
-    #
-    # This anchors the goal marker completely to the object.
-    pregrasp_pos = np.array([
-        target_xyz[0],                        # object centroid X
-        target_xyz[1],                        # object centroid Y
-        target_xyz[2] + abs(approach_offset), # object centroid Z + hover height
-    ], dtype=np.float32)
+    # --- 8b. Create Pre-Grasp / Goal Pose ---
+    # CHANGED: previously this synthesized a "hover above the object centroid"
+    # point using --grasp-approach-offset, because the raw grasp position was
+    # off (a rendering/offset bug — see the module docstring's "Z-offset"
+    # section). Now that _apply_z_offset correctly converts GraspGen's
+    # wrist-frame SE(3) output into the real fingertip/contact pose (adj_pos,
+    # adj_quat), the goal can be placed directly at the selected grasp
+    # prediction. --grasp-approach-offset now defaults to 0.0 (no offset —
+    # goal = adj_pos exactly). If you ever want a small pre-grasp standoff
+    # (e.g. to avoid brushing neighbouring clutter on the way in), a positive
+    # value backs the goal off along the GRASP'S OWN approach axis (adj_rot's
+    # local Z column, world frame) rather than blindly along world Z, so it
+    # still works for non-top-down grasps.
+    approach_offset = float(getattr(args, "grasp_approach_offset", 0.0))
+    approach_axis = adj_rot[:, 2]  # local Z column = approach direction, world frame
+    pregrasp_pos = (adj_pos - approach_axis * approach_offset).astype(np.float32)
 
     if abs(approach_offset) > 1e-6:
         print(
-            f"[GraspGen] Episode {spec.output_index}: applying approach offset={abs(approach_offset):.4f}m:\n"
-            f"  object centroid  = {target_xyz.tolist()}\n"
-            f"  pre-grasp pos    = {pregrasp_pos.tolist()}\n",
+            f"[GraspGen] Episode {spec.output_index}: applying approach offset={approach_offset:.4f}m "
+            f"along the grasp's own approach axis:\n"
+            f"  grasp contact pos = {adj_pos.tolist()}\n"
+            f"  pre-grasp pos     = {pregrasp_pos.tolist()}\n",
+            flush=True,
+        )
+    else:
+        print(
+            f"[GraspGen] Episode {spec.output_index}: no approach offset — "
+            f"goal placed directly at the selected grasp prediction: {pregrasp_pos.tolist()}",
             flush=True,
         )
 
@@ -2111,20 +2115,27 @@ def _execute_pick_and_place(
     print("\n--- [Phase 1b] Cartesian Descent to Grasp Contact Pose ---", flush=True)
 
     # ── Compute descent target ────────────────────────────────────────────────
-    # Use the GraspGen contact Z as the descent target (the Z of the actual
-    # grasp contact point, stored by _run_graspgen_for_episode).
-    # XY stays at the current arm position (we go straight down).
-    # We clamp to at least 1cm above the table to avoid going through the floor.
+    # Use the actual grasp pose (final_grasp_pos, already corrected to the
+    # real fingertip/contact position) directly for XY and Z.
+    #
+    # CHANGED: this used to keep the arm's CURRENT XY (only using GraspGen's Z)
+    # because the grasp XY position couldn't be trusted. Now it can be, so we
+    # descend straight to the actual grasp XY too, not wherever Phase 1a
+    # happened to land. z_extra_margin remains a small literal safety
+    # clearance above the surface (not a bug-compensation offset) — it's
+    # fine to leave at its default, or set to 0.0 if you want to land exactly
+    # on the computed contact Z.
     z_extra_margin = float(getattr(args, "mplib_descent_z_margin", 0.01))
     contact_z = float(final_grasp_pos[2])
     target_z  = max(contact_z + z_extra_margin, 0.01)
 
-    manual_descent_target = current_pos.copy()
+    manual_descent_target = final_grasp_pos.copy()
     manual_descent_target[2] = target_z
 
     descent_dist = current_pos[2] - target_z
     print(
-        f"[Descent] Target Z = GraspGen contact ({contact_z:.4f}m) + margin ({z_extra_margin:.3f}m) = {target_z:.4f}m  "
+        f"[Descent] Target = grasp XY {final_grasp_pos[:2].tolist()}, "
+        f"Z = GraspGen contact ({contact_z:.4f}m) + margin ({z_extra_margin:.3f}m) = {target_z:.4f}m  "
         f"(descending {descent_dist:.4f}m from current Z={current_pos[2]:.4f}m)",
         flush=True,
     )
@@ -2164,7 +2175,6 @@ def _execute_pick_and_place(
         f"  Finger-spread XY: [{np.degrees(wrist_yaw):.1f}°]  →  top-down target: {topdown_euler.tolist()} deg",
         flush=True,
     )
-    print(f"[Descent] Manual descent offset applied: {descent_offset:.4f}m downwards", flush=True)
     _descend_to_grasp(
         sim_env,
         video_env,
@@ -2750,16 +2760,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "('robotiq_2f_140'), whose control points place the fingertips "
                         "0.195m ahead of the origin along the local +Z axis. Re-derive "
                         "this number from that same function if you switch grippers.")
-    g.add_argument("--grasp-approach-offset", type=float, default=0.10,
-                   help="Distance (m) to offset the goal pose backwards along the approach "
-                        "axis to create a pre-grasp pose. The DP3 reach policy will be "
-                        "evaluated against this pre-grasp pose. (Phase 0 -> Phase 1)")
+    g.add_argument("--grasp-approach-offset", type=float, default=0.0,
+                   help="Distance (m) to back the goal pose off along the grasp's OWN "
+                        "approach axis, creating a pre-grasp standoff before the actual "
+                        "contact pose. CHANGED: previously defaulted to 0.10m as a "
+                        "workaround for an incorrect raw grasp position (see module "
+                        "docstring's Z-offset section). Now that the grasp position is "
+                        "correct, this defaults to 0.0 — the goal is placed directly at "
+                        "the selected grasp prediction. Set > 0 only if you deliberately "
+                        "want a pre-grasp hover before descending (e.g. to clear clutter).")
     g.add_argument("--mplib-descent-offset", type=float, default=0.15,
-                   help="[DEPRECATED] Previously: distance (m) down from current arm Z. "
-                        "Now ignored; use --mplib-descent-z-margin instead.")
+                   help="[DEPRECATED, ignored] Use --mplib-descent-z-margin instead.")
     g.add_argument("--mplib-descent-z-margin", type=float, default=0.01,
-                   help="Extra clearance (m) above the GraspGen contact Z for the descent target. "
-                        "Descent lands at: GraspGen_contact_Z + this_margin. Default 0.01m (1cm above contact).")
+                   help="Extra clearance (m) above the GraspGen contact Z for the descent "
+                        "target. This is a literal physical safety margin (avoids grazing "
+                        "the surface due to pose noise), NOT a bug-compensation offset — "
+                        "unlike the old --grasp-approach-offset default, this one is fine "
+                        "to leave as-is. Descent lands at: GraspGen_contact_Z + this_margin. "
+                        "Set to 0.0 to land exactly on the computed contact Z.")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
