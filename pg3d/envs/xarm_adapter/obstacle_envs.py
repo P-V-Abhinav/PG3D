@@ -417,7 +417,6 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
     # Tighter bounds to ensure the object spawns comfortably within robot reach.
     _JSTBANANA_X_RANGE = (-0.15, 0.07)
     _JSTBANANA_Y_RANGE = (-0.25, 0.07)
-    _JSTBANANA_Z     = 0.065  # table surface height for object base
     _JSTBANANA_MIN_DIST_FROM_START = 0.20   # keep object away from robot home
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
@@ -438,7 +437,35 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
                 # Fallback: use centre of workspace
                 sx, sy = 0.30, 0.0
 
-            pos_np = np.array([sx, sy, self._JSTBANANA_Z], dtype=np.float32)
+            # Calculate actual Z height so object rests perfectly on the table (Z=0).
+            # The original 0.065 hardcoded value was leaving objects floating, causing them to fall mid-episode.
+            model_id = getattr(self, "ycb_model_id", "")
+            if "cube_7cm" in model_id:
+                obj_z = 0.035
+            elif "banana" in model_id:
+                obj_z = 0.020
+            elif "cracker_box" in model_id:
+                obj_z = 0.030 
+            elif "gelatin_box" in model_id:
+                obj_z = 0.015
+            elif "mug" in model_id:
+                obj_z = 0.042
+            elif "mustard_bottle" in model_id:
+                obj_z = 0.095
+            elif "tomato_soup_can" in model_id:
+                obj_z = 0.051
+            elif "bleach_cleanser" in model_id:
+                obj_z = 0.115
+            elif "potted_meat_can" in model_id:
+                obj_z = 0.043
+            elif "sugar_box" in model_id:
+                obj_z = 0.088
+            elif "bowl" in model_id:
+                obj_z = 0.033
+            else:
+                obj_z = 0.035  # Fallback
+
+            pos_np = np.array([sx, sy, obj_z], dtype=np.float32)
             pos_t = torch.tensor(pos_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
             # Apply random Z rotation (assume objects are upright by default)
@@ -461,7 +488,7 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
 
             print(
                 f"[jstbanana-v0] Episode seed={self._episode_seed}: "
-                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {self._JSTBANANA_Z:.3f})",
+                f"cheezit placed at ({sx:.3f}, {sy:.3f}, {obj_z:.3f})",
                 flush=True,
             )
 

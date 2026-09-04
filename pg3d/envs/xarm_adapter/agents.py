@@ -269,6 +269,27 @@ class XArm7Gripper(BaseAgent):
         joint_name: {"joint": "drive_joint"}
         for joint_name in gripper_joint_names[1:]
     }
+    # Contact-surface friction for the two links that actually touch a grasped
+    # object (left_finger/right_finger — the whole finger mesh is the collision
+    # geometry, there's no separate "pad" sub-link the way Robotiq has one).
+    # xarm7_with_gripper_colored.urdf sets NO surface friction on these links, so
+    # they fell back to SAPIEN's default physical material (~0.3 static/dynamic).
+    # That default was the actual cause of held objects (even a bare cube) sliding
+    # out during transport: the mimic drive can press the fingers together, but
+    # grip RETENTION force is normal_force * mu, and mu~0.3 caps that retention
+    # well below what's needed to counter gravity + transport-accel loads,
+    # regardless of gripper_force_limit. XArm7Robotiq already does this for its
+    # own finger pads (see that class below) -- this mirrors it for the xArm
+    # gripper's finger links.
+    urdf_config = dict(
+        _materials=dict(
+            gripper=dict(static_friction=2.0, dynamic_friction=2.0, restitution=0.0)
+        ),
+        link=dict(
+            left_finger=dict(material="gripper", patch_radius=0.05, min_patch_radius=0.05),
+            right_finger=dict(material="gripper", patch_radius=0.05, min_patch_radius=0.05),
+        ),
+    )
     # Gains match ManiSkill's own xarm6_robotiq mimic gripper exactly (stiffness=1e5,
     # damping=2000, force_limit=0.1) -- this codebase's closest precedent for a
     # mimic-driven xArm-family gripper. force_limit is the critical one: a 1e5-rad/s^2
