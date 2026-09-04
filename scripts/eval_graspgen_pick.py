@@ -775,7 +775,13 @@ def _gripper_stick_figure_lines_for_grasp(
     cp_local = _get_gripper_control_points(gripper_name) # fetched as-is
     cp_local = np.asarray(cp_local, dtype=np.float32)
 
-    # Normalise to (N, 3) — GraspGen may return (3, N) or (N, 3).
+    # Normalise to (N, 3).
+    # load_control_points_for_visualization returns (1, 7, 3) — squeeze all
+    # leading batch dimensions until we have exactly 2 dims.
+    while cp_local.ndim > 2:
+        cp_local = cp_local.squeeze(0)   # (1, N, 3) → (N, 3), repeat if needed
+
+    # Handle the rare (3, N) layout (columns = control points).
     if cp_local.ndim == 2 and cp_local.shape[0] == 3 and cp_local.shape[1] != 3:
         cp_local = cp_local.T   # (3, N) → (N, 3)
 
