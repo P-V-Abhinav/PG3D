@@ -278,7 +278,7 @@ class XArm7Gripper(BaseAgent):
     # never actually moved its target so a high cap was never exercised).
     gripper_stiffness = 1e5
     gripper_damping = 2000
-    gripper_force_limit = 50  # bumped from 0.1 — 0.1 N·m was too low to hold objects during transport
+    gripper_force_limit = 1 # bumped from 0.1 — 0.1 N·m was too low to hold objects during transport
     gripper_friction = 1
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding

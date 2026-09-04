@@ -767,10 +767,20 @@ def _gripper_stick_figure_lines_for_grasp(
     from the SE(3) origin to the fingertips). Using GraspGen's own control
     points here means this is correct for whichever gripper config is
     actually loaded, not just Robotiq 2F-140.
+
+    Shape note: load_control_points_for_visualization may return either
+    (N, 3) or (3, N).  We normalise to (N, 3) before computing world coords.
     """
-    grasp_T = np.asarray(grasp_T, dtype=np.float32)
-    cp_local = _get_gripper_control_points(gripper_name)  # (7, 3) local frame
-    cp_world = (grasp_T[:3, :3] @ cp_local.T).T + grasp_T[:3, 3]  # (7, 3)
+    grasp_T  = np.asarray(grasp_T,  dtype=np.float32)   # (4, 4)
+    cp_local = _get_gripper_control_points(gripper_name) # fetched as-is
+    cp_local = np.asarray(cp_local, dtype=np.float32)
+
+    # Normalise to (N, 3) — GraspGen may return (3, N) or (N, 3).
+    if cp_local.ndim == 2 and cp_local.shape[0] == 3 and cp_local.shape[1] != 3:
+        cp_local = cp_local.T   # (3, N) → (N, 3)
+
+    # cp_local : (N, 3)  →  cp_world : (N, 3)
+    cp_world = (grasp_T[:3, :3] @ cp_local.T).T + grasp_T[:3, 3]
     # Consecutive control points form the stick figure (right tip -> right
     # root -> crossbar center -> origin -> crossbar center -> left root ->
     # left tip). Draw each consecutive segment.
@@ -824,11 +834,54 @@ def _log_graspgen_rerun(
         ),
         static=True,
     )
+
+    # --- Selected grasp contact point on the object ---
+    # This is the raw GraspGen centroid (no offsets applied). Show it as a
+    # large bright-red sphere and draw the 3 local axes so the full 6-DOF
+    # orientation is visible.
+    grasp_T   = all_grasps[best_idx]
+    grasp_pos = grasp_T[:3, 3]          # XYZ contact centroid
+    grasp_R   = grasp_T[:3, :3]         # rotation: cols = local X, Y, Z axes
+    axis_len  = 0.06                    # 6 cm arrows
+
+    # Contact centroid — large red sphere
+    rr.log(
+        "world/graspgen/selected_grasp_contact",
+        rr.Points3D(grasp_pos.reshape(1, 3), colors=[255, 30, 30], radii=0.012),
+        static=True,
+    )
+
+    # Local X axis (finger span direction) — red arrow
+    x_end = grasp_pos + grasp_R[:, 0] * axis_len
+    rr.log(
+        "world/graspgen/selected_grasp_axis_x",
+        rr.LineStrips3D([np.stack([grasp_pos, x_end])], colors=[255, 60, 60], radii=0.003),
+        static=True,
+    )
+
+    # Local Y axis — green arrow
+    y_end = grasp_pos + grasp_R[:, 1] * axis_len
+    rr.log(
+        "world/graspgen/selected_grasp_axis_y",
+        rr.LineStrips3D([np.stack([grasp_pos, y_end])], colors=[60, 255, 60], radii=0.003),
+        static=True,
+    )
+
+    # Local Z axis (approach direction) — blue arrow, longer to show approach
+    z_end = grasp_pos + grasp_R[:, 2] * axis_len * 1.5
+    rr.log(
+        "world/graspgen/selected_grasp_axis_z_approach",
+        rr.LineStrips3D([np.stack([grasp_pos, z_end])], colors=[60, 60, 255], radii=0.004),
+        static=True,
+    )
+
     print(
         f"[GraspGen] Logged {all_grasps.shape[0]} candidates to Rerun "
-        f"(episode {episode_index}, best_idx={best_idx})",
+        f"(episode {episode_index}, best_idx={best_idx}, "
+        f"contact_pos={grasp_pos.tolist()})",
         flush=True,
     )
+
 
 
 def _show_graspgen_viser(
@@ -1858,186 +1911,17 @@ def resolve_checkpoint_path(checkpoint: Path | None, checkpoint_dir: Path | None
 #              and loads GraspGenSampler first.
 # ===========================================================================
 
-def _descend_to_grasp(
-    sim_env: Any,
-    video_env: Any,
-    frames: list[np.ndarray],
-    timeline: list[dict[str, Any]],
-    *,
-    final_grasp_pos: np.ndarray,
-    final_grasp_quat_wxyz: np.ndarray,
-    gripper_open: float,
-    crop_config: Any,
-    render_video_frame_fn: Any,
-    n_descent_steps: int = 20,
-) -> None:
-    """Descend the EEF from the current (pre-grasp offset) pose to the grasp contact pose.
+# _descend_to_grasp was removed.
+# Rationale: GraspGen now places grasps ON the object (no offset/standoff).
+# Phase 1a (DP3 policy) drives directly to the grasp pose; Phase 1b
+# (ScrewPlanner descent) is therefore obsolete and has been deleted.
+# The gripper is closed immediately after Phase 1a completes (Phase 1c).
 
-    Strategy
-    --------
-    1. Try mplib ``plan_screw`` for a collision-aware straight-line Cartesian descent.
-       This is the same planner used in dataset generation and gives smooth joint
-       trajectories that respect the kinematic constraints.
-    2. Fall back to pinocchio IK with linear position interpolation if plan_screw
-       reports a failure (e.g. the start is in self-collision at an edge case).
-
-    In both cases the gripper stays at ``gripper_open`` (held open) during descent.
-    The caller is responsible for closing the gripper afterwards.
-    """
-    import sapien.core as sapien
-    from scipy.spatial.transform import Rotation as _Rotation
-
-    current_qpos_full = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos       = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    current_quat_wxyz = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy().astype(np.float64)
-
-    print(
-        f"[Descent] Starting descent from pre-grasp pose\n"
-        f"  current  EEF pos : {current_pos.tolist()}\n"
-        f"  target grasp pos : {final_grasp_pos.tolist()}\n"
-        f"  distance         : {np.linalg.norm(final_grasp_pos - current_pos):.4f} m",
-        flush=True,
-    )
-
-    # ── Step 1: try mplib plan_screw ─────────────────────────────────────────
-    waypoints_qpos: np.ndarray | None = None
-    try:
-        from pg3d.envs.xarm_adapter.motionplanner import XArm7RobotiqMotionPlanningSolver
-        solver = XArm7RobotiqMotionPlanningSolver(
-            sim_env,
-            vis=False,
-            debug=False,
-            base_pose=sim_env.unwrapped.agent.robot.pose,
-            print_env_info=False,
-        )
-        # plan_screw expects pose as [px, py, pz, qw, qx, qy, qz] (wxyz)
-        # Use final_grasp_quat_wxyz so the gripper rotates into the correct GraspGen orientation
-        target_pose_vec = np.concatenate([final_grasp_pos, final_grasp_quat_wxyz]).astype(np.float64)
-        result = solver.planner.plan_screw(
-            target_pose_vec,
-            current_qpos_full[:7],                     # arm joints only (7-DOF)
-            time_step=sim_env.unwrapped.control_timestep,
-            use_point_cloud=False,
-        )
-        if result["status"] == "Success":
-            waypoints_qpos = result["position"]        # (N, 7) arm joints
-            print(
-                f"[Descent] mplib plan_screw succeeded → {waypoints_qpos.shape[0]} waypoints",
-                flush=True,
-            )
-        else:
-            print(
-                f"[Descent] mplib plan_screw status={result['status']!r} — "
-                "falling back to pinocchio IK interpolation",
-                flush=True,
-            )
-    except Exception as exc:
-        import traceback
-        print(
-            f"[Descent] mplib plan_screw raised {type(exc).__name__}: {exc}\n"
-            f"{traceback.format_exc()}\n"
-            "falling back to pinocchio IK interpolation",
-            flush=True,
-        )
-
-    # ── Step 2: pinocchio IK fallback ────────────────────────────────────────
-    if waypoints_qpos is None:
-        try:
-            model        = sim_env.unwrapped.agent.robot.create_pinocchio_model()
-            link_names   = [lk.name for lk in sim_env.unwrapped.agent.robot.get_links()]
-            tcp_name     = sim_env.unwrapped.agent.ee_link_name
-            tcp_link_idx = link_names.index(tcp_name)
-
-            ik_waypoints: list[np.ndarray] = []
-            q_seed = current_qpos_full[:7].copy()
-
-            # Pre-build SLERP over [0, 1] for the orientation interpolation
-            from scipy.spatial.transform import Slerp as _Slerp
-            
-            # Need to convert from wxyz to xyzw for scipy Slerp
-            current_quat_xyzw = np.roll(current_quat_wxyz, -1)
-            grasp_quat_xyzw = np.roll(final_grasp_quat_wxyz, -1)
-            
-            _key_times   = [0.0, 1.0]
-            _key_rots    = _Rotation.concatenate([
-                _Rotation.from_quat(current_quat_xyzw),
-                _Rotation.from_quat(grasp_quat_xyzw),
-            ])
-            _slerp       = _Slerp(_key_times, _key_rots)
-
-            for i in range(1, n_descent_steps + 1):
-                alpha    = i / n_descent_steps
-                interp_p = current_pos + alpha * (final_grasp_pos - current_pos)
-                interp_q = _slerp(alpha).as_quat()  # xyzw
-                
-                # Build sapien pose for IK (sapien expects wxyz)
-                q_wxyz = np.array([float(interp_q[3]), float(interp_q[0]), float(interp_q[1]), float(interp_q[2])])
-                q_wxyz = q_wxyz / (np.linalg.norm(q_wxyz) + 1e-8)
-                target_sapien = sapien.Pose(
-                    p=interp_p.tolist(),
-                    q=q_wxyz.tolist(),
-                )
-                result_ik = model.compute_inverse_kinematics(
-                    tcp_link_idx,
-                    target_sapien,
-                    initial_qpos=q_seed,
-                    active_qmask=[True] * 7 + [False] * (len(q_seed) - 7),
-                )
-                if result_ik[0] == "success":
-                    q_sol   = result_ik[1][:7]
-                    q_seed  = q_sol
-                    ik_waypoints.append(q_sol)
-                else:
-                    # IK failed for this waypoint — keep the last good one
-                    if ik_waypoints:
-                        ik_waypoints.append(ik_waypoints[-1])
-                    else:
-                        ik_waypoints.append(current_qpos_full[:7])
-
-            waypoints_qpos = np.stack(ik_waypoints, axis=0)
-            print(
-                f"[Descent] pinocchio IK fallback generated {waypoints_qpos.shape[0]} waypoints",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[Descent] pinocchio IK also failed: {type(exc).__name__}: {exc} — "
-                "skipping descent (gripper will close at pre-grasp offset)",
-                flush=True,
-            )
-            return
-
-    # ── Step 3: execute the descent waypoints ────────────────────────────────
-    action_dim = int(np.prod(sim_env.action_space.shape))
-    log_every = max(1, len(waypoints_qpos) // 5)  # print ~5 diagnostic lines during descent
-    for step_i, qpos_wp in enumerate(waypoints_qpos):
-        action = np.zeros(action_dim, dtype=np.float32)
-        action[:7] = qpos_wp.astype(np.float32)
-        if action_dim > 7:
-            action[7:] = float(gripper_open)           # keep gripper open during descent
-        sim_env.step(action)
-        if video_env is not None:
-            video_env.step(action)
-        frames.append(_frame_to_numpy(render_video_frame_fn(sim_env, video_env)))
-        sim_obs   = sim_env.unwrapped.get_obs()
-        sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
-        timeline.append(sim_entry)
-
-        if step_i % log_every == 0 or step_i == len(waypoints_qpos) - 1:
-            _eef_pos  = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-            _eef_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()  # wxyz
-            _eef_euler = _Rotation.from_quat(np.roll(_eef_quat, -1)).as_euler('xyz', degrees=True)
-            print(
-                f"  [Descent wp {step_i:3d}/{len(waypoints_qpos)-1}] "
-                f"z={_eef_pos[2]:.4f}m  euler={[round(e,2) for e in _eef_euler.tolist()]} deg",
-                flush=True,
-            )
-
-    final_pos = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    print(
-        f"[Descent] Done. EEF pos after descent: {final_pos.tolist()}  "
-        f"(residual from target: {np.linalg.norm(final_pos - final_grasp_pos):.4f} m)",
-        flush=True,
+# ── placeholder so the removed function name errors quickly if called ─────────
+def _descend_to_grasp(*_args, **_kwargs):
+    raise RuntimeError(
+        "_descend_to_grasp has been removed. "
+        "GraspGen grasps are now placed on the object directly; no descent step is needed."
     )
 
 
@@ -2073,102 +1957,24 @@ def _execute_pick_and_place(
     final_grasp_quat = np.asarray(CURRENT_RERUN_DATA["final_grasp_quat"], dtype=np.float32)  # wxyz
     gripper_open_val = float(getattr(args, "gripper_open", 0.0))
 
-    # ── Pre-descent diagnostic ────────────────────────────────────────────────
+    # ── Phase 1a diagnostic: DP3 has driven to the grasp pose ────────────────
+    # GraspGen now predicts grasps ON the object itself (no offset/standoff),
+    # so Phase 1b (ScrewPlanner Cartesian descent) has been removed entirely.
+    # DP3 steers directly to the grasp position; we close the gripper immediately.
     current_pos  = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
     current_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy()  # wxyz
     current_euler = Rotation.from_quat(np.roll(current_quat, -1)).as_euler('xyz', degrees=True)
     current_qpos  = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
 
     print(
-        f"\n--- [Phase 1a] DP3 Reached Pre-Grasp Pose ---\n"
+        f"\n--- [Phase 1a] DP3 Reached Grasp Pose (GraspGen contact on object) ---\n"
         f"  EEF pos   : {current_pos.tolist()}\n"
         f"  EEF euler : {current_euler.tolist()} deg\n"
-        f"  joints    : {current_qpos.tolist()}",
+        f"  joints    : {current_qpos.tolist()}\n"
+        f"  grasp target (GraspGen): {final_grasp_pos.tolist()}\n"
+        f"  residual from target   : {np.linalg.norm(current_pos - final_grasp_pos):.4f} m",
         flush=True,
     )
-
-    # ── Phase 1b: Cartesian descent to the grasp contact pose ────────────────
-    print("\n--- [Phase 1b] Cartesian Descent to Grasp Contact Pose ---", flush=True)
-
-    # ── Compute descent target ────────────────────────────────────────────────
-    # Use the actual grasp pose (final_grasp_pos, already corrected to the
-    # real fingertip/contact position) directly for XY and Z.
-    #
-    # CHANGED: this used to keep the arm's CURRENT XY (only using GraspGen's Z)
-    # because the grasp XY position couldn't be trusted. Now it can be, so we
-    # descend straight to the actual grasp XY too, not wherever Phase 1a
-    # happened to land. z_extra_margin remains a small literal safety
-    # clearance above the surface (not a bug-compensation offset) — it's
-    # fine to leave at its default, or set to 0.0 if you want to land exactly
-    # on the computed contact Z.
-    z_extra_margin = float(getattr(args, "mplib_descent_z_margin", 0.01))
-    contact_z = float(final_grasp_pos[2])
-    target_z  = max(contact_z + z_extra_margin, 0.01)
-
-    manual_descent_target = final_grasp_pos.copy()
-    manual_descent_target[2] = target_z
-
-    descent_dist = current_pos[2] - target_z
-    print(
-        f"[Descent] Target = grasp XY {final_grasp_pos[:2].tolist()}, "
-        f"Z = GraspGen contact ({contact_z:.4f}m) + margin ({z_extra_margin:.3f}m) = {target_z:.4f}m  "
-        f"(descending {descent_dist:.4f}m from current Z={current_pos[2]:.4f}m)",
-        flush=True,
-    )
-
-    current_euler_graspgen = Rotation.from_quat(np.roll(final_grasp_quat, -1)).as_euler('xyz', degrees=True)
-
-    # ── Build a TOP-DOWN + correct wrist quaternion ───────────────────────────
-    # GraspGen's quaternion encodes a full 6-DoF grasp orientation which may
-    # assume a SIDE approach (approach axis ≠ world -Z). If we blindly feed that
-    # quaternion to a straight-down descent, mplib rotates the wrist far past the
-    # correct finger alignment, giving the worst possible grasp orientation.
-    #
-    # What we actually want for a top-down descent is:
-    #   • Gripper pointing STRAIGHT DOWN  → approach = world [0, 0, -1]
-    #   • Fingers spread along the correct direction in the XY plane
-    #
-    # The finger-spread axis is column 0 (X-axis) of GraspGen's rotation matrix.
-    # Project it onto the XY plane to get the wrist yaw angle, then build a
-    # clean top-down quaternion with just that yaw.
-    graspgen_rot = Rotation.from_quat(np.roll(final_grasp_quat, -1))  # xyzw
-    graspgen_mat = graspgen_rot.as_matrix()  # (3,3)
-    # Column 0 = GraspGen's finger-spread (baseline) axis in world frame
-    finger_spread_world = graspgen_mat[:, 0]
-    wrist_yaw = float(np.arctan2(finger_spread_world[1], finger_spread_world[0]))
-    # Top-down = 180° X flip (gripper tip faces -Z), then wrist yaw on Z
-    topdown_quat_wxyz = (
-        Rotation.from_euler('z', wrist_yaw) *
-        Rotation.from_euler('x', np.pi)
-    ).as_quat()  # xyzw → convert to wxyz
-    topdown_quat_wxyz = np.roll(topdown_quat_wxyz, 1).astype(np.float32)  # wxyz
-
-    topdown_euler = Rotation.from_quat(np.roll(topdown_quat_wxyz, -1)).as_euler('xyz', degrees=True)
-    print(
-        f"[Descent] Gripper orientation:\n"
-        f"  DP3 end         : {current_euler.tolist()} deg\n"
-        f"  GraspGen raw    : {current_euler_graspgen.tolist()} deg\n"
-        f"  Finger-spread XY: [{np.degrees(wrist_yaw):.1f}°]  →  top-down target: {topdown_euler.tolist()} deg",
-        flush=True,
-    )
-    _descend_to_grasp(
-        sim_env,
-        video_env,
-        frames,
-        timeline,
-        final_grasp_pos=manual_descent_target,
-        final_grasp_quat_wxyz=topdown_quat_wxyz,   # ← top-down + correct wrist yaw
-        gripper_open=gripper_open_val,
-        crop_config=crop_config,
-        render_video_frame_fn=_render_video_frame,
-    )
-
-    # ── Post-descent diagnostic ────────────────────────────────────────────────
-    current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-    current_pos  = sim_env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-    current_euler = Rotation.from_quat(
-        np.roll(sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy(), -1)
-    ).as_euler('xyz', degrees=True)
 
     print(
         f"\n--- [Phase 1c] Closing Gripper ---\n"
