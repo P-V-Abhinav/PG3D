@@ -1092,76 +1092,37 @@ def _build_graspgen_constraint(
             "gripper_name": gripper_name,
         }
 
-    # --- 8. Apply Z-offset: wrist frame (GraspGen's SE(3) origin) -> fingertip ---
-    # CORRECTED: was defaulting to 0.0, which is wrong — see module docstring's
-    # "Z-offset" section. GraspGen's own control-point geometry for
-    # robotiq_2f_140 places the SE(3) origin 0.195m behind the fingertips
-    # along the local approach (+Z) axis. --graspgen-z-offset now defaults to
-    # -0.195 (see _apply_z_offset's sign convention docstring). If you use a
-    # different --graspgen-config/gripper, re-derive this number from
-    # grasp_gen.utils.viser_utils.load_control_points_for_visualization(gripper_name)
-    # instead of assuming -0.195 carries over.
-    z_offset = float(getattr(args, "graspgen_z_offset", -0.195))
-    adjusted = _apply_z_offset(best_grasp, z_offset)
-    adj_pos  = adjusted[:3, 3]
-    adj_rot  = adjusted[:3, :3]
+    # --- 8. Grasp pose: use the raw GraspGen output directly ---
+    # GraspGen now predicts grasps ON the object itself, so no z-offset
+    # (wrist→fingertip correction) or approach-offset (hover standoff) is
+    # needed. The goal marker and CartesianPoseConstraint both target the
+    # raw grasp centroid exactly.
+    adj_pos  = best_grasp[:3, 3].astype(np.float32)
+    adj_rot  = best_grasp[:3, :3].astype(np.float32)
     adj_quat = _rot3x3_to_quat_wxyz(adj_rot)
 
-    # Store the final grasp pose so _execute_pick_and_place can use it for
-    # the Cartesian descent, regardless of whether --rerun is set.
-    #
-    # CHANGED: previously this mixed object-centroid XY with grasp-contact Z,
-    # because the raw grasp XY position couldn't be trusted (the wrist/
-    # fingertip offset bug — see module docstring). Now that adj_pos is the
-    # actual corrected fingertip/contact position, use it directly for both
-    # XY and Z — no more anchoring to the object centroid as a workaround.
-    final_grasp_pos_for_descent = adj_pos.astype(np.float32)
+    # Store for _execute_pick_and_place / Rerun logging.
     if not hasattr(args, "_graspgen_rerun_data"):
         args._graspgen_rerun_data = {}
     if spec.output_index not in args._graspgen_rerun_data:
         args._graspgen_rerun_data[spec.output_index] = {}
-    args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = final_grasp_pos_for_descent
+    args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = adj_pos
     args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
-    # --- 8b. Create Pre-Grasp / Goal Pose ---
-    # CHANGED: previously this synthesized a "hover above the object centroid"
-    # point using --grasp-approach-offset, because the raw grasp position was
-    # off (a rendering/offset bug — see the module docstring's "Z-offset"
-    # section). Now that _apply_z_offset correctly converts GraspGen's
-    # wrist-frame SE(3) output into the real fingertip/contact pose (adj_pos,
-    # adj_quat), the goal can be placed directly at the selected grasp
-    # prediction. --grasp-approach-offset now defaults to 0.0 (no offset —
-    # goal = adj_pos exactly). If you ever want a small pre-grasp standoff
-    # (e.g. to avoid brushing neighbouring clutter on the way in), a positive
-    # value backs the goal off along the GRASP'S OWN approach axis (adj_rot's
-    # local Z column, world frame) rather than blindly along world Z, so it
-    # still works for non-top-down grasps.
-    approach_offset = float(getattr(args, "grasp_approach_offset", 0.0))
-    approach_axis = adj_rot[:, 2]  # local Z column = approach direction, world frame
-    pregrasp_pos = (adj_pos - approach_axis * approach_offset).astype(np.float32)
-
-    if abs(approach_offset) > 1e-6:
-        print(
-            f"[GraspGen] Episode {spec.output_index}: applying approach offset={approach_offset:.4f}m "
-            f"along the grasp's own approach axis:\n"
-            f"  grasp contact pos = {adj_pos.tolist()}\n"
-            f"  pre-grasp pos     = {pregrasp_pos.tolist()}\n",
-            flush=True,
-        )
-    else:
-        print(
-            f"[GraspGen] Episode {spec.output_index}: no approach offset — "
-            f"goal placed directly at the selected grasp prediction: {pregrasp_pos.tolist()}",
-            flush=True,
-        )
+    # Goal = raw grasp position (no offset).
+    goal_pos = adj_pos
+    print(
+        f"[GraspGen] Episode {spec.output_index}: "
+        f"goal placed at GraspGen centroid: {goal_pos.tolist()}",
+        flush=True,
+    )
 
     # --- 8c. Update Policy Goal Marker (goal_site) ---
-    # The DP3 policy observation includes the goal_site. We must move the goal_site
-    # to the pregrasp_pos so the policy actually steers towards the safe approach
-    # pose rather than the centroid of the object (which would cause collision).
     if hasattr(env.unwrapped, "goal_site"):
-        pos_t = torch.tensor(pregrasp_pos, dtype=torch.float32, device=env.unwrapped.device).unsqueeze(0)
+        pos_t = torch.tensor(goal_pos, dtype=torch.float32, device=env.unwrapped.device).unsqueeze(0)
         env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
+
+    pregrasp_pos = goal_pos  # alias — constraint target = goal_pos
 
     # --- 9. Build CartesianPoseConstraint ---
     pos_tol  = float(getattr(args, "grasp_position_tolerance", 0.02))
