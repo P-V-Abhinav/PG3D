@@ -159,6 +159,9 @@ GRIPPER_OPEN_STEPS = 20
 
 POS_TOLERANCE = 0.015          # metres; servo considered "arrived" below this
 MAX_SERVO_STEPS = 200          # safety cap per servo call so a bad target can't hang forever
+MAX_STEP_DIST = 0.03           # metres/step cap for _servo_to_pose's waypoints -- bounds
+                                # transit velocity/acceleration so a fast reposition move
+                                # can't shake a held object loose (see _servo_to_pose docstring)
 
 
 def _grasp_rotation_matrix(approaching: np.ndarray, closing: np.ndarray) -> np.ndarray:
@@ -290,12 +293,18 @@ class IsolatedXArm7Gripper(BaseAgent):
     # exactly the "gripper teeth vibrating" symptom. Lowering stiffness (and
     # damping proportionally) gives the spring a real proportional band
     # before it saturates, so it settles into a compliant hold instead of
-    # oscillating. force_limit stays modest (max sustained holding force is
-    # unchanged in magnitude) -- only how "hard" the spring is near the
-    # setpoint changes.
+    # oscillating.
+    #
+    # force_limit is also raised here (1.0 -> 3.0): at the new, much lower
+    # stiffness, force_limit/stiffness = 3/400 = 0.0075 rad is still a small,
+    # physically sensible compliance band (nowhere near the old 1e5's
+    # essentially-zero threshold), so this doesn't reintroduce the earlier
+    # relay/bang-bang behavior -- it just gives the grip more absolute margin
+    # against disturbances (transit accelerations, minor residual chatter)
+    # before it saturates at all.
     gripper_stiffness = 400
     gripper_damping = 40
-    gripper_force_limit = 1.0   # overridable via --gripper-force-limit
+    gripper_force_limit = 3.0   # overridable via --gripper-force-limit
     gripper_friction = 1
     # Back off the drive target from the 0.85 rad hard stop so the PD spring
     # and the joint limit never fight over the same boundary point.
@@ -507,19 +516,35 @@ def _servo_to_pose(
     frames: list[np.ndarray],
     max_qvel_tracker: list[float],
 ) -> tuple[bool, float]:
-    """Closed-loop servo of the TCP toward a fixed absolute (position,
-    orientation) target. The action itself is constant every step (this is
-    an absolute, non-delta controller -- see module docstring); repeated
-    stepping is what lets the physically simulated PD/IK dynamics actually
-    converge the arm to that target over multiple substeps.
+    """Closed-loop servo of the TCP toward a fixed (position, orientation)
+    target, in bounded per-step waypoints.
+
+    pd_ee_pose_abs is a non-delta controller, so nothing stops the action
+    from naming a target many centimetres away from the current TCP pose.
+    Naively sending the FINAL target from the very first step (as an earlier
+    version of this function did) meant the IK-solved joint target could be a
+    large jump from the current qpos; with interpolate=False the arm's PD
+    controller then sprints toward it as fast as force_limit allows, which is
+    exactly what produced the ~11 rad/s velocity spikes seen on a real run --
+    and a high-acceleration transit is enough to shake a marginally-held
+    object loose even when the grasp itself is fine (confirmed: the cube
+    survived the lift, then fell specifically during the long, fast
+    transit). Capping each step's waypoint to MAX_STEP_DIST recovers the
+    same bounded-velocity behavior the previous delta-controller version had
+    for free, while still using the exact absolute-pose targeting this
+    version relies on for orientation correctness.
     """
-    action = _pose_action(target_pos_world, target_euler_xyz, gripper_val)
+    target_pos_world = np.asarray(target_pos_world, dtype=np.float32)
     dist = float("inf")
     for _ in range(max_steps):
         tcp_p = env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-        dist = float(np.linalg.norm(np.asarray(target_pos_world, dtype=np.float32) - tcp_p))
+        err = target_pos_world - tcp_p
+        dist = float(np.linalg.norm(err))
         if dist < pos_tol:
             return True, dist
+        step_vec = err if dist <= MAX_STEP_DIST else err / dist * MAX_STEP_DIST
+        waypoint = tcp_p + step_vec
+        action = _pose_action(waypoint, target_euler_xyz, gripper_val)
         env.step(action)
         frames.append(_to_numpy_frame(env.render()))
         qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
@@ -656,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     import gymnasium as gym
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gripper-force-limit", type=float, default=1.0)
+    parser.add_argument("--gripper-force-limit", type=float, default=IsolatedXArm7Gripper.gripper_force_limit)
     parser.add_argument("--gripper-close-steps", type=int, default=GRIPPER_CLOSE_STEPS)
     parser.add_argument("--gripper-open-steps", type=int, default=GRIPPER_OPEN_STEPS)
     parser.add_argument("--gripper-stall-qvel-thresh", type=float, default=0.05)
