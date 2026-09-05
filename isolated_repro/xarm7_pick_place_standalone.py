@@ -542,6 +542,66 @@ class IsolatedXArm7GripperMotionPlanningSolver(BaseMotionPlanningSolver):
             self.elapsed_steps += 1
             self._capture()
 
+    def close_ramped_until_stall(
+        self,
+        *,
+        max_q: float,
+        ramp_steps: int,
+        settle_steps: int = 5,
+        qvel_stall_thresh: float = 0.05,
+        stall_patience: int = 3,
+    ) -> float:
+        """Size-agnostic close: ramp the gripper target toward `max_q` (fully
+        closed) a little per control step, and stop advancing it the moment
+        the drive joint stalls against the object -- then hold there.
+
+        This is the opt-in alternative to the reference's fixed
+        GRIPPER_CLOSED_Q=0.55 snap, which only works because that cube's
+        width is known in advance. Here nothing needs to know the object's
+        size: whatever stops the fingers defines the grasp. It is also the
+        closer analogue of what real gripper firmware does (drive toward
+        closed at a bounded speed, stall out on the object at a current
+        limit), so the sim's close duration and final finger opening are
+        both physically meaningful rather than instantaneous.
+
+        Returns the held target -- pass it as the gripper value for every
+        later step so nothing re-commands a deeper close.
+        """
+        drive = self.robot.active_joints_map["drive_joint"]
+        qpos = self.robot.get_qpos().cpu().numpy()[0][:7]
+        step_size = max_q / max(ramp_steps, 1)
+        target = float(self.gripper_state)
+        stalled = 0
+        contact_step = None
+
+        for i in range(1, ramp_steps + 1):
+            if abs(float(drive.qvel[0])) < qvel_stall_thresh and (target - float(drive.qpos[0])) > 0.02:
+                stalled += 1
+            else:
+                stalled = 0
+            if stalled >= stall_patience:
+                contact_step = i
+                break
+            target = min(max_q, target + step_size)
+            self.gripper_state = target
+            self.env.step(np.hstack([qpos, target]).astype(np.float32))
+            self.elapsed_steps += 1
+            self._capture()
+
+        for _ in range(settle_steps):
+            self.env.step(np.hstack([qpos, target]).astype(np.float32))
+            self.elapsed_steps += 1
+            self._capture()
+
+        if contact_step is not None:
+            print(f"    [gripper] stalled on object at ramp step {contact_step}: "
+                  f"drive_q={float(drive.qpos[0]):.4f}, target frozen at {target:.4f}")
+        else:
+            print(f"    [gripper] ramp finished with no stall (target {target:.4f}) -- "
+                  f"nothing between the fingers, or thresholds need tuning")
+        self.gripper_state = target
+        return target
+
 
 # ===========================================================================
 # 4. Pick cycle -- waypoints/phases copied from
@@ -599,6 +659,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gripper-closed-q", type=float, default=GRIPPER_CLOSED_Q)
     parser.add_argument("--close-hold-steps", type=int, default=CLOSE_HOLD_STEPS)
+    parser.add_argument("--close-mode", choices=["snap", "ramp"], default="snap",
+                        help="'snap' = the reference's fixed-target close (needs the object "
+                             "width known in advance); 'ramp' = size-agnostic, ramps toward "
+                             "fully closed and freezes on stall")
+    parser.add_argument("--close-ramp-steps", type=int, default=20,
+                        help="--close-mode ramp: control steps over which to drive the gripper "
+                             "shut (at 20Hz control, 20 steps = 1.0s, close to a real xArm "
+                             "gripper's closing time)")
+    parser.add_argument("--close-max-q", type=float, default=0.85,
+                        help="--close-mode ramp: fully-closed target the ramp drives toward; the "
+                             "object, not this number, decides where it actually stops")
     parser.add_argument("--open-hold-steps", type=int, default=OPEN_HOLD_STEPS)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--video-out", type=str, default="./isolated_repro_output.mp4")
@@ -659,8 +730,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _log(env, "post-descend")
 
-    print(f"\n--- close (hold {args.close_hold_steps} steps at q={args.gripper_closed_q}) ---")
-    planner.hold(args.close_hold_steps, args.gripper_closed_q)
+    if args.close_mode == "ramp":
+        print(f"\n--- close (size-agnostic ramp, <= {args.close_ramp_steps} steps toward q={args.close_max_q}) ---")
+        held_q = planner.close_ramped_until_stall(
+            max_q=args.close_max_q, ramp_steps=args.close_ramp_steps
+        )
+    else:
+        print(f"\n--- close (hold {args.close_hold_steps} steps at q={args.gripper_closed_q}) ---")
+        planner.hold(args.close_hold_steps, args.gripper_closed_q)
+        held_q = args.gripper_closed_q
     _log(env, "post-close")
 
     print("\n--- lift ---")
