@@ -440,6 +440,96 @@ def _ramp_gripper(
         max_qvel_tracker[0] = max(max_qvel_tracker[0], float(np.max(np.abs(qvel))))
 
 
+def _close_gripper_until_contact(
+    env: Any,
+    *,
+    target_val: float,
+    max_ramp_steps: int,
+    frames: list[np.ndarray],
+    max_qvel_tracker: list[float],
+    qvel_stall_thresh: float = 0.05,
+    stall_patience: int = 5,
+    settle_steps: int = 5,
+) -> float:
+    """Ramp the gripper's drive_joint target toward `target_val`, but STOP
+    advancing it as soon as the joint stalls against something (qvel near
+    zero for `stall_patience` consecutive steps while a real position gap to
+    the commanded target still remains), then hold the target frozen there.
+
+    This is the fix for "the cube flies off": the previous version always
+    ramped all the way to a fixed, fully-closed target regardless of what
+    actually stopped the fingers. Once the object blocks them, qpos stops
+    advancing but the commanded target kept climbing anyway, so the PD
+    spring kept being driven with an ever-growing, never-satisfied position
+    error against a rigid contact every single step for the rest of the
+    episode -- a continuous, unrelieved compressive load that (with a stiff
+    1e5 spring) is exactly the kind of thing that eventually pops/launches a
+    rigid-body contact in a physics sim. Freezing the target at first
+    contact means the PD controller only ever supplies enough restoring
+    force to hold that position (i.e. resist the object trying to escape),
+    not force trying to close through it.
+
+    Uses the drive_joint's own qpos/qvel (looked up by name via
+    active_joints_map, not a positional index into the flat qpos vector --
+    robust regardless of how mani_skill orders DOFs for this articulation).
+
+    Returns the held target value (float) -- pass this as `gripper_val` for
+    every subsequent action instead of `target_val`, so nothing re-commands
+    a deeper close later.
+    """
+    drive_joint = env.unwrapped.agent.robot.active_joints_map["drive_joint"]
+    step_size = target_val / max_ramp_steps
+    current_target = 0.0
+    stall_count = 0
+    contact_step = None
+
+    for i in range(1, max_ramp_steps + 1):
+        drive_qpos = float(drive_joint.qpos[0])
+        drive_qvel = float(drive_joint.qvel[0])
+
+        # Stalled: barely moving, but we're still asking it to close further
+        # than it actually is -- i.e. blocked by the object, not just arrived.
+        if abs(drive_qvel) < qvel_stall_thresh and (current_target - drive_qpos) > 0.02:
+            stall_count += 1
+        else:
+            stall_count = 0
+
+        if stall_count >= stall_patience:
+            contact_step = i
+            break
+
+        current_target = min(target_val, current_target + step_size)
+        action = np.array([0.0, 0.0, 0.0, current_target], dtype=np.float32)
+        env.step(action)
+        frames.append(_to_numpy_frame(env.render()))
+        qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
+        max_qvel_tracker[0] = max(max_qvel_tracker[0], float(np.max(np.abs(qvel))))
+
+    if contact_step is not None:
+        print(
+            f"    [gripper] contact stall detected at ramp step {contact_step}: "
+            f"drive_qpos={float(drive_joint.qpos[0]):.4f}  "
+            f"held target={current_target:.4f}  (commanded {target_val:.4f})"
+        )
+    else:
+        print(
+            f"    [gripper] ramp completed with no contact stall detected -- "
+            f"either the cube wasn't between the fingers, or stall_thresh/patience "
+            f"need tuning. held target={current_target:.4f} (commanded {target_val:.4f})"
+        )
+
+    # A few extra steps at the frozen target so the sim settles before the
+    # caller moves the arm again.
+    for _ in range(settle_steps):
+        action = np.array([0.0, 0.0, 0.0, current_target], dtype=np.float32)
+        env.step(action)
+        frames.append(_to_numpy_frame(env.render()))
+        qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
+        max_qvel_tracker[0] = max(max_qvel_tracker[0], float(np.max(np.abs(qvel))))
+
+    return current_target
+
+
 def _save_video(frames: list[np.ndarray], path: str) -> None:
     if not frames:
         print("[warn] no frames recorded, nothing to save.")
@@ -467,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gripper-force-limit", type=float, default=1.0)
     parser.add_argument("--gripper-close-steps", type=int, default=GRIPPER_CLOSE_STEPS)
     parser.add_argument("--gripper-open-steps", type=int, default=GRIPPER_OPEN_STEPS)
+    parser.add_argument("--gripper-stall-qvel-thresh", type=float, default=0.05)
+    parser.add_argument("--gripper-stall-patience", type=int, default=5)
     parser.add_argument("--max-servo-steps", type=int, default=MAX_SERVO_STEPS)
     parser.add_argument("--pos-tol", type=float, default=POS_TOLERANCE)
     parser.add_argument("--seed", type=int, default=0)
@@ -517,10 +609,13 @@ def main(argv: list[str] | None = None) -> int:
     _log_state(env, "post-descend")
     transit_max_qvel = max_qvel_tracker[0]
 
-    print(f"\n--- [phase 3] ramped close over {args.gripper_close_steps} steps (arm frozen) ---")
-    _ramp_gripper(
-        env, from_val=IsolatedXArm7Gripper._GRIPPER_OPEN, to_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
-        steps=args.gripper_close_steps, frames=frames, max_qvel_tracker=max_qvel_tracker,
+    print(f"\n--- [phase 3] close until contact (stall-detected, arm frozen) ---")
+    held_closed_val = _close_gripper_until_contact(
+        env, target_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
+        max_ramp_steps=args.gripper_close_steps,
+        frames=frames, max_qvel_tracker=max_qvel_tracker,
+        qvel_stall_thresh=args.gripper_stall_qvel_thresh,
+        stall_patience=args.gripper_stall_patience,
     )
     close_jolt_qvel = max_qvel_tracker[0]
     print(f"  max|qvel| during close = {close_jolt_qvel:.3f} rad/s (compare to transit's {transit_max_qvel:.3f})")
@@ -528,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n--- [phase 4] lift ---")
     ok, dist = _servo_to_position(
-        env, lift, gripper_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
+        env, lift, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -536,9 +631,9 @@ def main(argv: list[str] | None = None) -> int:
     _log_state(env, "post-lift")
     lift_cube_z = env.unwrapped.cube.pose.p[0, 2].item()
 
-    print("\n--- [phase 5] transit to place location (gripper held closed) ---")
+    print("\n--- [phase 5] transit to place location (gripper held at contact target) ---")
     ok, dist = _servo_to_position(
-        env, place_hover, gripper_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
+        env, place_hover, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -552,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\n--- [phase 6] descend to place height ---")
     ok, dist = _servo_to_position(
-        env, place_down, gripper_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
+        env, place_down, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -561,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n--- [phase 7] ramped release over {args.gripper_open_steps} steps (arm frozen) ---")
     _ramp_gripper(
-        env, from_val=IsolatedXArm7Gripper._GRIPPER_CLOSED, to_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
+        env, from_val=held_closed_val, to_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
         steps=args.gripper_open_steps, frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
     _log_state(env, "post-release")
