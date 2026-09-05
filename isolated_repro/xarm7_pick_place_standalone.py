@@ -113,19 +113,52 @@ MAX_SERVO_STEPS = 200          # safety cap per servo call so a bad target can't
 # 1. Agent -- xArm7 + parallel-jaw gripper, defined from scratch in this file.
 # ===========================================================================
 
-# The ManiSkill-bundled xArm7+gripper URDF, resolved next to the actual
-# meshes/ directory on this server (not a Python import -- just an on-disk
-# asset path). Using the raw bundled URDF directly here (rather than the
-# committed pg3d/envs/xarm_adapter/assets/xarm7_with_gripper_colored.urdf)
-# sidesteps that file's `meshes` symlink, which is committed pointing at a
-# different machine's venv path and would be broken on this server; pointing
-# straight at the URDF that already lives beside the real meshes/ folder
-# needs no symlink at all. The color tags that colored copy adds are purely
-# cosmetic (render material only), not physics, so nothing is lost.
+# xArm7+gripper URDF resolution.
+#
+# The raw ManiSkill-bundled xarm7_with_gripper.urdf is NOT actually present
+# on this server (only its meshes/ directory is -- the URDF itself is gated
+# behind ManiSkill's interactive asset-download prompt, confirmed by
+# running this script). And the git-committed
+# pg3d/envs/xarm_adapter/assets/xarm7_with_gripper_colored.urdf *is* present,
+# but its own `meshes` symlink is committed pointing at a different
+# machine's venv path, so it's broken here too.
+#
+# Fix: read that committed URDF's TEXT (a plain file read, not a Python
+# import -- no code from agents.py is executed) and rewrite every relative
+# "meshes/..." reference to an absolute path under the real meshes/
+# directory on this server, then write the patched copy next to this
+# script. This needs no symlink and no asset download. The color tags the
+# committed copy adds are purely cosmetic (render material only, not
+# physics), so reusing it changes nothing physically.
 _XARM7_GRIPPER_MESHES_DIR = Path(
     "/home/cross-emb/abhinav.pv/success/.venv/lib/python3.10/site-packages/mani_skill/assets/robots/xarm7/meshes"
 )
-_XARM7_GRIPPER_URDF = str(_XARM7_GRIPPER_MESHES_DIR.parent / "xarm7_with_gripper.urdf")
+
+
+def _resolve_gripper_urdf() -> str:
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "pg3d" / "envs" / "xarm_adapter" / "assets" / "xarm7_with_gripper_colored.urdf"
+    )
+    if not src.exists():
+        raise FileNotFoundError(
+            f"expected the committed URDF at {src}. If this checkout doesn't have it, "
+            "point _resolve_gripper_urdf() at some other xarm7-with-gripper URDF you do have."
+        )
+    if not _XARM7_GRIPPER_MESHES_DIR.is_dir():
+        raise FileNotFoundError(
+            f"_XARM7_GRIPPER_MESHES_DIR does not exist: {_XARM7_GRIPPER_MESHES_DIR}"
+        )
+    text = src.read_text()
+    patched = text.replace('filename="meshes/', f'filename="{_XARM7_GRIPPER_MESHES_DIR}/')
+    if patched == text:
+        raise RuntimeError(f"no 'meshes/...' mesh references found in {src} -- unexpected URDF format.")
+    dst = Path(__file__).resolve().parent / "_generated_xarm7_with_gripper.urdf"
+    dst.write_text(patched)
+    return str(dst)
+
+
+_XARM7_GRIPPER_URDF = _resolve_gripper_urdf()
 
 
 @register_agent()
