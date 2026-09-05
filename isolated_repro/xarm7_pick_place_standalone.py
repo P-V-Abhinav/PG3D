@@ -1,64 +1,105 @@
-"""Standalone, from-scratch xArm7-gripper pick-and-place repro.
+"""Standalone, from-scratch xArm7-gripper pick-and-place repro (v2 -- grasp
+pose rewritten from ManiSkill's own documented grasp-pose convention).
 
 Deliberately NOT wired into the rest of this repo: it does not import
 anything from ``pg3d/``, ``scripts/``, or ``dataset_generation/``. The agent
 (xArm7 + parallel-jaw gripper), the environment (table + one cube), and the
-scripted pick-and-place controller are all defined in this single file, so it
-can be debugged completely independently of the DP3 policy / motion planner /
-reranking machinery used elsewhere. The only imports are third-party
-(mani_skill, sapien, torch, numpy) plus the Python standard library.
+scripted pick-and-place controller are all defined in this single file. The
+only imports are third-party (mani_skill, sapien, torch, numpy) plus the
+Python standard library.
+
+WHY THIS VERSION IS A FROM-SCRATCH REWRITE OF THE GRASP LOGIC
+================================================================
+The previous version servoed the TCP to a position directly above the cube
+but never controlled ORIENTATION -- it just left the gripper at whatever
+rotation the "rest" keyframe happened to produce, flagged as an unverified
+assumption. Running it showed the actual consequence: the gripper closed
+"successfully" (ramp completed with no stall) but the cube was kicked ~6cm
+sideways during the close and the arm itself got shoved ~4cm off target --
+i.e. the fingers were not actually straddling the cube symmetrically, so
+closing swiped/flicked it instead of trapping it. Bad orientation, not gripper
+force, was the real cause of that failure.
+
+This version fixes that at the root by computing a real, geometrically
+correct grasp orientation instead of leaving it uncontrolled, using the exact
+same convention ManiSkill's own official scripted solutions use (see
+mani_skill.examples.motionplanning.xarm6.solutions.pick_cube -- read locally
+on this machine for reference, not imported by this script):
+
+  1. Pick a world-frame `approaching` axis (the direction the gripper's TCP
+     frame should point *into* the object -- [0, 0, -1] for a straight
+     top-down grasp) and a `closing` axis (the world direction along which
+     the two fingers should straddle the object -- for a cube, any axis
+     orthogonal to `approaching` works, since a cube's cross-section is
+     identical from every side; ManiSkill's own reference solution instead
+     derives this from the object's oriented bounding box, which matters for
+     non-cube objects but is unnecessary complexity here).
+  2. Build a target rotation matrix R = [ortho, closing, approaching] as
+     columns, where ortho = closing x approaching. This is IDENTICAL to the
+     `build_grasp_pose` staticmethod defined on every ManiSkill two-finger
+     gripper agent (Panda, xarm6_robotiq, Fetch, SO-100 all use this exact
+     formula) -- reimplemented here as plain numpy (see
+     `_grasp_rotation_matrix` below) rather than imported, since this file
+     imports no code from any existing agent class.
+  3. Verify this convention actually matches *this* gripper's `link_tcp`
+     frame by reading the raw URDF geometry (not assuming it): `link_tcp` is
+     a fixed child of `xarm_gripper_base_link` with zero rotation offset
+     (origin rpy="0 0 0"), so it shares that link's axes exactly. The
+     drive_joint/right_outer_knuckle_joint origins place the left finger
+     assembly at +Y and the right at -Y of that frame, both rotating about
+     local X -- i.e. the fingers separate along local Y ("closing" = local Y)
+     and extend outward along local Z ("approaching" = local Z), which is
+     exactly the column order in the R above. So this convention is
+     confirmed correct for this specific gripper, not assumed by analogy.
+
+Given a correct (position, orientation) grasp pose, the servo now drives the
+TCP there using `pd_ee_pose_abs` -- a PDEEPoseController configured with
+`use_delta=False, normalize_action=False`. This was deliberately chosen over
+the delta-controller used previously: with `normalize_action=False` the
+action IS the literal absolute target ([x, y, z, roll, pitch, yaw] in the
+robot's root frame, root frame = world frame here since ROBOT_BASE_POSE has
+no rotation) with no [-1, 1] rescaling, and no delta/frame-composition
+semantics to get subtly wrong. The one piece that still had to be gotten
+exactly right -- which Euler convention `action[3:6]` is decoded with -- is
+resolved exactly (not approximated) by using mani_skill's own
+`matrix_to_euler_angles(..., "XYZ")`, the documented, exact inverse of the
+`euler_angles_to_matrix(..., "XYZ")` this controller decodes the action with
+(both in mani_skill.utils.geometry.rotation_conversions -- a mani_skill
+library module, not a copy of any file in this repo).
 
 Scene: one table (ManiSkill's stock TableSceneBuilder), one xArm7 + xArm
-parallel gripper, one cube. Nothing else — no goal markers, no cameras beyond
-one render camera, no obstacles.
+parallel gripper, one cube. Nothing else.
 
-Scripted flow (closed-loop Cartesian position servoing, not a learned
-policy):
+Scripted flow (closed-loop 6-DoF Cartesian pose servoing, not a learned
+policy) -- the grasp orientation computed once above is held fixed for the
+whole episode, only the target position changes between phases:
   1. reset            -> arm at its keyframe rest pose, gripper open, cube on the table.
-  2. transit          -> servo XY+Z to a hover pose above the cube.
-  3. descend          -> servo straight down to the cube's height.
-  4. close (ramped)   -> arm target frozen; gripper target ramped open->closed
-                         over N steps. This is the fix for the "arm jolts
-                         during transit" failure: closing is never issued as
-                         a single large instantaneous target jump, and it
-                         never overlaps with arm motion.
+  2. transit          -> servo to a hover pose above the cube (grasp orientation).
+  3. descend          -> servo straight down to the cube's height (same orientation).
+  4. close-until-stall-> arm target frozen at the grasp pose; gripper target
+                         ramped open->closed, but the ramp stops the moment the
+                         drive joint stalls against the object (near-zero qvel
+                         while still short of the ramp's current target) --
+                         freezing there means the PD controller only ever
+                         supplies a *holding* force afterwards, not a
+                         continuously growing command to close through a
+                         rigid object it physically can't reach.
   5. lift + transit   -> servo to a place location elsewhere on the table,
-                         gripper action held at the closed target throughout.
+                         gripper action held at the frozen contact target.
   6. descend          -> servo down to place height.
-  7. open (ramped)    -> arm target frozen; gripper target ramped closed->open.
+  7. open (ramped)    -> arm target frozen; gripper ramped closed->open.
   8. retreat          -> lift back up.
 
-Two known physics fixes are baked into the agent config below (both found by
-inspecting this project's actual custom xArm7Gripper agent and its git-log
-comments, then re-derived independently here):
-  * gripper_force_limit is kept low (1.0 by default, overridable via
-    --gripper-force-limit) and the close/open transitions are always ramped
-    with the arm frozen -- driving the mimic gripper's target from fully
-    open to fully closed in a single step, especially at a high force_limit,
-    slams the four-bar linkage shut on empty air and kicks the whole arm.
-  * the finger links (`left_finger`/`right_finger`) are given an explicit
-    high-friction contact material. The ManiSkill-bundled
-    xarm7_with_gripper.urdf sets NO surface friction on these links (only
-    joint friction, which is irrelevant to grip), so they silently fell back
-    to SAPIEN's low default material -- meaning no amount of clamp force
-    could retain a held object once the arm started moving. This is the
-    actual cause of "even a perfect cube slips out during transport".
-
-ASSUMPTIONS THIS SCRIPT COULD NOT VERIFY WITHOUT RUNNING IT (no sim
-dependencies are installed on this machine -- run on the server and check the
-printed diagnostics + saved video against these):
+ASSUMPTIONS THIS SCRIPT COULD NOT VERIFY WITHOUT RUNNING IT:
   * TableSceneBuilder's table top is assumed to sit at world z=0 (standard
     ManiSkill convention). CUBE_SPAWN_Z is set relative to that.
   * CUBE_SPAWN_XY / PLACE_XY are guesses at in-workspace points given
     ROBOT_BASE_POSE=(-0.615, 0, 0) (same base pose this repo's other xArm7
     envs use) -- adjust if the arm can't reach either point.
-  * The gripper's approach orientation is NOT actively controlled -- it is
-    whatever the "rest" keyframe naturally produces at agent.tcp_pose, held
-    fixed for the whole episode (pd_ee_delta_pos never touches orientation,
-    by construction -- see PDEEPosController.compute_target_pose). If the
-    rendered video shows the gripper approaching the cube from a bad angle
-    (not roughly top-down), that's the thing to fix next -- see the
-    --tilt-down-deg flag for a quick interactive fix.
+  * The gripper's own contact-friction/force config (kept from the previous
+    version -- these were separately validated against the "cube slips
+    during transport" and "arm jolts during close" failures, which are
+    independent of the orientation bug this rewrite targets).
 
 Run on the server, e.g.:
     python isolated_repro/xarm7_pick_place_standalone.py \\
@@ -80,13 +121,14 @@ from mani_skill.agents.registration import register_agent
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
+from mani_skill.utils.geometry.rotation_conversions import matrix_to_euler_angles
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 
 # ===========================================================================
 # Tunable constants -- everything spatial lives here so it's easy to adjust
-# after watching the first run's video, without hunting through the file.
+# after watching a run's video, without hunting through the file.
 # ===========================================================================
 
 ROBOT_BASE_POSE = sapien.Pose(p=[-0.615, 0.0, 0.0])  # same base pose as this repo's other xArm7 envs
@@ -97,16 +139,55 @@ CUBE_SPAWN_Z = CUBE_HALF_SIZE + 0.002   # ASSUMES table top at world z=0
 
 PLACE_XY = (-0.25, 0.2)        # world-frame XY for the place location
 
+# Grasp axes (world frame) -- see module docstring for why these are correct
+# for THIS gripper's link_tcp frame, verified from URDF joint geometry.
+GRASP_APPROACHING = np.array([0.0, 0.0, -1.0])   # straight top-down
+GRASP_CLOSING = np.array([1.0, 0.0, 0.0])        # arbitrary axis orthogonal to
+                                                  # approaching -- fine for a
+                                                  # cube, whose cross-section
+                                                  # is identical from every side
+
 PRE_GRASP_HOVER_HEIGHT = 0.12  # metres above cube center for the hover waypoint
 GRASP_HEIGHT_OFFSET = 0.0      # metres added to cube center Z for the descend target
 LIFT_HEIGHT = 0.15             # metres above grasp height for lift/transit waypoints
 
-GRIPPER_CLOSE_STEPS = 30       # matches the ramp length already validated for this repo's jolt fix
+GRIPPER_CLOSE_STEPS = 30       # max ramp length for the stall-detected close
 GRIPPER_OPEN_STEPS = 20
 
-POS_STEP_LIMIT = 0.05          # metres/step cap for the position servo (must match pos_lower/upper below)
 POS_TOLERANCE = 0.015          # metres; servo considered "arrived" below this
 MAX_SERVO_STEPS = 200          # safety cap per servo call so a bad target can't hang forever
+
+
+def _grasp_rotation_matrix(approaching: np.ndarray, closing: np.ndarray) -> np.ndarray:
+    """Build a target TCP rotation matrix from world-frame approach/closing axes.
+
+    Identical formula to the `build_grasp_pose` staticmethod ManiSkill defines
+    on every one of its two-finger-gripper agent classes (Panda, xarm6_robotiq,
+    Fetch, SO-100) -- reimplemented here as plain numpy rather than imported,
+    since this file imports no code from any existing agent class. Columns of
+    the returned matrix are [ortho, closing, approaching]: local X = ortho
+    (closing x approaching), local Y = closing (finger separation axis),
+    local Z = approaching (the axis pointing from the gripper into the
+    object). See the module docstring for why this column order matches this
+    specific gripper's `link_tcp` frame (verified from its URDF geometry, not
+    assumed by analogy to Panda/xarm6_robotiq).
+    """
+    approaching = approaching / np.linalg.norm(approaching)
+    closing = closing - (approaching @ closing) * approaching  # orthogonalize
+    closing = closing / np.linalg.norm(closing)
+    ortho = np.cross(closing, approaching)
+    return np.stack([ortho, closing, approaching], axis=1)  # (3, 3), columns as above
+
+
+def _rotation_matrix_to_root_euler_xyz(rot_matrix: np.ndarray) -> np.ndarray:
+    """World-frame rotation matrix -> the exact XYZ-Euler triple `pd_ee_pose_abs`
+    expects in action[3:6], using mani_skill's own exact inverse of the
+    matrix<->euler conversion that controller decodes actions with (so this
+    is exact, not an approximation of the controller's convention).
+    """
+    mat = torch.as_tensor(rot_matrix, dtype=torch.float32).unsqueeze(0)
+    euler = matrix_to_euler_angles(mat, "XYZ")[0]
+    return euler.numpy()
 
 
 # ===========================================================================
@@ -117,11 +198,11 @@ MAX_SERVO_STEPS = 200          # safety cap per servo call so a bad target can't
 #
 # The raw ManiSkill-bundled xarm7_with_gripper.urdf is NOT actually present
 # on this server (only its meshes/ directory is -- the URDF itself is gated
-# behind ManiSkill's interactive asset-download prompt, confirmed by
-# running this script). And the git-committed
+# behind ManiSkill's interactive asset-download prompt, confirmed by running
+# this script). And the git-committed
 # pg3d/envs/xarm_adapter/assets/xarm7_with_gripper_colored.urdf *is* present,
-# but its own `meshes` symlink is committed pointing at a different
-# machine's venv path, so it's broken here too.
+# but its own `meshes` symlink is committed pointing at a different machine's
+# venv path, so it's broken here too.
 #
 # Fix: read that committed URDF's TEXT (a plain file read, not a Python
 # import -- no code from agents.py is executed) and rewrite every relative
@@ -178,7 +259,7 @@ class IsolatedXArm7Gripper(BaseAgent):
     ]
     _gripper_mimic = {name: {"joint": "drive_joint"} for name in gripper_joint_names[1:]}
 
-    # --- Friction fix -----------------------------------------------------
+    # --- Friction fix -------------------------------------------------------
     # left_finger/right_finger are the only links that actually touch a held
     # object (the whole finger mesh is the collision geometry -- there's no
     # separate "pad" sub-link). The bundled URDF sets no surface friction on
@@ -196,7 +277,7 @@ class IsolatedXArm7Gripper(BaseAgent):
 
     gripper_stiffness = 1e5
     gripper_damping = 2000
-    gripper_force_limit = 1.0   # overridable via --gripper-force-limit; see module docstring
+    gripper_force_limit = 1.0   # overridable via --gripper-force-limit
     gripper_friction = 1
     # Back off the drive target from the 0.85 rad hard stop so the PD spring
     # and the joint limit never fight over the same boundary point.
@@ -248,22 +329,26 @@ class IsolatedXArm7Gripper(BaseAgent):
 
     @property
     def _controller_configs(self):
-        # Position-only EE control. Deliberately NOT pd_ee_delta_pose: that
-        # controller also needs a target orientation, and this repro doesn't
-        # try to guess link_tcp's local axis convention (see module
-        # docstring). PDEEPosController.compute_target_pose explicitly keeps
-        # the current EE rotation unchanged, so orientation is simply
-        # whatever the rest keyframe produces, frozen for the whole episode.
-        pd_ee_delta_pos = PDEEPosControllerConfig(  # noqa: F405
+        # Absolute 6-DoF EE pose control: use_delta=False + normalize_action=False
+        # means the action IS the literal target [x, y, z, roll, pitch, yaw] in
+        # the robot's root frame (== world frame here, since ROBOT_BASE_POSE has
+        # no rotation) -- no [-1, 1] rescaling, no delta/frame-composition
+        # semantics. See module docstring for why this was chosen over a delta
+        # controller.
+        pd_ee_pose_abs = PDEEPoseControllerConfig(  # noqa: F405
             joint_names=self.arm_joint_names,
-            pos_lower=-POS_STEP_LIMIT,
-            pos_upper=POS_STEP_LIMIT,
+            pos_lower=-2.0,
+            pos_upper=2.0,
+            rot_lower=-2 * np.pi,
+            rot_upper=2 * np.pi,
             stiffness=self.arm_stiffness,
             damping=self.arm_damping,
             force_limit=self.arm_force_limit,
             friction=self.arm_friction,
             ee_link=self.ee_link_name,
             urdf_path=self.urdf_path,
+            use_delta=False,
+            normalize_action=False,
         )
         gripper_pd_joint_pos = PDJointPosMimicControllerConfig(  # noqa: F405
             self.gripper_joint_names,
@@ -277,7 +362,7 @@ class IsolatedXArm7Gripper(BaseAgent):
             normalize_action=False,   # raw target radians, not normalized to [-1, 1]
         )
         return deepcopy_dict(dict(  # noqa: F405
-            pd_ee_delta_pos=dict(arm=pd_ee_delta_pos, gripper=gripper_pd_joint_pos),
+            pd_ee_pose_abs=dict(arm=pd_ee_pose_abs, gripper=gripper_pd_joint_pos),
         ))
 
 
@@ -360,7 +445,7 @@ class IsolatedXArm7PickCubeEnv(BaseEnv):
 
 
 # ===========================================================================
-# 3. Scripted pick-and-place controller (closed-loop Cartesian servoing).
+# 3. Scripted pick-and-place controller (closed-loop 6-DoF pose servoing).
 # ===========================================================================
 
 def _to_numpy_frame(raw: Any) -> np.ndarray:
@@ -382,9 +467,21 @@ def _log_state(env: Any, label: str) -> None:
     )
 
 
-def _servo_to_position(
+def _pose_action(target_pos_world: np.ndarray, target_euler_xyz: np.ndarray, gripper_val: float) -> np.ndarray:
+    """Assemble the 7-dim pd_ee_pose_abs+gripper action: absolute [x,y,z,
+    roll,pitch,yaw] in root frame (== world frame here, ROBOT_BASE_POSE has
+    no rotation) followed by the gripper's raw target radians.
+    """
+    target_pos_root = np.asarray(target_pos_world, dtype=np.float32) - np.asarray(ROBOT_BASE_POSE.p, dtype=np.float32)
+    return np.concatenate(
+        [target_pos_root, np.asarray(target_euler_xyz, dtype=np.float32), [np.float32(gripper_val)]]
+    ).astype(np.float32)
+
+
+def _servo_to_pose(
     env: Any,
     target_pos_world: np.ndarray,
+    target_euler_xyz: np.ndarray,
     *,
     gripper_val: float,
     max_steps: int,
@@ -392,22 +489,19 @@ def _servo_to_position(
     frames: list[np.ndarray],
     max_qvel_tracker: list[float],
 ) -> tuple[bool, float]:
-    """Closed-loop position-only servo of the TCP toward a world-frame target.
-
-    Orientation is left untouched by construction (pd_ee_delta_pos never
-    changes it). Recomputes the error from the actual sim state every step,
-    so this is self-correcting rather than open-loop.
+    """Closed-loop servo of the TCP toward a fixed absolute (position,
+    orientation) target. The action itself is constant every step (this is
+    an absolute, non-delta controller -- see module docstring); repeated
+    stepping is what lets the physically simulated PD/IK dynamics actually
+    converge the arm to that target over multiple substeps.
     """
+    action = _pose_action(target_pos_world, target_euler_xyz, gripper_val)
     dist = float("inf")
     for _ in range(max_steps):
         tcp_p = env.unwrapped.agent.tcp_pose.p[0].cpu().numpy()
-        err = np.asarray(target_pos_world, dtype=np.float32) - tcp_p
-        dist = float(np.linalg.norm(err))
+        dist = float(np.linalg.norm(np.asarray(target_pos_world, dtype=np.float32) - tcp_p))
         if dist < pos_tol:
             return True, dist
-        raw_delta = np.clip(err, -POS_STEP_LIMIT, POS_STEP_LIMIT)
-        norm_delta = raw_delta / POS_STEP_LIMIT  # normalize to [-1, 1] for normalize_action=True
-        action = np.concatenate([norm_delta, [gripper_val]]).astype(np.float32)
         env.step(action)
         frames.append(_to_numpy_frame(env.render()))
         qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
@@ -418,6 +512,8 @@ def _servo_to_position(
 def _ramp_gripper(
     env: Any,
     *,
+    frozen_pos_world: np.ndarray,
+    frozen_euler_xyz: np.ndarray,
     from_val: float,
     to_val: float,
     steps: int,
@@ -425,15 +521,15 @@ def _ramp_gripper(
     max_qvel_tracker: list[float],
 ) -> None:
     """Ramp the gripper's mimic drive target over `steps` control steps while
-    holding the arm's Cartesian target fixed (zero position delta each step).
+    holding the arm's pose target fixed at `frozen_pos_world`/`frozen_euler_xyz`.
 
     This is the jolt fix: the drive target never jumps from open to closed
-    (or back) in a single step, and it's never issued while the arm is also
-    receiving a nonzero motion command.
+    (or back) in a single step, and the arm's own target never changes while
+    the gripper is being ramped.
     """
     for i in range(1, steps + 1):
         val = from_val + (to_val - from_val) * (i / steps)
-        action = np.array([0.0, 0.0, 0.0, val], dtype=np.float32)
+        action = _pose_action(frozen_pos_world, frozen_euler_xyz, val)
         env.step(action)
         frames.append(_to_numpy_frame(env.render()))
         qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
@@ -443,6 +539,8 @@ def _ramp_gripper(
 def _close_gripper_until_contact(
     env: Any,
     *,
+    frozen_pos_world: np.ndarray,
+    frozen_euler_xyz: np.ndarray,
     target_val: float,
     max_ramp_steps: int,
     frames: list[np.ndarray],
@@ -456,26 +554,16 @@ def _close_gripper_until_contact(
     zero for `stall_patience` consecutive steps while a real position gap to
     the commanded target still remains), then hold the target frozen there.
 
-    This is the fix for "the cube flies off": the previous version always
-    ramped all the way to a fixed, fully-closed target regardless of what
-    actually stopped the fingers. Once the object blocks them, qpos stops
-    advancing but the commanded target kept climbing anyway, so the PD
-    spring kept being driven with an ever-growing, never-satisfied position
-    error against a rigid contact every single step for the rest of the
-    episode -- a continuous, unrelieved compressive load that (with a stiff
-    1e5 spring) is exactly the kind of thing that eventually pops/launches a
-    rigid-body contact in a physics sim. Freezing the target at first
-    contact means the PD controller only ever supplies enough restoring
-    force to hold that position (i.e. resist the object trying to escape),
-    not force trying to close through it.
+    Freezing the target at first contact means the PD controller only ever
+    supplies enough restoring force to hold that position afterwards, not a
+    continuously-growing command to close through a rigid object.
 
     Uses the drive_joint's own qpos/qvel (looked up by name via
     active_joints_map, not a positional index into the flat qpos vector --
     robust regardless of how mani_skill orders DOFs for this articulation).
 
     Returns the held target value (float) -- pass this as `gripper_val` for
-    every subsequent action instead of `target_val`, so nothing re-commands
-    a deeper close later.
+    every subsequent action instead of `target_val`.
     """
     drive_joint = env.unwrapped.agent.robot.active_joints_map["drive_joint"]
     step_size = target_val / max_ramp_steps
@@ -487,8 +575,6 @@ def _close_gripper_until_contact(
         drive_qpos = float(drive_joint.qpos[0])
         drive_qvel = float(drive_joint.qvel[0])
 
-        # Stalled: barely moving, but we're still asking it to close further
-        # than it actually is -- i.e. blocked by the object, not just arrived.
         if abs(drive_qvel) < qvel_stall_thresh and (current_target - drive_qpos) > 0.02:
             stall_count += 1
         else:
@@ -499,7 +585,7 @@ def _close_gripper_until_contact(
             break
 
         current_target = min(target_val, current_target + step_size)
-        action = np.array([0.0, 0.0, 0.0, current_target], dtype=np.float32)
+        action = _pose_action(frozen_pos_world, frozen_euler_xyz, current_target)
         env.step(action)
         frames.append(_to_numpy_frame(env.render()))
         qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
@@ -518,10 +604,8 @@ def _close_gripper_until_contact(
             f"need tuning. held target={current_target:.4f} (commanded {target_val:.4f})"
         )
 
-    # A few extra steps at the frozen target so the sim settles before the
-    # caller moves the arm again.
     for _ in range(settle_steps):
-        action = np.array([0.0, 0.0, 0.0, current_target], dtype=np.float32)
+        action = _pose_action(frozen_pos_world, frozen_euler_xyz, current_target)
         env.step(action)
         frames.append(_to_numpy_frame(env.render()))
         qvel = env.unwrapped.agent.robot.get_qvel()[0, :7].cpu().numpy()
@@ -571,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     env = gym.make(
         "Isolated-XArm7-PickCube-v0",
         obs_mode="state",
-        control_mode="pd_ee_delta_pos",
+        control_mode="pd_ee_pose_abs",
         render_mode="rgb_array",
         num_envs=1,
     )
@@ -584,6 +668,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cube spawned at {cube_pos0.tolist()}")
     _log_state(env, "reset")
 
+    # --- Grasp pose: computed once, held fixed for the whole episode -------
+    grasp_rot = _grasp_rotation_matrix(GRASP_APPROACHING, GRASP_CLOSING)
+    grasp_euler = _rotation_matrix_to_root_euler_xyz(grasp_rot)
+    print(
+        f"grasp orientation: approaching={GRASP_APPROACHING.tolist()} "
+        f"closing={GRASP_CLOSING.tolist()} -> euler_xyz={grasp_euler.round(4).tolist()}"
+    )
+
     pregrasp = cube_pos0 + np.array([0.0, 0.0, PRE_GRASP_HOVER_HEIGHT], dtype=np.float32)
     grasp = cube_pos0 + np.array([0.0, 0.0, GRASP_HEIGHT_OFFSET], dtype=np.float32)
     lift = grasp + np.array([0.0, 0.0, LIFT_HEIGHT], dtype=np.float32)
@@ -591,8 +683,8 @@ def main(argv: list[str] | None = None) -> int:
     place_down = np.array([PLACE_XY[0], PLACE_XY[1], grasp[2]], dtype=np.float32)
 
     print("\n--- [phase 1] transit: hover above cube ---")
-    ok, dist = _servo_to_position(
-        env, pregrasp, gripper_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
+    ok, dist = _servo_to_pose(
+        env, pregrasp, grasp_euler, gripper_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -600,8 +692,8 @@ def main(argv: list[str] | None = None) -> int:
     _log_state(env, "post-hover")
 
     print("\n--- [phase 2] descend to cube ---")
-    ok, dist = _servo_to_position(
-        env, grasp, gripper_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
+    ok, dist = _servo_to_pose(
+        env, grasp, grasp_euler, gripper_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -611,7 +703,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n--- [phase 3] close until contact (stall-detected, arm frozen) ---")
     held_closed_val = _close_gripper_until_contact(
-        env, target_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
+        env, frozen_pos_world=grasp, frozen_euler_xyz=grasp_euler,
+        target_val=IsolatedXArm7Gripper._GRIPPER_CLOSED,
         max_ramp_steps=args.gripper_close_steps,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
         qvel_stall_thresh=args.gripper_stall_qvel_thresh,
@@ -622,8 +715,8 @@ def main(argv: list[str] | None = None) -> int:
     _log_state(env, "post-close")
 
     print("\n--- [phase 4] lift ---")
-    ok, dist = _servo_to_position(
-        env, lift, gripper_val=held_closed_val,
+    ok, dist = _servo_to_pose(
+        env, lift, grasp_euler, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -632,8 +725,8 @@ def main(argv: list[str] | None = None) -> int:
     lift_cube_z = env.unwrapped.cube.pose.p[0, 2].item()
 
     print("\n--- [phase 5] transit to place location (gripper held at contact target) ---")
-    ok, dist = _servo_to_position(
-        env, place_hover, gripper_val=held_closed_val,
+    ok, dist = _servo_to_pose(
+        env, place_hover, grasp_euler, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -646,8 +739,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print("\n--- [phase 6] descend to place height ---")
-    ok, dist = _servo_to_position(
-        env, place_down, gripper_val=held_closed_val,
+    ok, dist = _servo_to_pose(
+        env, place_down, grasp_euler, gripper_val=held_closed_val,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
@@ -656,14 +749,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n--- [phase 7] ramped release over {args.gripper_open_steps} steps (arm frozen) ---")
     _ramp_gripper(
-        env, from_val=held_closed_val, to_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
+        env, frozen_pos_world=place_down, frozen_euler_xyz=grasp_euler,
+        from_val=held_closed_val, to_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
         steps=args.gripper_open_steps, frames=frames, max_qvel_tracker=max_qvel_tracker,
     )
     _log_state(env, "post-release")
 
     print("\n--- [phase 8] retreat ---")
-    _servo_to_position(
-        env, place_down + np.array([0.0, 0.0, LIFT_HEIGHT], dtype=np.float32),
+    _servo_to_pose(
+        env, place_down + np.array([0.0, 0.0, LIFT_HEIGHT], dtype=np.float32), grasp_euler,
         gripper_val=IsolatedXArm7Gripper._GRIPPER_OPEN,
         max_steps=args.max_servo_steps, pos_tol=args.pos_tol,
         frames=frames, max_qvel_tracker=max_qvel_tracker,
