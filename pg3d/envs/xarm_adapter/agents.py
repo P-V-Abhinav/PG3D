@@ -291,26 +291,55 @@ class XArm7Gripper(BaseAgent):
         ),
     )
     # Gains match ManiSkill's own xarm6_robotiq mimic gripper exactly (stiffness=1e5,
-    # damping=2000, force_limit=0.1) -- this codebase's closest precedent for a
-    # mimic-driven xArm-family gripper. force_limit is the critical one: a 1e5-rad/s^2
-    # spring with no meaningful force cap can deliver unbounded torque on any real
-    # target change, which is what produced a qvel blowup (~100 rad/s) when this was
-    # first tried at force_limit=50 alongside the ORIGINAL damping=2000 (copied from
-    # the old *static*-hold config, which never actually moved its target so a high
-    # cap was never exercised): the gripper's own self-collision/mimic-loop chatter
-    # (see _no_self_collision_links below) generates a small constant joint-velocity
-    # "error" that's harmless at low force_limit (clipped to near-zero torque) but,
-    # multiplied by damping=2000, demands a torque large enough that a force_limit=50
-    # ceiling lets almost all of it through -- reflecting a jolt into link7/the arm
-    # every time the arm is actively moving (which is when that chatter gets excited;
-    # it's quiescent while the arm holds still to close on an object). damping=500
-    # (4x lower) keeps the demanded torque well under the 50 N*m cap for typical
-    # chatter, so force_limit=50 (needed -- 0.1-0.5 N*m was too weak to hold objects
-    # during transport) can be raised without the ceiling actually being hit.
-    gripper_stiffness = 1e5
-    gripper_damping = 500
-    gripper_force_limit = 50
-    gripper_friction = 1
+    # damping=2000, force_limit=0.1) -- but those gains were never right for a gripper
+    # that actually CLOSES ON AN OBJECT, and the 1e5/500/50 variant they were tuned
+    # into was worse. The governing fact:
+    #
+    #   A position-controlled gripper closing on a rigid object NEVER reaches its
+    #   target. Commanded 0.84 rad, the fingers stall at the object's half-width
+    #   (~0.30 rad for a 70 mm cube). That ~0.54 rad error is PERMANENT, so the PD
+    #   spring demands stiffness*error = 1e5*0.54 ~= 5.4e4 N*m every single step and
+    #   the clamp cuts it to force_limit. From first contact onward the joint sits
+    #   pinned at exactly force_limit, forever. Stiffness and damping stop mattering
+    #   for the held force: **force_limit IS the grip force.**
+    #
+    # This is also exactly how the real gripper behaves (command closed, motor stalls
+    # on the object, holds at whatever its current/force setting allows), so
+    # force_limit is the direct sim analogue of the real gripper's grip-force setting
+    # and is the parameter to calibrate against hardware.
+    #
+    # Sizing it: both drive_joint (knuckle pivot, ~0.09 m from the pad) and
+    # left/right_finger_joint (finger pivot, ~0.05 m from the pad) push the finger, so
+    # fingertip force ~= tau*(1/0.09 + 1/0.05) ~= 31*tau N per N*m. The task needs very
+    # little: a 70 mm cube at SAPIEN's default 1000 kg/m^3 is 0.343 kg = 3.4 N, and
+    # two-finger friction retention is 2*mu*N, so N ~= 1.5 N per pad statically and
+    # ~3-5 N under transport accelerations.
+    #   force_limit = 50   -> ~1550 N   (~400x need; ejects the cube on any asymmetry,
+    #                                    and dumps ~50 N*m of residual wrench into the
+    #                                    wrist, whose whole budget is arm_force_limit=100)
+    #   force_limit = 0.1  -> ~3 N      (marginal, and too weak to hold the finger
+    #                                    parallel before the linkage loop was closed)
+    #   force_limit = 1.0  -> ~31 N     (~10x static need, ~6-8x transport need)
+    gripper_force_limit = 1.0
+    # damping and friction MUST be resized whenever force_limit is: they are subtracted
+    # from the same torque budget, so a damping/friction term larger than force_limit
+    # freezes the gripper solid. At the old damping=500, a force_limit of 1.0 would cap
+    # closing speed at F/d = 0.002 rad/s -- 0.85 rad would take 7 minutes. The rule is
+    # v_terminal = force_limit / damping, so damping=0.5 gives 2.0 rad/s, which is
+    # exactly the URDF's declared joint velocity limit -- the drive saturates at the
+    # speed the joint is allowed to move anyway, and cannot run away past it.
+    gripper_damping = 0.5
+    # Likewise friction=1 N*m against a 1.0 N*m ceiling would leave zero net torque to
+    # move with. 0.05 is light gearbox drag, ~5% of the budget.
+    gripper_friction = 0.05
+    # With force_limit=1.0 the drive saturates at 0.001 rad of error, so the old 1e5
+    # bought nothing but stiff-ODE grief (the finger link's inertia is ~1e-5 kg*m^2;
+    # 1e5 against that is an omega of ~3200 rad/s, far past what the solver timestep
+    # resolves). 1000 still saturates almost immediately while keeping the drive
+    # numerically sane: with I ~= 4.9e-5 kg*m^2 (the finger's own izz carried to its
+    # pivot by the parallel-axis theorem), zeta = damping/(2*sqrt(k*I)) = 1.13, i.e.
+    # just past critical -- settles without ringing and without overshoot.
+    gripper_stiffness = 1000
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding
     # the drive target AT the hard stop makes the PD spring and the limit constraint
@@ -372,6 +401,61 @@ class XArm7Gripper(BaseAgent):
         "right_outer_knuckle", "right_inner_knuckle", "right_finger",
     ]
 
+    # ---- four-bar loop closure -------------------------------------------------
+    # Each side of the xArm gripper is a PARALLELOGRAM four-bar linkage: housing,
+    # outer knuckle, inner knuckle (parallel to and the same length as the outer),
+    # and finger. The loop is what forces the finger to stay vertical as it swings
+    # in -- that is the entire mechanism behind "parallel jaw".
+    #
+    # URDF is a TREE and cannot express a loop, so xarm7_with_gripper_colored.urdf
+    # cuts it: left_finger hangs off left_outer_knuckle alone, and left_inner_knuckle
+    # is a stub attached to nothing. Without the missing pin the finger's "parallel"
+    # pose is held only by the PD spring on *_finger_joint, which DEFLECTS under
+    # contact load -- the finger visibly cants over even when squarely on a flat face.
+    # A real gripper physically cannot do that.
+    #
+    # These two drives restore the missing pin, exactly as XArm7Robotiq already does
+    # for its own gripper (see that class's _after_loading_articulation below).
+    #
+    # Pin locations, derived from the URDF's joint origins rather than guessed. Write
+    #   A = outer knuckle pivot, B = inner knuckle pivot (both in the housing frame),
+    #   v = finger pivot offset within the outer knuckle frame.
+    # The left chain rotates by R(+theta) about x and the finger's own joint rotates
+    # by R(-theta) (its axis is negated in the URDF), so the finger frame stays
+    # axis-aligned and sits at  A + R(theta)v. Putting the pin at offset v inside the
+    # inner knuckle frame places it at  B + R(theta)v. The two coincide for ALL theta
+    # iff the finger-frame offset is exactly B - A, and from the URDF numbers
+    #   B - A = (0, 0.020-0.035, 0.074098-0.059098) = (0, -0.015, +0.015)
+    # which is the constant used below. The residual is identically zero at every
+    # joint angle, so the constraint never fights the mimic drives.
+    _LOOP_CLOSURE = {
+        # side: (inner_knuckle_link, finger_link, pin_in_knuckle_frame, pin_in_finger_frame)
+        "left": (
+            "left_inner_knuckle", "left_finger",
+            [0.0,  0.035465, 0.042039], [0.0, -0.015, 0.015],
+        ),
+        "right": (
+            "right_inner_knuckle", "right_finger",
+            [0.0, -0.035465, 0.042039], [0.0,  0.015, 0.015],
+        ),
+    }
+
+    def _after_loading_articulation(self) -> None:
+        links_map = self.robot.links_map
+        self._loop_drives = []
+        for knuckle_name, finger_name, p_knuckle, p_finger in self._LOOP_CLOSURE.values():
+            drive = self.scene.create_drive(
+                links_map[knuckle_name], sapien.Pose(p_knuckle),
+                links_map[finger_name], sapien.Pose(p_finger),
+            )
+            # Zero the three LINEAR limits only: that is a pin (ball joint), which is
+            # what the real linkage has. Rotation is left free so the mimic drives
+            # still own the joint angles. Mirrors XArm7Robotiq's loop closure.
+            drive.set_limit_x(0, 0)
+            drive.set_limit_y(0, 0)
+            drive.set_limit_z(0, 0)
+            self._loop_drives.append(drive)
+
     def _after_init(self) -> None:
         self.tcp = sapien_utils.get_obj_by_name(self.robot.get_links(), self.ee_link_name)
         links_map = self.robot.links_map
@@ -379,9 +463,102 @@ class XArm7Gripper(BaseAgent):
             if link_name in links_map:
                 links_map[link_name].set_collision_group_bit(group=2, bit_idx=31, bit=1)
 
+        # Contact links, cached for is_grasping(). The whole finger mesh is the
+        # collision geometry -- unlike Robotiq there is no separate pad sub-link.
+        self.finger1_link = sapien_utils.get_obj_by_name(self.robot.get_links(), "left_finger")
+        self.finger2_link = sapien_utils.get_obj_by_name(self.robot.get_links(), "right_finger")
+        # Index of drive_joint within the full qpos vector, for the stall detector.
+        active_names = [j.name for j in self.robot.get_active_joints()]
+        self._drive_joint_index = active_names.index("drive_joint")
+
     def is_static(self, threshold: float = 0.2):
         qvel = self.robot.get_qvel()[..., :7]  # arm joints only
         return torch.max(torch.abs(qvel), 1)[0] <= threshold
+
+    # ---- grasp detection -------------------------------------------------------
+    # Two signals, deliberately kept separate because only one of them transfers.
+
+    def is_grasping(self, object, min_force: float = 0.3, max_angle: float = 85):
+        """SIM-ONLY ground truth: both finger pads pressing on ``object``.
+
+        Mirrors ManiSkill's ``Panda.is_grasping``. Real parallel grippers have no
+        fingertip force sensor, so this has no hardware counterpart -- use it to
+        validate/label in sim, and use :meth:`is_gripper_stalled` for anything that
+        has to run on the robot.
+
+        The angle test rejects a glancing brush: a contact only counts if its force
+        direction is within ``max_angle`` of the finger's own closing axis. The
+        fingers stay axis-aligned with the housing (that is what the parallelogram
+        guarantees), so the outward normal is +y in finger1's frame and -y in
+        finger2's.
+
+        Args:
+            object: the :class:`Actor` to test against.
+            min_force: newtons of contact force per pad to count as a grasp. 0.3 N
+                is well under the ~1.5 N/pad a 0.343 kg cube needs, so it detects
+                contact rather than sufficiency.
+            max_angle: degrees; maximum deviation of the contact force from the
+                closing axis.
+        """
+        from mani_skill.utils import common
+
+        l_forces = self.scene.get_pairwise_contact_forces(self.finger1_link, object)
+        r_forces = self.scene.get_pairwise_contact_forces(self.finger2_link, object)
+        lforce = torch.linalg.norm(l_forces, axis=1)
+        rforce = torch.linalg.norm(r_forces, axis=1)
+
+        ldirection = self.finger1_link.pose.to_transformation_matrix()[..., :3, 1]
+        rdirection = -self.finger2_link.pose.to_transformation_matrix()[..., :3, 1]
+        langle = common.compute_angle_between(ldirection, l_forces)
+        rangle = common.compute_angle_between(rdirection, r_forces)
+
+        lflag = torch.logical_and(lforce >= min_force, torch.rad2deg(langle) <= max_angle)
+        rflag = torch.logical_and(rforce >= min_force, torch.rad2deg(rangle) <= max_angle)
+        return torch.logical_and(lflag, rflag)
+
+    def is_gripper_stalled(
+        self,
+        target_qpos: float,
+        min_gap: float = 0.05,
+        max_qvel: float = 0.05,
+    ):
+        """REAL-TRANSFERABLE grasp signal: the fingers stopped short of their target.
+
+        This is the signal the hardware actually gives you. A real parallel gripper
+        reports commanded position, measured position and motor current; when the
+        jaws close on an object the motor stalls, so measured position freezes with a
+        residual gap to the commanded position. (The Robotiq 2F-85 surfaces the same
+        fact directly as an "object detected" status bit; the xArm gripper leaves you
+        to infer it from commanded-vs-actual.) Nothing here needs a physics engine --
+        only ``qpos`` and ``qvel``, both available over the real robot's API -- so the
+        same predicate can gate the same state machine in sim and on hardware.
+
+        Note this is stall detection, not force control. The gripper is *meant* to
+        stall and hold; ``gripper_force_limit`` is what decides how hard.
+
+        Args:
+            target_qpos: the drive target currently commanded, in radians.
+            min_gap: radians of residual (target - measured) that count as "stopped
+                short". Bounded on both sides: it must exceed the drive's tracking lag
+                while the target is still ramping (a caller stepping the target by
+                0.85/30 = 0.028 rad per control step can lag by about that much without
+                having stalled on anything), and it must stay below the residual left
+                by the thinnest object worth grasping (a 70 mm cube closes to ~0.30 rad
+                against a 0.84 rad target, leaving ~0.54 rad -- an order of magnitude of
+                headroom). 0.05 sits between the two.
+            max_qvel: rad/s below which the finger counts as stopped. This is the half
+                of the test that rejects ramp lag outright: while the jaws are still
+                travelling they run near the drive's terminal velocity
+                (force_limit/damping = 2 rad/s), which is far above this.
+
+        Returns:
+            Bool tensor, one entry per parallel env.
+        """
+        q = self.robot.get_qpos()[..., self._drive_joint_index]
+        v = self.robot.get_qvel()[..., self._drive_joint_index]
+        stopped_short = (target_qpos - q) > min_gap
+        not_moving = torch.abs(v) < max_qvel
+        return torch.logical_and(stopped_short, not_moving)
 
     @property
     def tcp_pos(self):

@@ -1980,6 +1980,29 @@ def _descend_to_grasp(*_args, **_kwargs):
     )
 
 
+def _grasp_signals(sim_env: Any, drive_target: float) -> tuple[bool, bool]:
+    """Read both grasp signals for the current sim state.
+
+    Returns ``(stalled, pad_contact)``:
+
+    - ``stalled``  — the fingers stopped short of their commanded target. This is the
+      signal REAL hardware gives you (commanded vs. measured position plus motor
+      stall), so it is the one to gate a real pick-and-place state machine on.
+    - ``pad_contact`` — both finger pads are pressing on the object, from the sim's
+      contact solver. No hardware counterpart; use it to validate in sim.
+
+    Raises if the agent or env cannot supply either signal. A pick-and-place run whose
+    grasp detector silently reported ``False`` would be indistinguishable from one that
+    genuinely missed the object, so a missing method is a configuration error to
+    surface, not a condition to absorb.
+    """
+    agent = sim_env.unwrapped.agent
+    grasp_object = sim_env.unwrapped.cheezit
+    stalled = bool(agent.is_gripper_stalled(target_qpos=drive_target)[0])
+    pad_contact = bool(agent.is_grasping(grasp_object)[0])
+    return stalled, pad_contact
+
+
 def _execute_pick_and_place(
     sim_env: Any,
     video_env: Any,
@@ -2040,13 +2063,25 @@ def _execute_pick_and_place(
     )
 
     # ── Phase 1c: Close gripper ───────────────────────────────────────────────
-    # Ramp gripper from open → fully closed over 30 steps; arm stays still.
+    # Ramp gripper open → fully closed while the arm holds still.
+    #
+    # The arm target is LATCHED here, once, before the loop. It used to be re-read
+    # from get_qpos() on every iteration and commanded straight back, which zeroes
+    # the position error and so generates NO restoring torque against the gripper's
+    # disturbance: every jolt from the closing fingers displaced the arm, and the next
+    # step adopted that displacement as its new goal. The arm ratcheted away and never
+    # came back. Holding one fixed target makes the arm actually resist. (Same reason
+    # you would latch the servo setpoint on the real robot rather than re-teaching it
+    # to wherever the arm happened to drift.)
+    latched_arm_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0, :7].cpu().numpy().copy()
+
     close_steps = 30
+    grasp_step: int | None = None
+    grasp_confirmed = False
     for i in range(1, close_steps + 1):
-        target_val   = GRIPPER_CLOSED_TARGET * (i / close_steps)
-        current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-        action       = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        action[:7]   = current_qpos[:7]
+        target_val = GRIPPER_CLOSED_TARGET * (i / close_steps)
+        action     = np.zeros(sim_env.action_space.shape, dtype=np.float32)
+        action[:7] = latched_arm_qpos
         if action.shape[0] > 7:
             action[7:] = target_val
         sim_env.step(action)
@@ -2056,6 +2091,39 @@ def _execute_pick_and_place(
         sim_obs   = sim_env.unwrapped.get_obs()
         sim_entry = rollout_observation_entry(sim_obs, {}, env=sim_env, crop_config=crop_config)
         timeline.append(sim_entry)
+
+        # Grasp detection. The gripper is *meant* to stall against the object and hold
+        # -- that is what the real one does, and gripper_force_limit decides how hard --
+        # so this does not stop the squeeze. It reports whether a grasp actually
+        # happened, so a failed close is visible here instead of at the far end of a
+        # transport that drops the object.
+        if grasp_step is None:
+            stalled, contact = _grasp_signals(sim_env, target_val)
+            if stalled or contact:
+                grasp_step = i
+                grasp_confirmed = bool(contact)
+                print(
+                    f"[Phase 1c] Grasp detected at close step {i}/{close_steps} "
+                    f"(drive target {target_val:.3f} rad) — "
+                    f"stall={stalled} (real-transferable), "
+                    f"pad_contact={contact} (sim ground truth)",
+                    flush=True,
+                )
+
+    if grasp_step is None:
+        print(
+            "[Phase 1c] WARNING: gripper reached the fully-closed target with no stall "
+            "and no pad contact — the jaws closed on empty space. The object was not "
+            "grasped; the transport phase will carry nothing.",
+            flush=True,
+        )
+    elif not grasp_confirmed:
+        print(
+            "[Phase 1c] WARNING: fingers stalled but pad contact was not confirmed on "
+            "both sides — the jaws may be stalled against each other or against a "
+            "single face rather than holding the object.",
+            flush=True,
+        )
 
     # Post-grasp diagnostic
     current_qpos  = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
@@ -2131,17 +2199,34 @@ def _execute_pick_and_place(
             print(f"[Phase 2] Reached new goal at step {step}!", flush=True)
             break
             
+    # Did the object survive transport? Comparing this against the Phase 1c result is
+    # what distinguishes "never grasped it" from "grasped it and dropped it en route".
+    held_stalled, held_contact = _grasp_signals(sim_env, GRIPPER_CLOSED_TARGET)
+    print(
+        f"\n--- [Phase 2] Transport complete — still holding: "
+        f"stall={held_stalled}, pad_contact={held_contact} ---",
+        flush=True,
+    )
+    if grasp_step is not None and not held_contact:
+        print(
+            "[Phase 2] WARNING: object was grasped at Phase 1c but pad contact is gone "
+            "— it was dropped during transport.",
+            flush=True,
+        )
+
     print("\n--- [Phase 3] Releasing Object ---", flush=True)
+    # Latched for the same reason as the close loop: re-reading qpos into the target
+    # each step leaves the arm with no restoring torque and lets it drift.
+    latched_arm_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0, :7].cpu().numpy().copy()
     open_steps = 20
     for i in range(1, open_steps + 1):
         target_val = GRIPPER_CLOSED_TARGET * (1.0 - i / open_steps)
-        current_qpos = sim_env.unwrapped.agent.robot.get_qpos()[0].cpu().numpy()
-            
+
         action = np.zeros(sim_env.action_space.shape, dtype=np.float32)
-        action[:7] = current_qpos[:7]
+        action[:7] = latched_arm_qpos
         if action.shape[0] > 7:
             action[7:] = target_val
-            
+
         sim_env.step(action)
         if video_env is not None:
             video_env.step(action)

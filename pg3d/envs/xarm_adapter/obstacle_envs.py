@@ -13,6 +13,9 @@ import os
 from typing import Any
 
 import numpy as np
+import sapien
+import sapien.physx
+import sapien.render
 import torch
 
 from mani_skill.sensors.camera import CameraConfig
@@ -424,6 +427,39 @@ class PG3DReachRealKitchenEnv(PG3DReachXArm7GripperEnv):
         return _build_obstacle_cameras(super()._default_sensor_configs)
 
 
+def _build_graspable_box(scene, *, half_size: float, color, name: str):
+    """Build a dynamic box with a friction material fit to be grasped.
+
+    ``actors.build_box`` calls ``add_box_collision`` without a ``material``, so the
+    box silently inherits SAPIEN's default physical material (~0.3 friction). That
+    caps grip RETENTION regardless of how hard the gripper squeezes: what stops a held
+    object sliding out is ``mu * N``, and PhysX averages the two contacting materials,
+    so a 0.3 box against the gripper's 2.0 pads yields an effective mu of only ~1.15.
+    Matching the box to the pads (see XArm7Gripper.urdf_config) lifts it to 2.0 and
+    roughly doubles the load the same squeeze can hold.
+
+    ``patch_radius``/``min_patch_radius`` widen the contact patch PhysX reports, which
+    gives the box torsional resistance about the grasp axis — without it a cube held
+    between two pads can pivot in the jaws under transport accelerations even when it
+    is not sliding.
+    """
+    material = sapien.physx.PhysxMaterial(
+        static_friction=2.0, dynamic_friction=2.0, restitution=0.0
+    )
+    builder = scene.create_actor_builder()
+    builder.add_box_collision(
+        half_size=[half_size] * 3,
+        material=material,
+        patch_radius=0.05,
+        min_patch_radius=0.05,
+    )
+    builder.add_box_visual(
+        half_size=[half_size] * 3,
+        material=sapien.render.RenderMaterial(base_color=color),
+    )
+    return builder.build(name=name)
+
+
 # ---------------------------------------------------------------------------
 # Just Banana Environment (Now Cheezit Box)
 # ---------------------------------------------------------------------------
@@ -438,7 +474,9 @@ class PG3DReachJustBananaEnv(PG3DReachXArm7GripperEnv):
         super()._load_scene(options)
         model_id = self.ycb_model_id
         if model_id == "cube_7cm":
-            self.cheezit = actors.build_box(self.scene, half_sizes=[0.035, 0.035, 0.035], color=[0, 1, 0, 1], name="cube_7cm", body_type="dynamic")
+            self.cheezit = _build_graspable_box(
+                self.scene, half_size=0.035, color=[0, 1, 0, 1], name="cube_7cm"
+            )
             # build_box's pose.p is its geometric centre, so half the side length
             # is exactly the offset from the origin down to its underside.
             self._cheezit_z_offset = 0.035
