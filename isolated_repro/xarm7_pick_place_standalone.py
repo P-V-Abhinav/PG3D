@@ -350,6 +350,14 @@ class IsolatedXArm7PickCubeEnv(BaseEnv):
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict[str, Any]) -> torch.Tensor:
         return torch.zeros(self.num_envs, device=self.device)
 
+    def compute_normalized_dense_reward(
+        self, obs: Any, action: torch.Tensor, info: dict[str, Any]
+    ) -> torch.Tensor:
+        # Scripted repro, no learned reward needed -- but BaseEnv.get_reward
+        # calls this by default (reward_mode="normalized_dense"), and the
+        # base class's version just raises NotImplementedError.
+        return torch.zeros(self.num_envs, device=self.device)
+
 
 # ===========================================================================
 # 3. Scripted pick-and-place controller (closed-loop Cartesian servoing).
