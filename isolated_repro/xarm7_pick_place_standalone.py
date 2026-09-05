@@ -137,10 +137,9 @@ CUBE_HALF_SIZE = 0.02          # 4cm cube -- comfortably within the gripper's st
 CUBE_SPAWN_XY = (-0.25, 0.0)   # world-frame XY; ASSUMED reachable, verify on first run
 CUBE_SPAWN_Z = CUBE_HALF_SIZE + 0.002   # ASSUMES table top at world z=0
 
-PLACE_XY = (-0.25, 0.4)        # world-frame XY for the place location -- doubled from the
-                                # previous 0.2 (which the last run reached with plenty of
-                                # residual reach margin, ~0.5m from ROBOT_BASE_POSE either
-                                # way) to stress-test grip stability over a longer transport
+PLACE_XY = (-0.10, 0.55)       # world-frame XY for the place location -- increased distance to
+                                # robustly stress-test grip stability: ~0.65m from spawn, diagonal
+                                # path (X and Y both change, increasing arm dynamics loads)
 
 # Grasp axes (world frame) -- see module docstring for why these are correct
 # for THIS gripper's link_tcp frame, verified from URDF joint geometry.
