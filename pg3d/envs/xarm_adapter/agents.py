@@ -290,39 +290,26 @@ class XArm7Gripper(BaseAgent):
             right_finger=dict(material="gripper", patch_radius=0.05, min_patch_radius=0.05),
         ),
     )
-    # --- Gripper drive gains: force_limit IS the steady-state grip force ---
-    # This is a pure PD POSITION controller with no contact/force feedback, so it
-    # has no notion of "the object is grasped, stop closing". Callers close the
-    # gripper by commanding the drive target to ~fully-closed (0.84 rad) while an
-    # object physically blocks the fingers at ~0.3-0.45 rad, so the position error
-    # NEVER decays -- it stays ~0.4 rad for the entire rest of the episode. The PD
-    # law therefore demands stiffness * 0.4 rad of torque forever, and whatever
-    # that works out to is clipped to force_limit. Net effect: once the fingers are
-    # blocked, EVERY driven gripper joint holds at exactly force_limit indefinitely.
-    #
-    # That makes force_limit the grip force, not a transient-only safety cap:
-    #   * 0.1-0.5 N*m  -> ~2-11 N of finger normal force: too weak, objects slid
-    #                     out during transport.
-    #   * 50 N*m       -> ~1100 N per finger, held forever, across 6 driven joints.
-    #                     The unbalanced share of that reaction lands on link7 and
-    #                     is comparable to the arm's OWN authority (arm_force_limit
-    #                     =100), so the arm gets dragged off its commanded path
-    #                     (visible sideways drift + sudden tilt) and the
-    #                     over-constrained finger/object contact eventually ejects
-    #                     the object mid-trajectory.
-    #   * 5 N*m        -> ~110 N normal force per finger. With the mu=2.0 finger
-    #                     material set in urdf_config above that's ~220 N of
-    #                     friction holding a ~0.5 N cube: a >100x margin against
-    #                     gravity + transport accelerations, while the reaction
-    #                     seen by the wrist is only ~5% of arm authority.
-    # stiffness is dropped 1e5 -> 1e3 (ManiSkill's own Panda/Fetch gripper idiom)
-    # so the drive ramps into that cap instead of slamming into it on the first
-    # substep of any target change, and damping 500 -> 100 to match the softer
-    # spring (damping * qvel is what turned gripper self-collision chatter into
-    # arm-jolting torque at the old gains).
-    gripper_stiffness = 1e3
-    gripper_damping = 100
-    gripper_force_limit = 5
+    # Gains match ManiSkill's own xarm6_robotiq mimic gripper exactly (stiffness=1e5,
+    # damping=2000, force_limit=0.1) -- this codebase's closest precedent for a
+    # mimic-driven xArm-family gripper. force_limit is the critical one: a 1e5-rad/s^2
+    # spring with no meaningful force cap can deliver unbounded torque on any real
+    # target change, which is what produced a qvel blowup (~100 rad/s) when this was
+    # first tried at force_limit=50 alongside the ORIGINAL damping=2000 (copied from
+    # the old *static*-hold config, which never actually moved its target so a high
+    # cap was never exercised): the gripper's own self-collision/mimic-loop chatter
+    # (see _no_self_collision_links below) generates a small constant joint-velocity
+    # "error" that's harmless at low force_limit (clipped to near-zero torque) but,
+    # multiplied by damping=2000, demands a torque large enough that a force_limit=50
+    # ceiling lets almost all of it through -- reflecting a jolt into link7/the arm
+    # every time the arm is actively moving (which is when that chatter gets excited;
+    # it's quiescent while the arm holds still to close on an object). damping=500
+    # (4x lower) keeps the demanded torque well under the 50 N*m cap for typical
+    # chatter, so force_limit=50 (needed -- 0.1-0.5 N*m was too weak to hold objects
+    # during transport) can be raised without the ceiling actually being hit.
+    gripper_stiffness = 1e5
+    gripper_damping = 500
+    gripper_force_limit = 50
     gripper_friction = 1
     # rad; joint hard limit is [0, 0.85]. The action-space upper bound is backed off
     # the hard limit by _GRIPPER_LIMIT_MARGIN rather than 0.85 exactly: commanding
