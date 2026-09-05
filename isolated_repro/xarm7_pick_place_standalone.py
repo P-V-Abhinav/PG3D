@@ -137,7 +137,10 @@ CUBE_HALF_SIZE = 0.02          # 4cm cube -- comfortably within the gripper's st
 CUBE_SPAWN_XY = (-0.25, 0.0)   # world-frame XY; ASSUMED reachable, verify on first run
 CUBE_SPAWN_Z = CUBE_HALF_SIZE + 0.002   # ASSUMES table top at world z=0
 
-PLACE_XY = (-0.25, 0.2)        # world-frame XY for the place location
+PLACE_XY = (-0.25, 0.4)        # world-frame XY for the place location -- doubled from the
+                                # previous 0.2 (which the last run reached with plenty of
+                                # residual reach margin, ~0.5m from ROBOT_BASE_POSE either
+                                # way) to stress-test grip stability over a longer transport
 
 # Grasp axes (world frame) -- see module docstring for why these are correct
 # for THIS gripper's link_tcp frame, verified from URDF joint geometry.
@@ -275,8 +278,23 @@ class IsolatedXArm7Gripper(BaseAgent):
         ),
     )
 
-    gripper_stiffness = 1e5
-    gripper_damping = 2000
+    # --- Vibration fix -------------------------------------------------
+    # force = stiffness*(target - qpos) - damping*qvel, clamped to
+    # force_limit. At stiffness=1e5 (this repo's original value, matched to
+    # ManiSkill's own xarm6_robotiq mimic gripper), the force saturates the
+    # instant the position error exceeds force_limit/stiffness = 1/1e5 =
+    # 0.00001 rad -- i.e. essentially any nonzero error at all. Once the
+    # fingers hold solid contact, that turns the "spring" into a relay: the
+    # smallest contact deflection commands max force the other way,
+    # overshoots, flips sign, and repeats -- a limit-cycle chatter, which is
+    # exactly the "gripper teeth vibrating" symptom. Lowering stiffness (and
+    # damping proportionally) gives the spring a real proportional band
+    # before it saturates, so it settles into a compliant hold instead of
+    # oscillating. force_limit stays modest (max sustained holding force is
+    # unchanged in magnitude) -- only how "hard" the spring is near the
+    # setpoint changes.
+    gripper_stiffness = 400
+    gripper_damping = 40
     gripper_force_limit = 1.0   # overridable via --gripper-force-limit
     gripper_friction = 1
     # Back off the drive target from the 0.85 rad hard stop so the PD spring
@@ -547,7 +565,7 @@ def _close_gripper_until_contact(
     max_qvel_tracker: list[float],
     qvel_stall_thresh: float = 0.05,
     stall_patience: int = 5,
-    settle_steps: int = 5,
+    settle_steps: int = 20,  # bumped from 5 so a softer spring (post vibration-fix) has time to visibly settle
 ) -> float:
     """Ramp the gripper's drive_joint target toward `target_val`, but STOP
     advancing it as soon as the joint stalls against something (qvel near
