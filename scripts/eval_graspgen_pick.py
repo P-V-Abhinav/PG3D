@@ -2164,10 +2164,44 @@ def _execute_pick_and_place(
     )
 
     print("\n--- [Phase 2] Moving to Place Goal ---", flush=True)
-    
-    # 1. Define a new goal location (e.g. up and to the right)
-    new_goal_pos = np.array([0.2, 0.2, 0.25], dtype=np.float32)
+
+    # 1. Place goal: on the table, near the base, clear of the pick location.
+    #
+    # The previous hardcoded [0.2, 0.2, 0.25] was unreachable AND invisible. Measured
+    # against the IK-verified envelope in xarm_adapter/reach_config.py, it sat 0.876 m
+    # from the base -- outside not just XARM7_REACH_BOX_BASE but XARM7_MAX_ENVELOPE_BASE
+    # (max forward reach 0.725 m) -- and also outside XARM7_CROP_BOX_BASE, so the marker
+    # never entered the policy's point cloud either. Phase 2 could not succeed.
+    #
+    # The default replacement sits inside all three boxes: 0.368 m from the base
+    # (dx=0.265 within [0.18,0.50]), dy=+0.25 on the OPPOSITE side from the pick
+    # (observed at y~-0.22), giving 0.589 m of separation, and z=0.05 -- which is both
+    # the "5 cm off the table" asked for and exactly the verified floor of the reach
+    # box's dz range. Holding a 70 mm cube with the TCP at z=0.05 puts its underside
+    # ~15 mm above the table, so the release drops it a short, safe distance.
+    new_goal_pos = np.asarray(args.place_goal, dtype=np.float32)
     print(f"[Debug] New Goal Pos: {new_goal_pos.tolist()}", flush=True)
+
+    # Reachability check. This warns rather than clamping: a goal you deliberately put
+    # outside the box is a valid experiment, but silently burning a run on a goal the
+    # arm physically cannot reach is not.
+    from pg3d.envs.xarm_adapter.reach_config import (
+        ROBOT_BASE_POSITION,
+        XARM7_REACH_BOX_BASE,
+    )
+    _rel = new_goal_pos - ROBOT_BASE_POSITION
+    if not (np.all(_rel >= XARM7_REACH_BOX_BASE[:, 0])
+            and np.all(_rel <= XARM7_REACH_BOX_BASE[:, 1])):
+        print(
+            f"[Phase 2] WARNING: place goal {new_goal_pos.tolist()} is outside the "
+            f"IK-verified reach box. Base-relative dx,dy,dz = "
+            f"{np.round(_rel, 3).tolist()}, verified range "
+            f"dx{XARM7_REACH_BOX_BASE[0].tolist()} dy{XARM7_REACH_BOX_BASE[1].tolist()} "
+            f"dz{XARM7_REACH_BOX_BASE[2].tolist()} "
+            f"(distance from base {np.linalg.norm(_rel):.3f} m). The arm may not be "
+            f"able to reach it.",
+            flush=True,
+        )
 
     # Move the goal_site to the new goal position so the policy sees it in the point cloud
     if hasattr(sim_env.unwrapped, "goal_site"):
@@ -2706,6 +2740,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "('robotiq_2f_140'), whose control points place the fingertips "
                         "0.195m ahead of the origin along the local +Z axis. Re-derive "
                         "this number from that same function if you switch grippers.")
+    g.add_argument("--place-goal", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                   default=[-0.35, 0.25, 0.05],
+                   help="World-frame XYZ the object is carried to in Phase 2, in "
+                        "metres. The table surface is z=0, so the default z=0.05 puts "
+                        "the TCP 5 cm above it (a held 70 mm cube's underside ends up "
+                        "~15 mm off the table). The default is inside all three "
+                        "envelopes in xarm_adapter/reach_config.py: 0.368 m from the "
+                        "base, dy on the opposite side from where objects spawn "
+                        "(0.589 m of separation from a typical pick), and within the "
+                        "point-cloud crop so the policy can actually see the marker. "
+                        "Replaces a hardcoded [0.2, 0.2, 0.25] that was outside even "
+                        "the maximum reach envelope and outside the crop box. A goal "
+                        "outside the IK-verified box warns but still runs.")
     g.add_argument("--goal-z-offset", type=float, default=-0.02,
                    help="Metres to bias the goal MARKER (goal_site) in world z, "
                         "relative to the GraspGen contact centroid. Negative is "
