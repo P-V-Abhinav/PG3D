@@ -1233,7 +1233,10 @@ def _build_graspgen_constraint(
     args._graspgen_rerun_data[spec.output_index]["final_grasp_pos"]  = adj_pos
     args._graspgen_rerun_data[spec.output_index]["final_grasp_quat"] = adj_quat
 
-    # Goal = raw grasp position (no offset).
+    # Goal = raw grasp position (no offset). This stays the GROUND TRUTH grasp point:
+    # it is what the CartesianPoseConstraint scores against and what the Phase 1a
+    # residual is printed against, so eval metrics keep measuring distance to the
+    # grasp GraspGen actually predicted.
     goal_pos = adj_pos
     print(
         f"[GraspGen] Episode {spec.output_index}: "
@@ -1242,11 +1245,32 @@ def _build_graspgen_constraint(
     )
 
     # --- 8c. Update Policy Goal Marker (goal_site) ---
+    # The MARKER is deliberately allowed to diverge from the scored target. It is what
+    # the policy sees in its point cloud, i.e. where the policy is told to aim -- and
+    # the policy systematically undershoots in z, stopping above the grasp point rather
+    # than descending onto it. Biasing the marker down by --goal-z-offset aims the
+    # policy lower so the TCP lands nearer the true grasp point, while the constraint
+    # above keeps scoring against that true point, so the metric stays honest about
+    # whether the bias actually helped.
+    #
+    # World -Z, not the grasp's approach axis: these grasps are near top-down (a
+    # measured approach axis of [0.028, -0.033, -0.999] is under 3 degrees off world
+    # -Z), so the two are equivalent here and straight down is the simpler contract.
+    # Revisit if angled or side grasps are ever used.
+    marker_pos = adj_pos.copy()
+    marker_pos[2] += args.goal_z_offset
+    if args.goal_z_offset != 0.0:
+        print(
+            f"[GraspGen] Episode {spec.output_index}: "
+            f"goal MARKER biased {args.goal_z_offset:+.3f} m in world z -> "
+            f"{marker_pos.tolist()} (scored target unchanged at {goal_pos.tolist()})",
+            flush=True,
+        )
     if hasattr(env.unwrapped, "goal_site"):
-        pos_t = torch.tensor(goal_pos, dtype=torch.float32, device=env.unwrapped.device).unsqueeze(0)
+        pos_t = torch.tensor(marker_pos, dtype=torch.float32, device=env.unwrapped.device).unsqueeze(0)
         env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
 
-    pregrasp_pos = goal_pos  # alias — constraint target = goal_pos
+    pregrasp_pos = goal_pos  # constraint target = the UNBIASED grasp centroid
 
     # --- 9. Build CartesianPoseConstraint ---
     pos_tol  = float(getattr(args, "grasp_position_tolerance", 0.02))
@@ -2682,6 +2706,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "('robotiq_2f_140'), whose control points place the fingertips "
                         "0.195m ahead of the origin along the local +Z axis. Re-derive "
                         "this number from that same function if you switch grippers.")
+    g.add_argument("--goal-z-offset", type=float, default=-0.02,
+                   help="Metres to bias the goal MARKER (goal_site) in world z, "
+                        "relative to the GraspGen contact centroid. Negative is "
+                        "downward. This moves ONLY what the policy sees and aims at -- "
+                        "the CartesianPoseConstraint and the Phase 1a residual still "
+                        "score against the unbiased centroid, so the metric reports "
+                        "whether the bias actually improved the achieved grasp. "
+                        "Exists because the policy systematically undershoots in z, "
+                        "stopping above the grasp point instead of descending onto it; "
+                        "aiming it lower pulls the TCP closer to the true target. "
+                        "Pass 0 to disable (the behaviour before this flag existed). "
+                        "Applied along world -Z, which is within ~3 degrees of the "
+                        "approach axis for the near-top-down grasps this is tuned on.")
     g.add_argument("--grasp-approach-offset", type=float, default=0.0,
                    help="Distance (m) to back the goal pose off along the grasp's OWN "
                         "approach axis, creating a pre-grasp standoff before the actual "
