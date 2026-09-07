@@ -1134,30 +1134,58 @@ def _build_graspgen_constraint(
         )
         return [constraint], None
 
-    # --- 6. Pick best grasp (Top-Down heuristic) ---
-    # We want grasps that approach from the top. The approach vector is the local Z
-    # axis of the grasp (column 2 of the rotation matrix), which points from the
-    # gripper base to the TCP. A perfectly top-down grasp points along world -Z
-    # (so approach_z = -1). We penalise grasps that approach from the side/bottom.
+    # --- 6. Pick best grasp (selection mode set by --grasp-selection) ---
+    # The approach vector is the grasp's local Z axis (column 2 of the rotation
+    # matrix), pointing from the gripper base toward the TCP. A perfectly top-down
+    # grasp points along world -Z, so approach_z = -1; a bottom-up one gives +1.
     approach_zs = all_grasps[:, 2, 2]
-    
-    # Combined score = GraspGen score (0 to 1) - 0.2 * approach_z
-    # This gives up to a +0.2 boost to perfectly top-down grasps, and penalises
-    # bottom-up grasps by -0.2.
-    combined_scores = all_scores - 0.2 * approach_zs
-    
-    best_idx   = int(np.argmax(combined_scores))
+
+    if args.grasp_selection == "topdown":
+        # Bias toward grasps the arm can reach comfortably from above. Adding
+        # -w * approach_z gives a top-down grasp up to +w and penalises a bottom-up
+        # one by -w, so a top-down candidate wins unless a side/bottom grasp beats it
+        # on GraspGen's own score by more than 2w. The weight was a hardcoded 0.2;
+        # it is now --grasp-topdown-weight.
+        selection_scores = all_scores - float(args.grasp_topdown_weight) * approach_zs
+    elif args.grasp_selection == "graspgen":
+        # GraspGen's own ranking, untouched: highest discriminator confidence wins
+        # regardless of approach direction.
+        selection_scores = all_scores
+    else:
+        raise ValueError(f"unsupported --grasp-selection {args.grasp_selection!r}")
+
+    best_idx   = int(np.argmax(selection_scores))
     best_score = float(all_scores[best_idx])
     best_grasp = all_grasps[best_idx].astype(np.float32)  # (4, 4)
 
+    # Report what the OTHER mode would have chosen, so a run makes the cost of the
+    # choice visible without needing a second run to compare against.
+    native_idx = int(np.argmax(all_scores))
     print(
         f"[GraspGen] Episode {spec.output_index}: "
         f"total_grasps={all_grasps.shape[0]}  "
-        f"best_idx={best_idx}  "
-        f"best_score={best_score:.4f} (combined={float(combined_scores[best_idx]):.4f}, approach_z={float(approach_zs[best_idx]):.2f})  "
+        f"selection={args.grasp_selection}"
+        + (f" (topdown_weight={float(args.grasp_topdown_weight)})"
+           if args.grasp_selection == "topdown" else "")
+        + f"  best_idx={best_idx}  "
+        f"best_score={best_score:.4f} "
+        f"(selection_score={float(selection_scores[best_idx]):.4f}, "
+        f"approach_z={float(approach_zs[best_idx]):.2f})  "
         f"raw_score_range=[{float(all_scores.min()):.4f}, {float(all_scores.max()):.4f}]",
         flush=True,
     )
+    if best_idx != native_idx:
+        print(
+            f"[GraspGen] Episode {spec.output_index}: "
+            f"GraspGen's native best would have been idx={native_idx} "
+            f"score={float(all_scores[native_idx]):.4f} "
+            f"approach_z={float(approach_zs[native_idx]):.2f} "
+            f"— the top-down bias overrode it "
+            f"(gave up {float(all_scores[native_idx]) - best_score:.4f} of score "
+            f"to gain {float(approach_zs[native_idx]) - float(approach_zs[best_idx]):.2f} "
+            f"of approach_z)",
+            flush=True,
+        )
 
     # --- 7. Diagnostic: raw Robotiq-frame grasp ---
     raw_pos  = best_grasp[:3, 3]
@@ -2970,6 +2998,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "needing 61 steps for a ~0.1-0.2 m move, while the place goal is "
                         "~0.59 m away and is approached while carrying the object, so 50 "
                         "truncated the arm in transit.")
+    g.add_argument("--grasp-selection", choices=["topdown", "graspgen"], default="topdown",
+                   help="How to pick one grasp out of GraspGen's candidate set. "
+                        "'topdown' (default, the behaviour the pipeline was verified "
+                        "with) re-ranks by score - w*approach_z, biasing toward grasps "
+                        "approached from above, which the arm reaches most comfortably "
+                        "and which keep the wrist clear of the table. 'graspgen' uses "
+                        "GraspGen's native ranking untouched — highest discriminator "
+                        "confidence wins regardless of approach direction, which is the "
+                        "right choice for measuring GraspGen's own quality or for "
+                        "objects whose best grasp is genuinely from the side. Either "
+                        "way the run logs what the other mode would have picked.")
+    g.add_argument("--grasp-topdown-weight", type=float, default=0.2,
+                   help="Weight w of the top-down bias in --grasp-selection topdown "
+                        "(ignored otherwise). Score is GraspGen's confidence (0..1) "
+                        "minus w*approach_z, so a perfectly top-down grasp gains +w and "
+                        "a bottom-up one loses w: a side grasp must beat the best "
+                        "top-down candidate by more than 2w on confidence to win. "
+                        "Was hardcoded at 0.2. Raise it to insist harder on top-down, "
+                        "lower it toward 0 to approach --grasp-selection graspgen.")
     g.add_argument("--place-goal", type=float, nargs=3, metavar=("X", "Y", "Z"),
                    default=[-0.35, 0.25, 0.05],
                    help="World-frame XYZ the object is carried to in Phase 2, in "
