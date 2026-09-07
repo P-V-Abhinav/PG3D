@@ -344,21 +344,14 @@ def save_rerun_timeline(
                         rr.LineStrips3D([selected_path], colors=[0, 255, 255, 255], radii=0.003),
                     )
 
-        # Goal-marker cluster: draw the 64 synthetic goal points as a magenta
-        # sphere cluster so it's clearly distinct from the object point cloud.
-        if np.all(np.isfinite(target)):
-            from pg3d.policies.dp3.goal_markers import DEFAULT_GOAL_MARKER_RADIUS
-            goal_marker_pts_count = 64
-            goal_marker_radius = DEFAULT_GOAL_MARKER_RADIUS
-            rng_gm = np.random.default_rng(step_idx)
-            offsets = rng_gm.standard_normal((goal_marker_pts_count, 3)).astype(np.float32)
-            norms = np.linalg.norm(offsets, axis=1, keepdims=True)
-            offsets = offsets / np.maximum(norms, 1e-6) * goal_marker_radius
-            goal_marker_cloud = target + offsets
-            rr.log(
-                "world/goal_marker_cluster",
-                rr.Points3D(goal_marker_cloud, colors=[255, 0, 255], radii=0.003),
-            )
+        # NOTE: a magenta "goal_marker_cluster" used to be drawn here -- 64 points
+        # resampled at random on a SPHERE surface every step. It was decoration only,
+        # and it misrepresented the real thing twice over: the marker actually sent to
+        # the policy is 192 DETERMINISTIC points forming a flat double ring (two
+        # concentric rings at 0.70r and 1.00r in XY, corrugated only +/-0.25r in z --
+        # see pg3d/policies/dp3/goal_markers.py), not a random sphere shell. Anyone
+        # reading the rrd would have inferred the wrong marker geometry. The green
+        # "world/goal" point above is the goal.
     rr.disconnect()
 
 
@@ -2263,12 +2256,58 @@ def _execute_pick_and_place(
     #    _select_decision picks a chunk by constraint cost, and the whole chunk is
     #    executed (steps_to_execute actions) before replanning -- the old code threw
     #    away 7 of every 8 predicted actions by taking only actions[0].
-    place_steps = 50
+    # Step budget matched to Phase 1's. The old hardcoded 50 was almost certainly too
+    # few: Phase 1 runs with --max-steps (default 100) and was measured taking 61 steps
+    # to converge on a target only ~0.1-0.2 m from its start, whereas the place goal is
+    # ~0.59 m away AND is approached while carrying the object. Truncating at 50 stops
+    # the arm in transit, which looks identical to "it never goes to the goal".
+    place_steps = int(args.place_steps if args.place_steps is not None else args.max_steps)
+    # Same success threshold as Phase 1 (the env's goal_thresh, default 0.025 m) rather
+    # than the old hardcoded 0.05 m.
+    place_thresh = float(steering["goal_thresh"])
     rng = steering["rng"]
     ema_sim_action = None
     action_ema_alpha = args.action_ema_alpha
     steps_done = 0
     reached_place_goal = False
+    start_dist = float(np.linalg.norm(
+        np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3] - new_goal_pos
+    ))
+    print(
+        f"[Phase 2] budget={place_steps} steps, success threshold={place_thresh:.4f} m, "
+        f"starting distance to place goal={start_dist:.4f} m",
+        flush=True,
+    )
+
+    # Phase-1-identical bookkeeping. run_eval_episode tracks replans, per-replan
+    # decisions, per-step traces and first_success_step for the pick; Phase 2 now keeps
+    # the same four, writing to the SAME decisions.jsonl / step_traces.jsonl through the
+    # same writers, tagged phase="place" so the two phases stay separable.
+    place_replans = 0
+    place_first_success_step: int | None = None
+    place_candidate_feasible = 0
+    place_candidate_total = 0
+    place_decisions: list[Any] = []
+    write_decision = steering["write_decision"]
+    write_step_trace = steering["write_step_trace"]
+    decisions_file = steering["decisions_file"]
+    step_traces_file = steering["step_traces_file"]
+    spec = steering["spec"]
+
+    # Phase 1 writes a step-0 trace before its loop; mirror that for the place phase.
+    write_step_trace(
+        step_traces_file,
+        method=method,
+        spec=spec,
+        step=0,
+        replan_index=None,
+        selected_chunk_step=None,
+        decision=None,
+        entry=sim_entry,
+        constraints=place_constraints,
+        policy_action=None,
+        sim_action=None,
+    )
 
     while steps_done < place_steps and not reached_place_goal:
         decision = _select_decision(
@@ -2291,6 +2330,21 @@ def _execute_pick_and_place(
             timer=steering["timer"],
             parallel_pool=steering["parallel_pool"],
         )
+        # Same per-replan accounting Phase 1 keeps, written to the same decisions.jsonl.
+        place_decisions.append((steps_done, decision))
+        place_replans += 1
+        if decision.result is not None:
+            place_candidate_feasible += decision.candidate_feasible
+            place_candidate_total += decision.candidate_total
+        write_decision(
+            decisions_file,
+            method=method,
+            spec=spec,
+            replan_index=place_replans - 1,
+            step=steps_done,
+            decision=decision,
+        )
+
         steps_to_execute = min(
             decision.selected_chunk.horizon,
             int(policy.n_action_steps) * steering["execution_horizon_chunks"],
@@ -2306,7 +2360,24 @@ def _execute_pick_and_place(
                 flush=True,
             )
 
-        for policy_action in decision.selected_chunk.actions[:steps_to_execute]:
+        # Per-replan trace. A distance that shrinks monotonically and simply runs out of
+        # budget means "increase place_steps". A distance that plateaus well short of the
+        # goal means the policy's prior never proposes chunks that head there, and no
+        # amount of reranking will fix it -- reranking can only pick the best of what the
+        # prior offers, so that would be a checkpoint-coverage problem, not plumbing.
+        _replan_tcp = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
+        print(
+            f"[Phase 2]   replan @ step {steps_done:3d}: "
+            f"dist_to_place_goal={np.linalg.norm(_replan_tcp - new_goal_pos):.4f} m  "
+            f"tcp={np.round(_replan_tcp, 4).tolist()}  "
+            f"feasible={decision.candidate_feasible}/{decision.candidate_total}  "
+            f"reason={decision.selection_reason}",
+            flush=True,
+        )
+
+        for selected_chunk_step, policy_action in enumerate(
+            decision.selected_chunk.actions[:steps_to_execute]
+        ):
             sim_action = policy_action_to_sim_action(
                 policy_action,
                 np.asarray(sim_entry["agent_pos"], dtype=np.float32),
@@ -2330,29 +2401,74 @@ def _execute_pick_and_place(
 
             sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
             obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
-            timeline.append(sim_entry)
+            timeline.append(sim_entry.copy())
             steps_done += 1
 
+            write_step_trace(
+                step_traces_file,
+                method=method,
+                spec=spec,
+                step=steps_done,
+                replan_index=place_replans - 1,
+                selected_chunk_step=selected_chunk_step,
+                decision=decision,
+                entry=sim_entry,
+                constraints=place_constraints,
+                policy_action=policy_action,
+                sim_action=ema_sim_action,
+            )
+
+            # Success, determined EXACTLY as Phase 1 determines it: the env's own
+            # `success` flag, which is TCP-to-goal_site distance <= goal_thresh
+            # (reach_env.py evaluate()). Because Phase 2 moved goal_site to the place
+            # goal, that flag already means "reached the place goal" -- no second,
+            # differently-defined criterion is needed. The old code compared distance
+            # against a hardcoded 0.05 m, which was both a looser threshold than Phase 1
+            # used and computed independently of the env.
             tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
             place_dist = float(np.linalg.norm(tcp_pos - new_goal_pos))
-            if place_dist < 0.05:
+            if _bool_info(sim_info, "success") and place_first_success_step is None:
+                place_first_success_step = steps_done
                 print(
                     f"[Phase 2] Reached place goal at step {steps_done} "
-                    f"(distance {place_dist:.4f} m)",
+                    f"(distance {place_dist:.4f} m, threshold {place_thresh:.4f} m)",
                     flush=True,
                 )
                 reached_place_goal = True
                 break
 
+    # Phase-1-identical reporting: the same constraint-error metrics Phase 1 prints as
+    # "GRASP EXECUTION CHECK", computed with the same cartesian_pose_step_metrics helper
+    # against the place constraint, so the two phases are read the same way.
     tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
-    print(
-        f"[Phase 2] Place goal {new_goal_pos.tolist()} — "
-        f"TCP ended at {np.round(tcp_pos, 4).tolist()}, "
-        f"residual {np.linalg.norm(tcp_pos - new_goal_pos):.4f} m "
-        f"after {steps_done}/{place_steps} steps "
-        f"(reached={reached_place_goal})",
-        flush=True,
+    place_metrics = cartesian_pose_step_metrics(
+        tcp_pose=np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1),
+        constraints=place_constraints,
+        step=steps_done,
     )
+    print("\n=== PLACE EXECUTION CHECK ===")
+    print(f"  Target Position:    {[round(float(x), 4) for x in new_goal_pos]}")
+    print(f"  Achieved Position:  {[round(float(x), 4) for x in tcp_pos]}")
+    print(f"  Residual:           {np.linalg.norm(tcp_pos - new_goal_pos):.4f} m "
+          f"(started {start_dist:.4f} m away)")
+    print(f"  Steps used:         {steps_done}/{place_steps}   replans: {place_replans}")
+    print(f"  Candidates scored:  {place_candidate_feasible}/{place_candidate_total} feasible")
+    print(f"  place_success:      {reached_place_goal} "
+          f"(first success step: {place_first_success_step})")
+    for pm in place_metrics:
+        if pm.get("min_position_error") is not None:
+            print(f"  Achieved Pos Error: {pm['min_position_error']:.4f} m")
+            print(f"  Achieved Rot Error: {pm['rotation_error_at_min_position']:.4f} rad")
+        print(f"  Strictly Satisfied: {pm['satisfied']} "
+              f"(within {pm['position_tolerance']}m and {pm['rotation_tolerance']:.4f}rad)")
+    if not reached_place_goal:
+        # Distinguish the two failure modes explicitly, since they need opposite fixes.
+        if steps_done >= place_steps:
+            print(f"  DIAGNOSIS:          ran out of budget while still converging — "
+                  f"raise --place-steps (was {place_steps})")
+        else:
+            print("  DIAGNOSIS:          stopped early without reaching the goal")
+    print("=============================\n", flush=True)
             
     # Did the object survive transport? Comparing this against the Phase 1c result is
     # what distinguishes "never grasped it" from "grasped it and dropped it en route".
@@ -2838,6 +2954,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "('robotiq_2f_140'), whose control points place the fingertips "
                         "0.195m ahead of the origin along the local +Z axis. Re-derive "
                         "this number from that same function if you switch grippers.")
+    g.add_argument("--place-steps", type=int, default=None,
+                   help="Step budget for the Phase 2 transport to the place goal. "
+                        "Defaults to --max-steps, matching Phase 1's budget. Replaces a "
+                        "hardcoded 50, which was likely too few: Phase 1 was measured "
+                        "needing 61 steps for a ~0.1-0.2 m move, while the place goal is "
+                        "~0.59 m away and is approached while carrying the object, so 50 "
+                        "truncated the arm in transit.")
     g.add_argument("--place-goal", type=float, nargs=3, metavar=("X", "Y", "Z"),
                    default=[-0.35, 0.25, 0.05],
                    help="World-frame XYZ the object is carried to in Phase 2, in "

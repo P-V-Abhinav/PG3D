@@ -1522,6 +1522,10 @@ def run_eval_episode(
                     timer=timer,
                     rng=rng,
                     spec=spec,
+                    decisions_file=decisions_file,
+                    step_traces_file=step_traces_file,
+                    write_decision=_write_decision,
+                    write_step_trace=_write_step_trace,
                 ),
             )
             
