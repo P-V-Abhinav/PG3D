@@ -2455,12 +2455,21 @@ def _execute_pick_and_place(
     print(f"  Candidates scored:  {place_candidate_feasible}/{place_candidate_total} feasible")
     print(f"  place_success:      {reached_place_goal} "
           f"(first success step: {place_first_success_step})")
-    for pm in place_metrics:
-        if pm.get("min_position_error") is not None:
-            print(f"  Achieved Pos Error: {pm['min_position_error']:.4f} m")
-            print(f"  Achieved Rot Error: {pm['rotation_error_at_min_position']:.4f} rad")
+    # cartesian_pose_step_metrics returns PER-STEP rows keyed
+    # position_error / rotation_error / position_violation / rotation_violation /
+    # combined_violation / satisfied. It does NOT carry the tolerances or the
+    # min_position_error / rotation_error_at_min_position fields -- those belong to the
+    # episode-level rows in episode_metric_row, which is what Phase 1's GRASP EXECUTION
+    # CHECK reads. Tolerances come off the constraint object itself.
+    for pm, constraint in zip(place_metrics, place_constraints):
+        print(f"  Achieved Pos Error: {pm['position_error']:.4f} m")
+        print(f"  Achieved Rot Error: {pm['rotation_error']:.4f} rad")
+        print(f"  Violations:         pos {pm['position_violation']:.4f} m, "
+              f"rot {pm['rotation_violation']:.4f} rad "
+              f"(combined {pm['combined_violation']:.4f})")
         print(f"  Strictly Satisfied: {pm['satisfied']} "
-              f"(within {pm['position_tolerance']}m and {pm['rotation_tolerance']:.4f}rad)")
+              f"(within {constraint.position_tolerance}m and "
+              f"{constraint.rotation_tolerance:.4f}rad)")
     if not reached_place_goal:
         # Distinguish the two failure modes explicitly, since they need opposite fixes.
         if steps_done >= place_steps:
