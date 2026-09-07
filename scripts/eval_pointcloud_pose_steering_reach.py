@@ -1493,12 +1493,36 @@ def run_eval_episode(
                 break
                 
         if post_episode_callback is not None:
+            # steering_context hands the callback the SAME machinery this loop used to
+            # steer the policy: the world model / ghost provider, and every knob
+            # _select_decision needs. A callback that wants to drive the policy to a
+            # further goal (e.g. a place goal after a pick) must re-run constraint-based
+            # selection exactly as above -- the goal markers are invisible to the depth
+            # cameras and agent_pos is arm joints only, so constraints are the ONLY
+            # channel that carries goal information to the policy. Sampling chunks
+            # directly instead would silently run the unconditioned policy prior.
             post_episode_callback(
                 sim_env=sim_env,
                 video_env=video_env,
                 frames=frames,
                 timeline=timeline,
                 method=method,
+                steering_context=dict(
+                    world_model=world_model,
+                    provider=provider,
+                    goal_thresh=goal_thresh,
+                    goal_mask_radius=goal_mask_radius,
+                    planning_horizon_chunks=planning_horizon_chunks,
+                    geometry_mode=geometry_mode,
+                    k_schedule=k_schedule,
+                    match_current_robot_points=match_current_robot_points,
+                    execution_horizon_chunks=execution_horizon_chunks,
+                    action_ema_alpha=action_ema_alpha,
+                    parallel_pool=parallel_pool,
+                    timer=timer,
+                    rng=rng,
+                    spec=spec,
+                ),
             )
             
     finally:

@@ -2039,6 +2039,7 @@ def _execute_pick_and_place(
     crop_config: Any,
     action_mode: Any,
     args: Any,
+    steering_context: dict[str, Any],
 ):
     import torch
     from mani_skill.utils.structs.pose import Pose
@@ -2208,54 +2209,150 @@ def _execute_pick_and_place(
         pos_t = torch.tensor(new_goal_pos, dtype=torch.float32, device=sim_env.unwrapped.device).unsqueeze(0)
         sim_env.unwrapped.goal_site.set_pose(Pose.create_from_pq(p=pos_t))
 
-    # 2. Get fresh observation and init window
+    # 2. Build the place CONSTRAINT — this is what actually steers the policy.
+    #
+    # THE BUG THIS REPLACES: the old loop called
+    #     adapter.sample_action_chunks(obs_window, k=1, rng=rng)
+    # which is byte-for-byte the `method == "base"` branch of _select_decision --
+    # no constraints, no reranking, k=1. It therefore ran the UNCONDITIONED policy
+    # prior and had no idea where the place goal was.
+    #
+    # Moving goal_site does not help, because the policy cannot see it:
+    #   * _make_marker_spheres_strictly_virtual() sets the marker's render visibility
+    #     to 0 in sim_env, so it never lands in the depth cameras' point cloud;
+    #   * XArm7Gripper.agent_pos_joint_indices is range(7), so agent_pos is arm joints
+    #     only and carries no goal either.
+    # Constraint-based reranking is the ONLY channel by which goal information reaches
+    # the policy in this architecture. That is exactly why Phase 1 hits its goal (it
+    # goes through RerankingController against the GraspGen CartesianPoseConstraint)
+    # and why Phase 2 landed at the same wrong place regardless of where the place goal
+    # was put -- it was never told, so the offset was the prior's attractor, not a
+    # tracking error.
+    from scripts.eval_pointcloud_pose_steering_reach import _select_decision
+
+    steering = steering_context
+    # Hold the orientation the object was grasped with, so transport does not twist the
+    # cube in the jaws. Position is what we actually care about here, so the rotation
+    # tolerance is deliberately loose and the position tolerance is the goal threshold.
+    place_quat = sim_env.unwrapped.agent.tcp_pose.q[0].cpu().numpy().astype(np.float32)
+    place_constraints = [
+        CartesianPoseConstraint(
+            target_position=new_goal_pos,
+            target_orientation=place_quat,
+            position_tolerance=float(steering["goal_thresh"]),
+            rotation_tolerance=float(args.grasp_rotation_tolerance),
+            weight=float(args.grasp_weight),
+            name="place_goal",
+            metadata={"phase": "place", "episode_output_index": steering["spec"].output_index},
+        )
+    ]
+    place_scene = scene_context_for_constraints(
+        target_position=new_goal_pos,
+        constraints=place_constraints,
+        metadata={"method": method, "phase": "place"},
+    )
+
+    # 3. Get fresh observation and init window
     sim_obs = sim_env.unwrapped.get_obs()
     sim_info = {}
     sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
     obs_window = make_initial_obs_window(sim_entry, n_obs_steps=int(policy.n_obs_steps))
     timeline.append(sim_entry)
 
-    # 3. Run policy for 50 steps
+    # 4. Drive to the place goal with the SAME select-then-execute loop as Phase 1:
+    #    _select_decision picks a chunk by constraint cost, and the whole chunk is
+    #    executed (steps_to_execute actions) before replanning -- the old code threw
+    #    away 7 of every 8 predicted actions by taking only actions[0].
     place_steps = 50
-    rng = np.random.default_rng(args.seed)
+    rng = steering["rng"]
     ema_sim_action = None
     action_ema_alpha = args.action_ema_alpha
+    steps_done = 0
+    reached_place_goal = False
 
-    for step in range(place_steps):
-        chunks = adapter.sample_action_chunks(obs_window, k=1, rng=rng)
-        selected_chunk = chunks[0]
-        
-        policy_action = selected_chunk.actions[0]
-        
-        sim_action = policy_action_to_sim_action(
-            policy_action,
-            np.asarray(sim_entry["agent_pos"], dtype=np.float32),
-            action_mode=action_mode,
-            sim_action_dim=int(np.prod(sim_env.action_space.shape)),
-            low=getattr(sim_env.action_space, "low", None),
-            high=getattr(sim_env.action_space, "high", None),
-            gripper_open=GRIPPER_CLOSED_TARGET,  # Keep gripper closed
+    while steps_done < place_steps and not reached_place_goal:
+        decision = _select_decision(
+            method=method,
+            adapter=adapter,
+            world_model=steering["world_model"],
+            provider=steering["provider"],
+            current_entry=sim_entry,
+            obs_window=obs_window,
+            scene=place_scene,
+            constraints=place_constraints,
+            crop_config=crop_config,
+            goal_thresh=steering["goal_thresh"],
+            goal_mask_radius=steering["goal_mask_radius"],
+            planning_horizon_chunks=steering["planning_horizon_chunks"],
+            geometry_mode=steering["geometry_mode"],
+            k_schedule=steering["k_schedule"],
+            match_current_robot_points=steering["match_current_robot_points"],
+            rng=rng,
+            timer=steering["timer"],
+            parallel_pool=steering["parallel_pool"],
         )
-        
-        if ema_sim_action is None or action_ema_alpha >= 1.0:
-            ema_sim_action = sim_action
-        else:
-            ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
-            
-        sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
-        if video_env is not None:
-            video_env.step(ema_sim_action)
-            
-        frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
-            
-        sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
-        obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
-        timeline.append(sim_entry)
-        
-        tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
-        if np.linalg.norm(tcp_pos - new_goal_pos) < 0.05:
-            print(f"[Phase 2] Reached new goal at step {step}!", flush=True)
-            break
+        steps_to_execute = min(
+            decision.selected_chunk.horizon,
+            int(policy.n_action_steps) * steering["execution_horizon_chunks"],
+            place_steps - steps_done,
+        )
+        if steps_done == 0:
+            print(
+                f"[Phase 2] steering with method={method} "
+                f"k_schedule={steering['k_schedule']} "
+                f"chunk_horizon={decision.selected_chunk.horizon} "
+                f"steps_to_execute={steps_to_execute} "
+                f"(candidates scored: {decision.candidate_total})",
+                flush=True,
+            )
+
+        for policy_action in decision.selected_chunk.actions[:steps_to_execute]:
+            sim_action = policy_action_to_sim_action(
+                policy_action,
+                np.asarray(sim_entry["agent_pos"], dtype=np.float32),
+                action_mode=action_mode,
+                sim_action_dim=int(np.prod(sim_env.action_space.shape)),
+                low=getattr(sim_env.action_space, "low", None),
+                high=getattr(sim_env.action_space, "high", None),
+                gripper_open=GRIPPER_CLOSED_TARGET,  # Keep gripper closed
+            )
+
+            if ema_sim_action is None or action_ema_alpha >= 1.0:
+                ema_sim_action = sim_action
+            else:
+                ema_sim_action = action_ema_alpha * sim_action + (1.0 - action_ema_alpha) * ema_sim_action
+
+            sim_obs, _reward, terminated, truncated, sim_info = sim_env.step(ema_sim_action)
+            if video_env is not None:
+                video_env.step(ema_sim_action)
+
+            frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
+
+            sim_entry = rollout_observation_entry(sim_obs, sim_info, env=sim_env, crop_config=crop_config)
+            obs_window = append_obs_window(obs_window, sim_entry, n_obs_steps=int(policy.n_obs_steps))
+            timeline.append(sim_entry)
+            steps_done += 1
+
+            tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
+            place_dist = float(np.linalg.norm(tcp_pos - new_goal_pos))
+            if place_dist < 0.05:
+                print(
+                    f"[Phase 2] Reached place goal at step {steps_done} "
+                    f"(distance {place_dist:.4f} m)",
+                    flush=True,
+                )
+                reached_place_goal = True
+                break
+
+    tcp_pos = np.asarray(sim_entry["tcp_pose"], dtype=np.float32).reshape(-1)[:3]
+    print(
+        f"[Phase 2] Place goal {new_goal_pos.tolist()} — "
+        f"TCP ended at {np.round(tcp_pos, 4).tolist()}, "
+        f"residual {np.linalg.norm(tcp_pos - new_goal_pos):.4f} m "
+        f"after {steps_done}/{place_steps} steps "
+        f"(reached={reached_place_goal})",
+        flush=True,
+    )
             
     # Did the object survive transport? Comparing this against the Phase 1c result is
     # what distinguishes "never grasped it" from "grasped it and dropped it en route".
@@ -2579,6 +2676,7 @@ def main(argv: list[str] | None = None) -> int:
                             crop_config=crop_config,
                             action_mode=action_mode,
                             args=args,
+                            steering_context=kwargs["steering_context"],
                         ),
                     )
                     rows.append(row)
