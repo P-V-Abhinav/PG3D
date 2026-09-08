@@ -27,7 +27,20 @@ def register_pg3d_xarm7_robotiq_reach_envs() -> None:
     from pg3d.envs.xarm_adapter import reach_env  # noqa: F401
 
 
+def register_pg3d_eval_envs() -> None:
+    """Register the frozen 25-env ten-task evaluation suite (``PG3DReach-Eval-*``).
+
+    Local-testing mirror of the master suite; see
+    :mod:`pg3d.envs.xarm_adapter.eval_envs.master_env_settings` for what this
+    copy pins so it matches the official camera/arm layout.
+    """
+    from pg3d.envs.xarm_adapter.eval_envs import register_pg3d_eval_envs as _register
+
+    _register()
+
+
 __all__ = [
+    "register_pg3d_eval_envs",
     "register_pg3d_xarm7_reach_envs",
     "register_pg3d_xarm7_gripper_reach_envs",
     "register_pg3d_xarm7_robotiq_reach_envs",

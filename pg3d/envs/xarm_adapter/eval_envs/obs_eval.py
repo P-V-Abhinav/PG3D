@@ -1,298 +1,240 @@
-"""obs_eval.py — Deterministic Obstacle evaluation environments (Tasks 3, 4, 6).
+"""obs_eval.py -- Deterministic obstacle eval envs (T2, T4, T6).
 
-Two env families:
-  PG3DEvalObsReachEnv  — reach through 3 slalom obstacles  (Task 3)
-  PG3DEvalObsPPEnv     — pick & place through obstacles     (Tasks 4, 6)
+Two families:
 
-Obstacle geometry
------------------
-Each obstacle is a tall kinematic blue cuboid:
-  half_sizes = [0.03, 0.03, 0.15]  →  6 cm × 6 cm × 30 cm
-  (matches PG3DReachRealObstacleEnv in obstacle_envs.py)
+  ``PG3DReach-Eval-Obs-Reach-v*``  reach through a three-bar slalom      (T2)
+  ``PG3DReach-Eval-Obs-PP-v*``     pick and place through a slalom  (T4, T6)
 
-Obstacle placement (deterministic)
------------------------------------
-Given a hardcoded start and goal position (TCP targets in world frame),
-the three obstacles are placed as a slalom on the direct path:
+Obstacle geometry is one frozen shape -- three upright 6 x 6 x 30 cm bars -- and
+their positions are a pure function of the frozen start and goal (see
+``eval_config.slalom_obstacle_positions``): one bar on the path midpoint and two
+straddling it. Nothing is sampled, so the layout is identical on every run and
+every machine.
 
-  obs0  : path midpoint                              (blocks direct route)
-  obs1  : midpoint + path_dir * 0.06 + perp * 0.08  (forward-left)
-  obs2  : midpoint - path_dir * 0.06 - perp * 0.08  (back-right)
+The bars are real scene geometry, so unlike the goal/start markers they are NOT
+blanked while observations render: the policy is meant to see them in the point
+cloud.
 
-Because start and goal are class-level constants, all obstacle positions
-are fully deterministic — no randomness.
-
-Task 6 (L/R + Avoidance) reuses PG3DReach-Eval-Obs-PP-v* directly.
-The L/R distinction is an ApproachPostureConstraint in the eval script.
+They are also COLLIDABLE. The suite this was ported from built them with
+``add_collision=False``, which makes an "avoidance" task unfalsifiable -- the arm
+can sweep straight through a bar and still be graded successful. Physical
+contact is what T2/T4/T6 grade against, so collision is on by default; pass
+``obstacle_collision=False`` to reproduce the old virtual-obstacle behaviour.
 """
+
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
-import numpy as np
+import sapien
 import torch
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 
-from .eval_config import CUBE_POSITIONS, OBS_REACH_CONFIGS, PLACE_TARGETS
-from .reach_eval import PG3DEvalBase
+from .eval_base import PG3DEvalBase
+from .eval_config import (
+    CUBE_HALF_SIZE,
+    CUBE_POSITIONS,
+    OBS_PP_START_QPOS,
+    OBS_PP_START_TCPS,
+    OBS_REACH_CONFIGS,
+    OBS_REACH_START_QPOS,
+    OBSTACLE_HALF_SIZES,
+    OBSTACLE_PP_PATH_HEIGHT_M,
+    PLACE_TARGETS,
+    slalom_obstacle_positions,
+)
+from .pp_eval import PG3DEvalPickPlaceEnv
+
+Vec3 = tuple[float, float, float]
 
 
-# ---------------------------------------------------------------------------
-# Shared: obstacle placement utility
-# ---------------------------------------------------------------------------
+class _SlalomObstacleMixin:
+    """Build and place the three frozen slalom bars.
 
-def _slalom_obstacle_positions(
-    start: tuple[float, float, float],
-    goal: tuple[float, float, float],
-    *,
-    obs_half_height: float = 0.15,
-) -> list[tuple[float, float, float]]:
-    """Compute the 3 obstacle centres for a start→goal slalom path.
-
-    Returns a list of 3 (x, y, z) world-frame positions.
-    Obstacles are placed at height z = obs_half_height (their centre).
-    """
-    s = np.array(start, dtype=np.float64)
-    g = np.array(goal,  dtype=np.float64)
-    mid = (s + g) / 2.0
-
-    # Forward unit vector in the XY plane
-    diff_xy = g[:2] - s[:2]
-    norm_xy = np.linalg.norm(diff_xy)
-    if norm_xy < 1e-6:
-        # Path is vertical — place obstacles in a fixed pattern
-        path_dir = np.array([1.0, 0.0])
-    else:
-        path_dir = diff_xy / norm_xy
-
-    perp_dir = np.array([-path_dir[1], path_dir[0]])  # left perpendicular
-
-    obs_z = obs_half_height
-
-    positions = [
-        (float(mid[0]),
-         float(mid[1]),
-         obs_z),
-
-        (float(mid[0] + path_dir[0] * 0.06 + perp_dir[0] * 0.08),
-         float(mid[1] + path_dir[1] * 0.06 + perp_dir[1] * 0.08),
-         obs_z),
-
-        (float(mid[0] - path_dir[0] * 0.06 - perp_dir[0] * 0.08),
-         float(mid[1] - path_dir[1] * 0.06 - perp_dir[1] * 0.08),
-         obs_z),
-    ]
-    return positions
-
-
-# ---------------------------------------------------------------------------
-# Obstacle mixin — builds 3 tall cuboid obstacles
-# ---------------------------------------------------------------------------
-
-class _ObstacleMixin:
-    """Mixin that adds 3 kinematic tall-cuboid obstacles to any eval base.
-
-    half_sizes=[0.03, 0.03, 0.15] → 6 cm × 6 cm × 30 cm blue cuboids.
-    Subclass must provide START_POS and GOAL_POS (or CUBE_POS / PLACE_POS).
+    Subclasses implement :meth:`slalom_endpoints` to say which path the slalom
+    straddles: the TCP path for a reach, the carried-cube transport path for a
+    pick and place.
     """
 
-    # Half-sizes matching PG3DReachRealObstacleEnv
-    OBS_HALF_SIZES: list[float] = [0.03, 0.03, 0.15]
+    OBSTACLE_HALF_SIZES: Vec3 = OBSTACLE_HALF_SIZES
+
+    def __init__(self, *args: Any, obstacle_collision: bool = True, **kwargs: Any) -> None:
+        self._obstacle_collision = bool(obstacle_collision)
+        super().__init__(*args, **kwargs)  # type: ignore[call-arg]
+
+    @classmethod
+    def slalom_endpoints(cls) -> tuple[Vec3, Vec3]:
+        raise NotImplementedError
+
+    @classmethod
+    def obstacle_positions(cls) -> list[Vec3]:
+        """The three frozen bar centres, computable without building the env."""
+        start, goal = cls.slalom_endpoints()
+        return slalom_obstacle_positions(start, goal, obs_half_height=cls.OBSTACLE_HALF_SIZES[2])
 
     def _load_scene(self, options: dict[str, Any]) -> None:
-        super()._load_scene(options)   # type: ignore[misc]
-        self._obstacles: list[Any] = []
-        for i in range(3):
-            obs = actors.build_box(
-                self.scene,                         # type: ignore[attr-defined]
-                half_sizes=self.OBS_HALF_SIZES,
-                color=[0.10, 0.10, 0.90, 1.0],
-                name=f"obstacle_{i}",
-                body_type="kinematic",
-                add_collision=False,
+        super()._load_scene(options)  # type: ignore[misc]
+        self.obstacle_actors: list[Any] = []
+        for index, position in enumerate(self.obstacle_positions()):
+            self.obstacle_actors.append(
+                actors.build_box(
+                    self.scene,  # type: ignore[attr-defined]
+                    half_sizes=list(self.OBSTACLE_HALF_SIZES),
+                    color=[0.10, 0.10, 0.90, 1.0],
+                    name=f"obstacle_{index}",
+                    body_type="kinematic",
+                    add_collision=self._obstacle_collision,
+                    initial_pose=sapien.Pose(p=list(position)),
+                )
             )
-            self._obstacles.append(obs)
 
-    def _place_obstacles(
-        self,
-        start: tuple[float, float, float],
-        goal: tuple[float, float, float],
-    ) -> None:
-        """Place the 3 obstacles on the start→goal slalom path."""
-        positions = _slalom_obstacle_positions(
-            start, goal,
-            obs_half_height=self.OBS_HALF_SIZES[2],
-        )
-        for obs, pos in zip(self._obstacles, positions):
-            pos_t = torch.tensor(
-                [list(pos)],
+    def _place_obstacles(self, batch: int) -> None:
+        for actor, position in zip(self.obstacle_actors, self.obstacle_positions(), strict=True):
+            pose = torch.tensor(
+                [list(position)],
                 dtype=torch.float32,
-                device=self.device,               # type: ignore[attr-defined]
-            )
-            obs.set_pose(Pose.create_from_pq(pos_t))
+                device=self.device,  # type: ignore[attr-defined]
+            ).expand(batch, -1)
+            actor.set_pose(Pose.create_from_pq(pose))
 
 
 # ---------------------------------------------------------------------------
-# ENV 3: Obstacle Reach  (Task 3)
+# T2 -- reach through the slalom
 # ---------------------------------------------------------------------------
+class PG3DEvalObsReachEnv(_SlalomObstacleMixin, PG3DEvalBase):
+    """Reach a frozen goal from the frozen start without touching three bars."""
 
-class PG3DEvalObsReachEnv(_ObstacleMixin, PG3DEvalBase):
-    """Deterministic reach-through-obstacles base.
+    TASK_IDS = ("T2",)
 
-    Subclasses set:
-      START_POS : (x, y, z) — TCP at episode start (used for obstacle placement)
-      GOAL_POS  : (x, y, z) — TCP reach target
-    """
+    @classmethod
+    def slalom_endpoints(cls) -> tuple[Vec3, Vec3]:
+        return cls.START_TCP_POS, cls.GOAL_POS
 
-    START_POS: tuple[float, float, float]
-    GOAL_POS:  tuple[float, float, float]
-
-    def _initialize_episode(
-        self, env_idx: torch.Tensor, options: dict[str, Any]
-    ) -> None:
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
-        with torch.device(self.device):
-            n = len(env_idx)
-            goal_t = torch.tensor(
-                [list(self.GOAL_POS)] * n,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self.goal_site.set_pose(Pose.create_from_pq(goal_t))
-        self._place_obstacles(self.START_POS, self.GOAL_POS)
+        self._place_obstacles(len(env_idx))
 
 
 @register_env("PG3DReach-Eval-Obs-Reach-v1", max_episode_steps=200)
 class PG3DEvalObsReachV1(PG3DEvalObsReachEnv):
-    """Obs-Reach v1 — pure lateral slalom."""
-    START_POS = OBS_REACH_CONFIGS["v1"]["start"]
-    GOAL_POS  = OBS_REACH_CONFIGS["v1"]["goal"]
+    """Obs-Reach v1 -- forward-left slalom."""
+
+    GOAL_POS = OBS_REACH_CONFIGS["v1"]["goal"]
+    START_TCP_POS = OBS_REACH_CONFIGS["v1"]["start"]
+    START_QPOS = OBS_REACH_START_QPOS["v1"]
 
 
 @register_env("PG3DReach-Eval-Obs-Reach-v2", max_episode_steps=200)
 class PG3DEvalObsReachV2(PG3DEvalObsReachEnv):
-    """Obs-Reach v2 — pure forward slalom."""
-    START_POS = OBS_REACH_CONFIGS["v2"]["start"]
-    GOAL_POS  = OBS_REACH_CONFIGS["v2"]["goal"]
+    """Obs-Reach v2 -- pure forward slalom."""
+
+    GOAL_POS = OBS_REACH_CONFIGS["v2"]["goal"]
+    START_TCP_POS = OBS_REACH_CONFIGS["v2"]["start"]
+    START_QPOS = OBS_REACH_START_QPOS["v2"]
 
 
 @register_env("PG3DReach-Eval-Obs-Reach-v3", max_episode_steps=200)
 class PG3DEvalObsReachV3(PG3DEvalObsReachEnv):
-    """Obs-Reach v3 — vertical slalom."""
-    START_POS = OBS_REACH_CONFIGS["v3"]["start"]
-    GOAL_POS  = OBS_REACH_CONFIGS["v3"]["goal"]
+    """Obs-Reach v3 -- forward-right slalom."""
+
+    GOAL_POS = OBS_REACH_CONFIGS["v3"]["goal"]
+    START_TCP_POS = OBS_REACH_CONFIGS["v3"]["start"]
+    START_QPOS = OBS_REACH_START_QPOS["v3"]
 
 
 @register_env("PG3DReach-Eval-Obs-Reach-v4", max_episode_steps=200)
 class PG3DEvalObsReachV4(PG3DEvalObsReachEnv):
-    """Obs-Reach v4 — 3D diagonal slalom."""
-    START_POS = OBS_REACH_CONFIGS["v4"]["start"]
-    GOAL_POS  = OBS_REACH_CONFIGS["v4"]["goal"]
+    """Obs-Reach v4 -- backward-left slalom."""
+
+    GOAL_POS = OBS_REACH_CONFIGS["v4"]["goal"]
+    START_TCP_POS = OBS_REACH_CONFIGS["v4"]["start"]
+    START_QPOS = OBS_REACH_START_QPOS["v4"]
 
 
 @register_env("PG3DReach-Eval-Obs-Reach-v5", max_episode_steps=200)
 class PG3DEvalObsReachV5(PG3DEvalObsReachEnv):
-    """Obs-Reach v5 — dense forward slalom (tightest)."""
-    START_POS = OBS_REACH_CONFIGS["v5"]["start"]
-    GOAL_POS  = OBS_REACH_CONFIGS["v5"]["goal"]
+    """Obs-Reach v5 -- backward-right slalom."""
+
+    GOAL_POS = OBS_REACH_CONFIGS["v5"]["goal"]
+    START_TCP_POS = OBS_REACH_CONFIGS["v5"]["start"]
+    START_QPOS = OBS_REACH_START_QPOS["v5"]
 
 
 # ---------------------------------------------------------------------------
-# ENV 4: Obstacle Pick & Place  (Tasks 4, 6)
+# T4 / T6 -- pick and place through the slalom
 #
-# Cube position and place target use the canonical CUBE_POSITIONS /
-# PLACE_TARGETS shared with the plain PP envs.
-#
-# The slalom path is computed between:
-#   slalom_start = (cube_x, cube_y, 0.20)   ← lifted above cube
-#   slalom_goal  = (place_x, place_y, 0.20) ← above place target
-#
-# This gives a horizontal obstacle field at 0.15 m height that the
-# arm must navigate while carrying the cube.
+# The slalom straddles the carried-cube transport path: from above the cube to
+# above the place target, both at OBSTACLE_PP_PATH_HEIGHT_M. Cube and place
+# target are the canonical ones shared with the plain pick-and-place envs, so a
+# T3-vs-T4 comparison differs only by the obstacles.
 # ---------------------------------------------------------------------------
+class PG3DEvalObsPickPlaceEnv(_SlalomObstacleMixin, PG3DEvalPickPlaceEnv):
+    """Pick and place through the frozen slalom."""
 
-class PG3DEvalObsPPEnv(_ObstacleMixin, PG3DEvalBase):
-    """Deterministic obstacle Pick & Place base.
+    TASK_IDS = ("T4", "T6")
 
-    Subclasses set CUBE_POS and PLACE_POS from canonical config.
-    """
+    CUBE_HALF_SIZE: float = CUBE_HALF_SIZE
 
-    CUBE_POS:  tuple[float, float, float]
-    PLACE_POS: tuple[float, float, float]
-    CUBE_HALF_SIZE: float = 0.035
-
-    def _load_scene(self, options: dict[str, Any]) -> None:
-        super()._load_scene(options)
-        self.cube = actors.build_box(
-            self.scene,
-            half_sizes=[self.CUBE_HALF_SIZE] * 3,
-            color=[0.85, 0.20, 0.20, 1.0],
-            name="cube",
-            body_type="dynamic",
+    @classmethod
+    def slalom_endpoints(cls) -> tuple[Vec3, Vec3]:
+        height = OBSTACLE_PP_PATH_HEIGHT_M
+        return (
+            (cls.CUBE_POS[0], cls.CUBE_POS[1], height),
+            (cls.GOAL_POS[0], cls.GOAL_POS[1], height),
         )
 
-    def _initialize_episode(
-        self, env_idx: torch.Tensor, options: dict[str, Any]
-    ) -> None:
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict[str, Any]) -> None:
         super()._initialize_episode(env_idx, options)
-        with torch.device(self.device):
-            n = len(env_idx)
-
-            # Place cube
-            cube_t = torch.tensor(
-                [list(self.CUBE_POS)] * n,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self.cube.set_pose(Pose.create_from_pq(cube_t))
-
-            # Place goal_site at place target
-            place_t = torch.tensor(
-                [list(self.PLACE_POS)] * n,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            self.goal_site.set_pose(Pose.create_from_pq(place_t))
-
-        # Slalom path runs between cube and place target, both lifted to 0.20m
-        slalom_start = (self.CUBE_POS[0],  self.CUBE_POS[1],  0.20)
-        slalom_goal  = (self.PLACE_POS[0], self.PLACE_POS[1], 0.20)
-        self._place_obstacles(slalom_start, slalom_goal)
+        self._place_obstacles(len(env_idx))
 
 
 @register_env("PG3DReach-Eval-Obs-PP-v1", max_episode_steps=250)
-class PG3DEvalObsPPV1(PG3DEvalObsPPEnv):
-    """Obs-PP v1 — lateral slalom (cube front-center)."""
-    CUBE_POS  = CUBE_POSITIONS["v1"]
-    PLACE_POS = PLACE_TARGETS["v1"]
+class PG3DEvalObsPPV1(PG3DEvalObsPickPlaceEnv):
+    """Obs-PP v1 -- lateral transport slalom."""
+
+    CUBE_POS = CUBE_POSITIONS["v1"]
+    GOAL_POS = PLACE_TARGETS["v1"]
+    START_TCP_POS = OBS_PP_START_TCPS["v1"]
+    START_QPOS = OBS_PP_START_QPOS["v1"]
 
 
 @register_env("PG3DReach-Eval-Obs-PP-v2", max_episode_steps=250)
-class PG3DEvalObsPPV2(PG3DEvalObsPPEnv):
-    """Obs-PP v2 — forward slalom (far cube)."""
-    CUBE_POS  = CUBE_POSITIONS["v2"]
-    PLACE_POS = PLACE_TARGETS["v2"]
+class PG3DEvalObsPPV2(PG3DEvalObsPickPlaceEnv):
+    """Obs-PP v2 -- longitudinal pull-back slalom."""
+
+    CUBE_POS = CUBE_POSITIONS["v2"]
+    GOAL_POS = PLACE_TARGETS["v2"]
+    START_TCP_POS = OBS_PP_START_TCPS["v2"]
+    START_QPOS = OBS_PP_START_QPOS["v2"]
 
 
 @register_env("PG3DReach-Eval-Obs-PP-v3", max_episode_steps=250)
-class PG3DEvalObsPPV3(PG3DEvalObsPPEnv):
-    """Obs-PP v3 — cross-sweep slalom."""
-    CUBE_POS  = CUBE_POSITIONS["v3"]
-    PLACE_POS = PLACE_TARGETS["v3"]
+class PG3DEvalObsPPV3(PG3DEvalObsPickPlaceEnv):
+    """Obs-PP v3 -- diagonal cross-sweep slalom."""
+
+    CUBE_POS = CUBE_POSITIONS["v3"]
+    GOAL_POS = PLACE_TARGETS["v3"]
+    START_TCP_POS = OBS_PP_START_TCPS["v3"]
+    START_QPOS = OBS_PP_START_QPOS["v3"]
 
 
 @register_env("PG3DReach-Eval-Obs-PP-v4", max_episode_steps=250)
-class PG3DEvalObsPPV4(PG3DEvalObsPPEnv):
-    """Obs-PP v4 — diagonal slalom."""
-    CUBE_POS  = CUBE_POSITIONS["v4"]
-    PLACE_POS = PLACE_TARGETS["v4"]
+class PG3DEvalObsPPV4(PG3DEvalObsPickPlaceEnv):
+    """Obs-PP v4 -- diagonal pull-back slalom."""
+
+    CUBE_POS = CUBE_POSITIONS["v4"]
+    GOAL_POS = PLACE_TARGETS["v4"]
+    START_TCP_POS = OBS_PP_START_TCPS["v4"]
+    START_QPOS = OBS_PP_START_QPOS["v4"]
 
 
 @register_env("PG3DReach-Eval-Obs-PP-v5", max_episode_steps=250)
-class PG3DEvalObsPPV5(PG3DEvalObsPPEnv):
-    """Obs-PP v5 — vertical-lift slalom (hardest)."""
-    CUBE_POS  = CUBE_POSITIONS["v5"]
-    PLACE_POS = PLACE_TARGETS["v5"]
+class PG3DEvalObsPPV5(PG3DEvalObsPickPlaceEnv):
+    """Obs-PP v5 -- far-front-left diagonal slalom."""
+
+    CUBE_POS = CUBE_POSITIONS["v5"]
+    GOAL_POS = PLACE_TARGETS["v5"]
+    START_TCP_POS = OBS_PP_START_TCPS["v5"]
+    START_QPOS = OBS_PP_START_QPOS["v5"]
