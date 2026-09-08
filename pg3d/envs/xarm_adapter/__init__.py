@@ -18,8 +18,17 @@ def register_pg3d_xarm7_reach_envs() -> None:
 
 
 def register_pg3d_xarm7_gripper_reach_envs() -> None:
-    """Register ``xarm7_gripper`` agent and ``PG3DReach-XArm7-Gripper-*`` env ids."""
+    """Register ``xarm7_gripper`` agent and ``PG3DReach-XArm7-Gripper-*`` env ids.
+
+    Also registers the frozen eval suite (``PG3DReach-Eval-*``), which is built
+    on this same agent. Every eval script already calls this registrar, so the
+    suite's ids resolve in all of them without a per-script edit -- the point of
+    the suite being self-contained is lost if using one still needs a code
+    change. Registering ids no script asks for is inert.
+    """
     from pg3d.envs.xarm_adapter import reach_env  # noqa: F401
+
+    register_pg3d_eval_envs()
 
 
 def register_pg3d_xarm7_robotiq_reach_envs() -> None:

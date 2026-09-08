@@ -159,7 +159,10 @@ from pg3d.envs.maniskill_adapter.dataset import (
     load_reach_metadata,
 )
 from pg3d.envs.maniskill_adapter.reach_env import PG3DReachEnv
-from pg3d.envs.xarm_adapter import register_pg3d_xarm7_gripper_reach_envs
+from pg3d.envs.xarm_adapter import (
+    register_pg3d_eval_envs,
+    register_pg3d_xarm7_gripper_reach_envs,
+)
 from pg3d.envs.xarm_adapter.agents import XArm7Gripper
 
 # Fully-closed gripper drive target. NOT 0.85 (the joint's hard limit): the
@@ -2586,6 +2589,10 @@ def main(argv: list[str] | None = None) -> int:
 
     register_pg3d_reach_envs()
     register_pg3d_xarm7_gripper_reach_envs()
+    # The frozen ten-task eval suite (PG3DReach-Eval-*). Registering it here is
+    # what lets --env-id-override name one of those envs; without it gym.make
+    # raises "unknown env id". Inert otherwise.
+    register_pg3d_eval_envs()
     metadata = load_reach_metadata(args.dataset)
     if args.env_id_override is not None:
         metadata["env_id"] = args.env_id_override
