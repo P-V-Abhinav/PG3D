@@ -81,8 +81,12 @@ def to_world(pos_m1: Vec3) -> Vec3:
 # too). :func:`verify_marker_contract` closes the drift risk by checking them
 # against the policy package's own defaults, and every eval env calls it at
 # construction.
+# Measured out of the checkpoint's own dataset (`pose_variety_final.zarr`) on
+# 2026-09-09 by matching the trailing points of `data/point_cloud` against
+# `goal_marker_offsets`: sphere / 192 / 0.045, at 0.000000 m error. Re-measure
+# the same way if the dataset behind the checkpoint changes.
 GOAL_MARKER_POINTS: int = 192
-GOAL_MARKER_RADIUS: float = 0.055
+GOAL_MARKER_RADIUS: float = 0.045
 GOAL_MARKER_SHAPE: str = "sphere"
 
 

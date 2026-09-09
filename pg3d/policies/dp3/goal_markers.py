@@ -10,8 +10,17 @@ Array = np.ndarray
 # The encoder splits off the trailing `goal_marker_points` slots as the goal
 # branch, so this MUST equal the number of goal slots baked by the dataset
 # writer or baked markers leak into the PointNet scene branch.
+#
+# The radius was 0.055 here while this comment said 0.045, and the artifact
+# settles it: recovering the marker directly out of `pose_variety_final.zarr`
+# (match the trailing 192 points of `data/point_cloud` against
+# `goal_marker_offsets`) reproduces them at 0.000000 m error with
+# shape="sphere", num_points=192, radius=0.045, on rows 0 / 226944 / 453888.
+# Corrected to 0.045 on 2026-09-09. A 1 cm error here is not cosmetic: the
+# encoder flattens the marker points, so every one of the 192 slots would have
+# been offset radially from what the checkpoint was trained to read.
 DEFAULT_GOAL_MARKER_POINTS = 192
-DEFAULT_GOAL_MARKER_RADIUS = 0.055
+DEFAULT_GOAL_MARKER_RADIUS = 0.045
 
 MarkerShape = Literal["sphere", "cross_ring"]
 
