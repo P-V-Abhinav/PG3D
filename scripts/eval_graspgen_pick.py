@@ -2633,14 +2633,25 @@ def main(argv: list[str] | None = None) -> int:
     action_mode = _action_mode(str(metadata.get("action_mode", "abs_joint")))
     crop_config = crop_config_from_metadata(metadata)
 
-    # Expand crop bounds for kitchen scene (same as pose steering script).
-    new_bounds = crop_config.bounds.copy()
-    new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)
-    new_bounds[2, 0] = 0.005
-    crop_config = PointCloudCropConfig(
-        bounds=new_bounds,
-        num_points=crop_config.num_points,
-        robot_point_fraction=0.25,
+    # See the note in eval_pointcloud_obstacle_reach.py: the crop is part of the
+    # checkpoint's input contract. `pose_variety_final.zarr` records
+    # robot_point_fraction=1.0 (robot points only), and overriding it to 0.25
+    # feeds the policy 768 scene points it never trained on. Kept behind a flag
+    # for reproducing older kitchen runs; OFF by default.
+    if args.crop_override == "legacy":
+        new_bounds = crop_config.bounds.copy()
+        new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)
+        new_bounds[2, 0] = 0.005
+        crop_config = PointCloudCropConfig(
+            bounds=new_bounds,
+            num_points=crop_config.num_points,
+            robot_point_fraction=0.25,
+        )
+    print(
+        f"crop_config ({args.crop_override}): bounds={crop_config.bounds.tolist()} "
+        f"num_points={crop_config.num_points} "
+        f"robot_point_fraction={crop_config.robot_point_fraction}",
+        flush=True,
     )
 
     goal_thresh = (
@@ -3088,6 +3099,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Close the browser tab or press Ctrl+C to continue.")
 
     # --- Episode / source ---
+    p.add_argument(
+        "--crop-override",
+        choices=["dataset", "legacy"],
+        default="dataset",
+        help="'dataset' (default): crop exactly as the training dataset's metadata records. "
+             "'legacy': the old kitchen override (x_max>=0.7, z_min=0.005, "
+             "robot_point_fraction=0.25), which is off-contract for this checkpoint.",
+    )
     p.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--seed-start", type=int, default=0)

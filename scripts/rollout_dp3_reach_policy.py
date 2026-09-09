@@ -780,6 +780,45 @@ def save_rerun_timeline(
                     active_decision = d
                 else:
                     break
+
+            # The action chunk the policy actually committed to at this step,
+            # drawn for EVERY method. The candidate/selected trajectories below
+            # only exist when a controller ran, so an unsteered `base` rollout
+            # would otherwise show no policy output at all in the .rrd.
+            chunk_path = getattr(active_decision, "eef_path", None)
+            if chunk_path is not None:
+                chunk_path = np.asarray(chunk_path, dtype=np.float32)
+                if chunk_path.ndim == 2 and chunk_path.shape[1] == 3 and chunk_path.shape[0] >= 1:
+                    rr.log(
+                        "world/action_chunk/waypoints",
+                        rr.Points3D(chunk_path, colors=[255, 0, 200], radii=0.006),
+                    )
+                    if chunk_path.shape[0] >= 2:
+                        rr.log(
+                            "world/action_chunk/path",
+                            rr.LineStrips3D([chunk_path], colors=[255, 0, 200], radii=0.003),
+                        )
+                    rr.log(
+                        "world/action_chunk/end",
+                        rr.Points3D(chunk_path[-1:], colors=[255, 255, 0], radii=0.010),
+                    )
+            chunk = getattr(active_decision, "selected_chunk", None)
+            actions = getattr(chunk, "actions", None)
+            if actions is not None:
+                actions = np.asarray(actions, dtype=np.float32)
+                if actions.ndim == 2:
+                    # Joint-space view of the same chunk: one scalar series per
+                    # joint, holding the chunk's FIRST commanded target. Reading
+                    # these next to the executed qpos is how a chunk that is
+                    # sane in joint space but wrong in Cartesian space (or the
+                    # reverse) gets spotted.
+                    for joint_idx in range(actions.shape[1]):
+                        rr.log(
+                            f"policy/action_chunk/joint_{joint_idx}",
+                            rr.Scalar(float(actions[0, joint_idx])),
+                        )
+                    rr.log("policy/action_chunk/horizon", rr.Scalar(float(actions.shape[0])))
+
             if active_decision is not None and getattr(active_decision, "result", None) is not None:
                 result = active_decision.result
                 rejected_paths = []

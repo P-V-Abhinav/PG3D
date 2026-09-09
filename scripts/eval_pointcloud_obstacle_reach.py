@@ -260,6 +260,10 @@ class EvalDecisionSummary:
     candidate_feasible: int
     candidate_total: int
     selection_reason: str | None
+    #: World-frame TCP path the selected action chunk is predicted to follow.
+    #: Populated for every method (including `base`, which has no controller and
+    #: therefore no candidate rollouts) so the chunk can be drawn in the .rrd.
+    eef_path: np.ndarray | None = None
 
 
 @dataclass
@@ -407,21 +411,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     action_mode = _action_mode(str(metadata.get("action_mode", "abs_joint")))
     crop_config = crop_config_from_metadata(metadata)
-    
-    # Overriding the metadata crop config to guarantee we see the environment
-    # 1. Expand X bounds to include the entire positive X workspace where the table/goal is
-    # 2. Raise the minimum Z bound from -0.02 to 0.005. The table surface in ManiSkill
-    #    is exactly at Z=0.0. By grazing just 5mm above the table, we perfectly filter
-    #    out all table points. Since the obstacle extends up to Z=0.30, it remains fully visible.
-    # 3. Force robot_point_fraction to 0.25 so the robot gets 256 points, and the environment
-    #    (now ONLY the obstacle) gets the remaining 768 points.
-    new_bounds = crop_config.bounds.copy()
-    new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)  # Make sure X max is at least 0.7
-    new_bounds[2, 0] = 0.04                        # Filter out the table completely (4 cm threshold)
-    crop_config = PointCloudCropConfig(
-        bounds=new_bounds,
-        num_points=crop_config.num_points,
-        robot_point_fraction=0.25,
+
+    # The crop is part of the checkpoint's input contract, not a display choice:
+    # the policy only ever saw clouds produced by the DATASET's bounds and
+    # robot_point_fraction. `pose_variety_final.zarr` records
+    # robot_point_fraction=1.0, whose crop_point_cloud branch keeps ONLY
+    # robot-masked points -- so that checkpoint was trained on "my own arm plus
+    # the goal marker", with no scene points at all.
+    #
+    # The legacy override below forced 0.25 (256 robot + 768 scene points) and
+    # raised the z floor to 0.04, to make obstacles visible to the policy. That
+    # is a different observation distribution than the one trained on, and it
+    # makes the arm wander: the goal token is still there, but three quarters of
+    # the cloud is now scene geometry the network has never seen. Kept behind a
+    # flag for reproducing older runs; OFF by default.
+    if args.crop_override == "legacy":
+        new_bounds = crop_config.bounds.copy()
+        new_bounds[0, 1] = max(new_bounds[0, 1], 0.7)
+        new_bounds[2, 0] = 0.04
+        crop_config = PointCloudCropConfig(
+            bounds=new_bounds,
+            num_points=crop_config.num_points,
+            robot_point_fraction=0.25,
+        )
+    print(
+        f"crop_config ({args.crop_override}): bounds={crop_config.bounds.tolist()} "
+        f"num_points={crop_config.num_points} "
+        f"robot_point_fraction={crop_config.robot_point_fraction}",
+        flush=True,
     )
     
     goal_thresh = (
@@ -742,6 +759,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--crop-override",
+        choices=["dataset", "legacy"],
+        default="dataset",
+        help="'dataset' (default): crop the point cloud exactly as the training dataset's "
+             "metadata records, which is what the checkpoint was trained on. 'legacy': the "
+             "old hardcoded override (x_max>=0.7, z_min=0.04, robot_point_fraction=0.25) that "
+             "feeds the policy scene points it never saw in training.",
+    )
     parser.add_argument("--source", choices=["dataset", "fresh"], default="fresh")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--episode-indices", type=int, nargs="+", default=None)
@@ -1263,14 +1289,16 @@ def run_eval_episode(
             frames.append(_frame_to_numpy(_render_video_frame(sim_env, video_env)))
     provider: ManiSkillGhostPandaGeometryProvider | None = None
     world_model: GeometricWorldModel | None = None
-    if method != "base" or robot_clearance_metric:
+    if method != "base" or robot_clearance_metric or rerun:
         provider = ManiSkillGhostPandaGeometryProvider(
             ghost_env,
             task_name=_env_task_name(sim_env),
             crop_bounds=crop_config.bounds,
         )
         provider.reset(seed=spec.seed, options={"reconfigure": True})
-        if method != "base":
+        # `base` needs one too when an .rrd is being written, so the action
+        # chunk it selected can be imagined and drawn like the steered ones.
+        if method != "base" or rerun:
             world_model = GeometricWorldModel(provider)
 
     # ---- Broadcast reset to Ray parallel workers (if pool is active) --------
@@ -1543,12 +1571,25 @@ def _select_decision(
 ) -> EvalDecisionSummary:
     if method == "base":
         chunk = adapter.sample_action_chunks(obs_window, k=1, rng=rng)[0]
+        # `base` runs no controller, so nothing has imagined this chunk yet.
+        # Imagine it here purely for logging when a world model is available;
+        # a failure must never take down the rollout, since this is diagnostics.
+        eef_path = None
+        if world_model is not None:
+            try:
+                rollout = world_model.imagine(
+                    entry_to_world_model_observation(current_entry), chunk
+                )
+                eef_path = np.asarray(rollout.eef_path, dtype=np.float32)
+            except Exception as exc:
+                print(f"warning: could not imagine base chunk for rerun: {exc}", flush=True)
         return EvalDecisionSummary(
             selected_chunk=chunk,
             result=None,
             candidate_feasible=0,
             candidate_total=0,
             selection_reason=None,
+            eef_path=eef_path,
         )
     if world_model is None or provider is None:
         raise RuntimeError("controller methods require a world model and ghost provider")
@@ -1592,12 +1633,17 @@ def _select_decision(
             timer=timer,
         )
     feasible = sum(1 for candidate in result.candidates if candidate.feasible)
+    selected_path = None
+    selected = getattr(result, "selected", None)
+    if selected is not None and getattr(selected, "rollout", None) is not None:
+        selected_path = np.asarray(selected.rollout.eef_path, dtype=np.float32)
     return EvalDecisionSummary(
         selected_chunk=result.action_chunk,
         result=result,
         candidate_feasible=feasible,
         candidate_total=len(result.candidates),
         selection_reason=result.selection_reason,
+        eef_path=selected_path,
     )
 
 
