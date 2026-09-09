@@ -44,6 +44,7 @@ from pg3d.utils.arrays import (
 from pg3d.utils.devices import select_device
 from pg3d.utils.serialization import jsonable as _jsonable
 
+Array = np.ndarray
 Source = Literal["dataset", "fresh"]
 ActionMode = Literal["abs_joint", "delta_joint"]
 
@@ -266,6 +267,8 @@ def run_policy_rollout(
     frames = [_frame_to_numpy(env.render())]
     timeline: list[dict[str, np.ndarray | bool | float]] = []
     first_entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
+    episode_goal = np.asarray(first_entry["target_position"], dtype=np.float32).reshape(3).copy()
+    print(f"[rollout] episode goal (frozen for the episode): {episode_goal.tolist()}", flush=True)
     obs_window = make_initial_obs_window(first_entry, n_obs_steps=int(policy.n_obs_steps))
     timeline.append(first_entry)
     steps = 0
@@ -311,7 +314,9 @@ def run_policy_rollout(
             obs, reward, terminated, truncated, info = env.step(ema_sim_action)
             steps += 1
             frames.append(_frame_to_numpy(env.render()))
-            entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
+            entry = rollout_observation_entry(
+                obs, info, env=env, crop_config=crop_config, goal_override=episode_goal
+            )
             obs_window = append_obs_window(obs_window, entry, n_obs_steps=int(policy.n_obs_steps))
             timeline.append(entry)
             success = _bool_info(info, "success")
@@ -403,12 +408,34 @@ def crop_config_from_metadata(metadata: dict[str, Any]) -> PointCloudCropConfig:
     return PointCloudCropConfig(bounds=bounds, num_points=num_points, robot_point_fraction=robot_point_fraction)
 
 
+#: The eval envs park their marker actors here while an observation renders
+#: (pg3d.envs.xarm_adapter.eval_envs.eval_base.MARKER_STASH_POSITION). A goal
+#: anywhere near it means a stashed marker pose leaked into the observation and
+#: the policy is being conditioned on a point 50 m under the table.
+_MARKER_STASH_POSITION = np.array([0.0, 0.0, -50.0], dtype=np.float32)
+
+
+def _check_goal_sane(target_position: Array) -> None:
+    if np.linalg.norm(target_position - _MARKER_STASH_POSITION) < 1.0:
+        raise RuntimeError(
+            f"observed goal {target_position.tolist()} is the eval env's marker stash "
+            "position -- the goal marker's render-time pose leaked into the observation. "
+            "The policy would be conditioned on a goal 50 m below the table."
+        )
+    if np.linalg.norm(target_position) > 5.0:
+        raise RuntimeError(
+            f"observed goal {target_position.tolist()} is more than 5 m from the robot base "
+            "-- that is outside any plausible workspace, so the goal channel is wrong."
+        )
+
+
 def rollout_observation_entry(
     obs: Any,
     info: Any,
     *,
     env: Any,
     crop_config: PointCloudCropConfig,
+    goal_override: Array | None = None,
 ) -> dict[str, np.ndarray | bool | float]:
     adapted = adapt_observation(obs, info=info, env=env, task_name=_env_task_name(env))
     
@@ -427,11 +454,20 @@ def rollout_observation_entry(
         robot_mask=adapted.robot_mask,
         config=crop_config,
     )
-    target_position = (
-        np.zeros((3,), dtype=np.float32)
-        if adapted.sim_gt is None or adapted.sim_gt.target_position is None
-        else adapted.sim_gt.target_position.astype(np.float32, copy=True)
-    )
+    # The goal is frozen for the whole episode (the eval envs pin goal_site to
+    # GOAL_POS; the sampling envs draw it once at reset), so it is captured once
+    # by the caller and carried here rather than re-read from every observation
+    # -- the same contract the real-hardware inference server uses, where the
+    # server owns the goal and the client never sends one.
+    if goal_override is not None:
+        target_position = np.asarray(goal_override, dtype=np.float32).reshape(3).copy()
+    else:
+        target_position = (
+            np.zeros((3,), dtype=np.float32)
+            if adapted.sim_gt is None or adapted.sim_gt.target_position is None
+            else adapted.sim_gt.target_position.astype(np.float32, copy=True)
+        )
+        _check_goal_sane(target_position)
     tcp_pose = (
         np.zeros((7,), dtype=np.float32)
         if adapted.robot_state.tcp_pose is None

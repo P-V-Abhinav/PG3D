@@ -180,6 +180,9 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
         self._strict_start = bool(strict_start)
         self._workspace_actors: list[Any] = []
         self._start_qpos_cache: np.ndarray | None = None
+        # goal_site's true position, saved while the markers are stashed for a
+        # render (see _hide_markers). Non-None ONLY inside get_obs.
+        self._goal_p_while_stashed: Any = None
         # Fails closed if the policy package's marker defaults ever move away
         # from the contract this suite (and the checkpoint's bake) assume.
         verify_marker_contract()
@@ -410,6 +413,12 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
         import sapien.physx as physx
 
         gpu = bool(physx.is_gpu_enabled())
+        # Both stash mechanisms (the CPU park at MARKER_STASH_POSITION and
+        # hide_visual's GPU teleport) move goal_site's pose, so anything that
+        # reads that pose during the render -- _get_obs_extra's `goal_pos`,
+        # which is the ONLY channel the goal reaches the policy through -- would
+        # read the stash instead of the goal. Remember the real one first.
+        self._goal_p_while_stashed = _clone_raw_pose(self.goal_site.pose.p)
         saved: list[tuple[Any, Any]] = []
         for actor in self._marker_actors():
             pose = None if gpu else _clone_raw_pose(actor.pose.raw_pose)
@@ -428,6 +437,7 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
 
     def _show_markers(self, saved: list[tuple[Any, Any]]) -> None:
         """Undo :meth:`_hide_markers`, restoring poses last so they always win."""
+        self._goal_p_while_stashed = None
         for actor, pose in saved:
             show = getattr(actor, "show_visual", None)
             if show is not None:
@@ -441,6 +451,31 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
             # removal fell back to permanent invisibility.
             for actor, _ in saved:
                 _set_actor_visibility(actor, 0.0)
+
+    def goal_position_p(self) -> Any:
+        """goal_site's true ``(N, 3)`` position, stash-proof.
+
+        Inside :meth:`get_obs` the marker actors are parked out of the scene, so
+        ``self.goal_site.pose.p`` is the stash position, not the goal. Every
+        read of the goal that can run during a render must go through here.
+        """
+        if self._goal_p_while_stashed is not None:
+            return self._goal_p_while_stashed
+        return self.goal_site.pose.p
+
+    def _get_obs_extra(self, info: dict[str, Any]) -> dict[str, Any]:
+        """Parent extras with the goal read through the stash-proof accessor.
+
+        ``goal_pos`` is what the observation adapter turns into the policy's
+        ``goal_xyz`` and its point-cloud goal marker, so the parent's raw
+        ``goal_site.pose.p`` read would condition the policy on
+        ``MARKER_STASH_POSITION`` (0, 0, -50) for the entire episode.
+        """
+        extra = super()._get_obs_extra(info)
+        goal_p = self.goal_position_p()
+        extra["goal_pos"] = goal_p
+        extra["tcp_to_goal_pos"] = goal_p - self.agent.tcp_pose.p
+        return extra
 
     def get_obs(self, info: dict[str, Any] | None = None, unflattened: bool = False) -> Any:
         """Render observations with every marker actor out of the scene.
