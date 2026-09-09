@@ -817,27 +817,10 @@ def save_rerun_timeline(
                 else:
                     break
 
-            # The action chunk the policy actually committed to at this step,
-            # drawn for EVERY method. The candidate/selected trajectories below
-            # only exist when a controller ran, so an unsteered `base` rollout
-            # would otherwise show no policy output at all in the .rrd.
-            chunk_path = getattr(active_decision, "eef_path", None)
-            if chunk_path is not None:
-                chunk_path = np.asarray(chunk_path, dtype=np.float32)
-                if chunk_path.ndim == 2 and chunk_path.shape[1] == 3 and chunk_path.shape[0] >= 1:
-                    rr.log(
-                        "world/action_chunk/waypoints",
-                        rr.Points3D(chunk_path, colors=[255, 0, 200], radii=0.006),
-                    )
-                    if chunk_path.shape[0] >= 2:
-                        rr.log(
-                            "world/action_chunk/path",
-                            rr.LineStrips3D([chunk_path], colors=[255, 0, 200], radii=0.003),
-                        )
-                    rr.log(
-                        "world/action_chunk/end",
-                        rr.Points3D(chunk_path[-1:], colors=[255, 255, 0], radii=0.010),
-                    )
+            # The committed action chunk is NOT drawn in 3D: its pink waypoint
+            # balls and yellow endpoint marker sat on top of the selected
+            # trajectory and made the scene unreadable. The same chunk is still
+            # fully inspectable as the per-joint scalar series logged below.
             chunk = getattr(active_decision, "selected_chunk", None)
             actions = getattr(chunk, "actions", None)
             if actions is not None:

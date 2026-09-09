@@ -153,6 +153,15 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
     #: still verified against ``START_TCP_POS`` every episode.
     START_QPOS: tuple[float, ...] = SUITE_START_QPOS
 
+    #: Per-variant escape hatch for the start-pose check. A variant whose
+    #: declared ``START_TCP_POS`` is NOT IK-reachable sets this True: the env
+    #: then warns and runs from whatever pose it achieved (the rest keyframe)
+    #: instead of raising. Everything that reads ``START_TCP_POS`` downstream --
+    #: ``pg3d_eval_spec``, the frozen obstacle/object layouts, ``start_site`` --
+    #: is then describing a start the arm is NOT at, so this is only ever right
+    #: for a variant where the declared start is a deliberate aspiration.
+    ALLOW_UNREACHABLE_START: bool = False
+
     #: ``"closed"`` keeps the reach-era hold; ``"open"`` opens the jaws at reset
     #: so a pick phase can close them onto an object.
     GRIPPER_START: str = "closed"
@@ -177,7 +186,7 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
             )
         self._marker_visibility = marker_visibility
         self._show_workspace = bool(show_workspace)
-        self._strict_start = bool(strict_start)
+        self._strict_start = bool(strict_start) and not self.ALLOW_UNREACHABLE_START
         self._workspace_actors: list[Any] = []
         self._start_qpos_cache: np.ndarray | None = None
         # goal_site's true position, saved while the markers are stashed for a
@@ -313,7 +322,12 @@ class PG3DEvalBase(eval_arm_base()):  # type: ignore[misc]
             )
             if self._strict_start:
                 raise RuntimeError(message)
-            warnings.warn(message, stacklevel=2)
+            achieved = _to_numpy(self.agent.tcp_pose.p).reshape(-1, 3)[0]
+            warnings.warn(
+                f"{message} Running anyway from the achieved TCP "
+                f"{tuple(round(float(v), 4) for v in achieved)}.",
+                stacklevel=2,
+            )
 
         start = torch.tensor(
             [list(self.START_TCP_POS)], dtype=torch.float32, device=self.device

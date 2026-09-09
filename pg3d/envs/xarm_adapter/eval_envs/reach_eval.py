@@ -60,7 +60,18 @@ class PG3DEvalReachV4(PG3DEvalReachEnv):
 
 @register_env("PG3DReach-Eval-Reach-v5", max_episode_steps=150)
 class PG3DEvalReachV5(PG3DEvalReachEnv):
-    """Reach v5 -- back and high (the tallest goal in the suite)."""
+    """Reach v5 -- workspace diagonal: high front-left to the back-right corner.
+
+    The start sits high on the front-left side of the eval box and the goal on
+    the opposite back-right xy corner, so this variant is the suite's longest
+    traverse, run inward toward the base.
+
+    Both ends are IK-verified, so this env keeps the suite's strict start check
+    (no ALLOW_UNREACHABLE_START): the arm really does begin at START_TCP_POS,
+    and a future edit that breaks that fails loudly instead of silently running
+    from the rest keyframe. See REACH_START_TCPS["v5"] for why the start is not
+    literally the box's front-left corner.
+    """
 
     GOAL_POS = REACH_GOALS["v5"]
     START_TCP_POS = REACH_START_TCPS["v5"]

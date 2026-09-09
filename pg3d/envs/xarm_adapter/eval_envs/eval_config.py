@@ -157,7 +157,17 @@ REACH_START_TCPS: dict[str, Vec3] = {
     "v2": (0.327, -0.100, 0.308),  # rest height, 10 cm right
     "v3": (0.267, 0.070, 0.258),   # back-left, lower
     "v4": (0.267, -0.070, 0.258),  # back-right, lower
-    "v5": (0.387, 0.000, 0.348),   # forward and high
+    # v5 runs the workspace diagonal INWARD: it starts high on the front-left
+    # side and reaches REACH_GOALS["v5"] on the opposite back-right corner of
+    # the eval box in xy (x_min, y_min). World frame, unlike the goals below.
+    #
+    # NOT the box's front-left corner (0.650, 0.420, 0.500): that is 0.921 m
+    # radially from the base and the planner's IK misses it by 0.219 m with the
+    # frozen tool-down orientation -- it is off the arm's reachable set, not
+    # merely awkward, so an env starting there raises at every reset. This is
+    # the reachable stand-in on the same diagonal (verified 2026-09-09: IK
+    # solves to 5 um, |dq| 2.67 rad from the rest keyframe).
+    "v5": (0.480, 0.300, 0.420),   # front-left and high -- diagonal start
 }
 OBS_REACH_START_TCPS: dict[str, Vec3] = {
     "v1": (0.297, 0.080, 0.278),   # back-left of the slalom entry
@@ -213,7 +223,11 @@ REACH_START_QPOS: dict[str, tuple[float, ...]] = {
     "v2": (-0.092376, -0.471822, -0.158605, 0.954242, -0.072659, 1.421359, -0.223049),
     "v3": (0.090691, -0.716274, 0.123908, 0.649485, 0.083033, 1.362648, 0.167171),
     "v4": (-0.090703, -0.716272, -0.123919, 0.649486, -0.083040, 1.362648, -0.167167),
-    "v5": (-0.000005, -0.298223, -0.000001, 1.205868, -0.000001, 1.504090, 0.000003),
+    # Re-baked 2026-09-09 for v5's inverted diagonal start (0.480, 0.300,
+    # 0.420): the least-contorted of the planner's 115 IK solutions, after
+    # unwrapping each joint toward the rest keyframe within its limits
+    # (|dq| 2.67 rad; FK reproduces the declared start TCP to 5 um).
+    "v5": (0.526222, 0.595511, 0.085841, 2.579609, -0.052562, 1.985298, 0.576168),
 }
 OBS_REACH_START_QPOS: dict[str, tuple[float, ...]] = {
     "v1": (0.087553, -0.596797, 0.133724, 0.779618, 0.076496, 1.372819, 0.183306),
@@ -270,7 +284,8 @@ WORKSPACE_Z_MIN, WORKSPACE_Z_MAX = (float(v) for v in EVAL_WORKSPACE_BOUNDS[2])
 CROP_BOUNDS: np.ndarray = np.asarray(_REPO_CROP_BOUNDS, dtype=np.float32)
 
 #: The conservative IK-verified sampling box. Advisory only here; see the module
-#: docstring for why 11 frozen positions sit outside it.
+#: docstring for why a number of frozen positions sit outside it (the exact
+#: list is reported by :func:`workspace_report`).
 REACH_BOUNDS: np.ndarray = np.asarray(_REPO_REACH_BOUNDS, dtype=np.float32)
 
 
@@ -349,7 +364,12 @@ _M1_REACH_GOALS: dict[str, Vec3] = {
     "v2": (-0.050, 0.200, 0.080),   # far front-left, near the table
     "v3": (-0.100, 0.380, 0.150),   # far left diagonal
     "v4": (-0.100, -0.380, 0.150),  # far right diagonal
-    "v5": (-0.400, 0.000, 0.450),   # back, high
+    # M1 FRAME -- to_world adds +0.615 to x, so this lands on the eval box's
+    # back-right corner at world (0.180, -0.420, 0.348), the opposite xy corner
+    # from REACH_START_TCPS["v5"]. On the boundary of the conservative
+    # IK-verified reach box (the import-time audit reports it) and inside the
+    # crop box, so the policy can see the goal marker.
+    "v5": (-0.435, -0.420, 0.348),  # back-right workspace corner
 }
 REACH_GOALS: dict[str, Vec3] = {k: to_world(v) for k, v in _M1_REACH_GOALS.items()}
 
