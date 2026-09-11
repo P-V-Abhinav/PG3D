@@ -1008,6 +1008,7 @@ def _build_graspgen_constraint(
     graspgen_sampler: Any,
     args: argparse.Namespace,
     zarr_context: dict[str, Any] | None = None,
+    grasp_crop_config: PointCloudCropConfig | None = None,
 ) -> tuple[list[Any], None]:
     """Reset the env and build a CartesianPoseConstraint from GraspGen.
 
@@ -1045,7 +1046,16 @@ def _build_graspgen_constraint(
     obs, _, _, _, info = env.step(zero_action)
 
     # --- 3. Get scene point cloud ---
-    entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
+    # Deliberately NOT the policy's crop. The dataset this checkpoint was trained
+    # on records robot_point_fraction=1.0, whose crop keeps ONLY robot-masked
+    # points -- so the policy's cloud contains no object at all and grasp
+    # sampling off it returns 0 points (the "only 0 object points" fallback,
+    # which leaves no grasp pose, so the executor skips the descent and the
+    # episode ends after the reach). Grasp sampling therefore gets its own
+    # scene-only crop over the same bounds. This cloud is never fed to the
+    # policy.
+    scene_crop_config = grasp_crop_config or crop_config
+    entry = rollout_observation_entry(obs, info, env=env, crop_config=scene_crop_config)
     if zarr_context is not None:
         entry = _apply_zarr_initial_entry(entry, zarr_context)
 
@@ -1088,7 +1098,9 @@ def _build_graspgen_constraint(
     print(
         f"[GraspGen] Episode {spec.output_index}: "
         f"object_crop_points={object_crop.shape[0]}  "
-        f"(radius={crop_radius:.2f}m around {target_xyz.tolist()})",
+        f"(radius={crop_radius:.2f}m around {target_xyz.tolist()}; "
+        f"scene cloud {scene_cloud.shape[0]} pts @ robot_point_fraction="
+        f"{scene_crop_config.robot_point_fraction})",
         flush=True,
     )
 
@@ -2653,6 +2665,20 @@ def main(argv: list[str] | None = None) -> int:
         f"robot_point_fraction={crop_config.robot_point_fraction}",
         flush=True,
     )
+    # Scene cloud for grasp sampling only -- same bounds, scene points instead of
+    # robot points. See _build_graspgen_constraint for why this cannot share the
+    # policy's crop.
+    grasp_crop_config = PointCloudCropConfig(
+        bounds=crop_config.bounds,
+        num_points=int(args.grasp_scene_points),
+        robot_point_fraction=0.0,
+    )
+    print(
+        f"grasp_crop_config (scene, GraspGen only): num_points="
+        f"{grasp_crop_config.num_points} robot_point_fraction="
+        f"{grasp_crop_config.robot_point_fraction}",
+        flush=True,
+    )
 
     goal_thresh = (
         float(args.goal_thresh)
@@ -2778,6 +2804,7 @@ def main(argv: list[str] | None = None) -> int:
                     graspgen_sampler=graspgen_sampler,
                     args=args,
                     zarr_context=zarr_context,
+                    grasp_crop_config=grasp_crop_config,
                 )
 
                 constraint_path = (
@@ -3079,6 +3106,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "unlike the old --grasp-approach-offset default, this one is fine "
                         "to leave as-is. Descent lands at: GraspGen_contact_Z + this_margin. "
                         "Set to 0.0 to land exactly on the computed contact Z.")
+    g.add_argument("--grasp-scene-points", type=int, default=8192,
+                   help="Point budget for the SCENE cloud GraspGen samples grasps from. This is "
+                        "NOT the policy's cloud: the policy is fed the dataset's crop, which for "
+                        "this checkpoint family is robot-points-only (robot_point_fraction=1.0) "
+                        "and therefore contains zero object points. Grasp sampling needs the "
+                        "object, so it gets its own scene-only crop over the same bounds.")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,
