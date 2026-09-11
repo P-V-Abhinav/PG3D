@@ -140,6 +140,16 @@ START_TCP: Vec3 = to_world(_M1_START_TCP)
 # raises rather than run a mis-posed episode.
 START_TCP_TOLERANCE_M: float = 0.02
 
+#: The robot base in the ACTIVE frame. The M1->M2 conversion is defined as "the
+#: base moves to the world origin", so running the authoring-frame base through
+#: the suite's own converter yields (0, 0, 0) -- but it is derived here rather
+#: than written as a literal zero, because every left/right side predicate in the
+#: suite takes this as its origin and `pg3d.constraints.sides` is explicit that a
+#: hard-coded origin would silently mis-grade every one of them if the frame
+#: moved (M11 replaces it with a calibrated base frame).
+_M1_ROBOT_BASE_POSITION: Vec3 = (-0.615, 0.000, 0.000)
+ROBOT_BASE_POSITION: Vec3 = to_world(_M1_ROBOT_BASE_POSITION)
+
 # Per-variant start TCPs. Every one of the 25 envs starts the arm somewhere
 # different -- a same-start-everywhere suite cannot distinguish a
 # policy that generalises over initial configurations from one that memorised
