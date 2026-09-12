@@ -871,16 +871,32 @@ def save_rerun_timeline(
 
             if active_decision is not None and getattr(active_decision, "result", None) is not None:
                 result = active_decision.result
+                # Split the rejected candidates by whether the constraint
+                # judged them feasible. Grey = the world model thought this was
+                # collision-free and rejected it on score; red = it was judged
+                # colliding. If a candidate that visibly hits the obstacle shows
+                # grey, the constraint is not seeing the obstacle.
                 rejected_paths = []
+                infeasible_paths = []
                 for candidate in result.candidates:
-                    if candidate is not result.selected:
-                        path = np.asarray(candidate.rollout.eef_path, dtype=np.float32)
-                        if path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3:
-                            rejected_paths.append(path)
+                    if candidate is result.selected:
+                        continue
+                    path = np.asarray(candidate.rollout.eef_path, dtype=np.float32)
+                    if not (path.ndim == 2 and path.shape[0] >= 2 and path.shape[1] == 3):
+                        continue
+                    if getattr(candidate, "feasible", True):
+                        rejected_paths.append(path)
+                    else:
+                        infeasible_paths.append(path)
                 if rejected_paths:
                     rr.log(
                         "world/predicted_trajectories/rejected",
                         rr.LineStrips3D(rejected_paths, colors=[100, 100, 100, 128], radii=0.001),
+                    )
+                if infeasible_paths:
+                    rr.log(
+                        "world/predicted_trajectories/infeasible",
+                        rr.LineStrips3D(infeasible_paths, colors=[220, 40, 40, 160], radii=0.0015),
                     )
                 
                 selected_path = np.asarray(result.selected.rollout.eef_path, dtype=np.float32)

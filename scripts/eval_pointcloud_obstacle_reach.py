@@ -1413,6 +1413,29 @@ def run_eval_episode(
                 step=steps,
                 decision=decision,
             )
+            # Per-replan console trace. Without this, "is reranking actually
+            # discriminating?" is only answerable by reading decisions.jsonl
+            # afterwards -- and the two failure modes look identical from the
+            # outside. feasible==total every replan means the constraint never
+            # separated the candidates (typically the horizon is too short to
+            # reach the obstacle, so nothing in the imagined window collides);
+            # feasible==0 means every candidate collides and the selection is a
+            # least-bad fallback.
+            if decision.result is not None:
+                selected = decision.result.selected
+                cost = None
+                costs = getattr(selected, "constraint_costs", None)
+                if isinstance(costs, dict):
+                    cost = costs.get("pointcloud_obstacle_avoid_region")
+                print(
+                    f"[replan {replans - 1} @ step {steps}] method={method} "
+                    f"feasible={decision.candidate_feasible}/{decision.candidate_total} "
+                    f"reason={decision.selection_reason} "
+                    f"selected_feasible={getattr(selected, 'feasible', None)} "
+                    f"selected_score={getattr(selected, 'total_score', float('nan')):.4f}"
+                    + (f" selected_constraint_cost={cost:.4f}" if cost is not None else ""),
+                    flush=True,
+                )
             steps_to_execute = min(
                 decision.selected_chunk.horizon,
                 int(policy.n_action_steps) * execution_horizon_chunks,
