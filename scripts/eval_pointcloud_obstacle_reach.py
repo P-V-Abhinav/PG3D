@@ -580,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
                     if zarr_root is not None and spec.dataset_episode_index is not None
                     else None
                 )
-                constraints, pending_spawn = _constraints_for_episode(
+                constraints, pending_spawn, sensed_scene_points = _constraints_for_episode(
                     sim_env,
                     spec=spec,
                     policy=policy,
@@ -616,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                         method=method,
                         spec=spec,
                         constraints=constraints,
+                        sensed_scene_points=sensed_scene_points,
                         pending_spawn=pending_spawn,
                         action_mode=action_mode,
                         crop_config=crop_config,
@@ -965,6 +966,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum clearance (metres) the robot must keep from obstacle point cloud. Default 0.12m = 12cm.",
     )
     parser.add_argument("--avoid-weight", type=float, default=1.0)
+    parser.add_argument("--obstacle-points", type=int, default=512,
+                        help="How many sensed obstacle points (after farthest-point sampling) the "
+                             "collision constraint keeps. A single bar is fine with a couple of "
+                             "hundred; a multi-bar wall or U needs more to be represented densely "
+                             "enough that a candidate passing through it is actually penalised.")
     parser.add_argument(
         "--avoid-shape",
         choices=["sphere", "box", "cuboid"],
@@ -1230,6 +1236,7 @@ def run_eval_episode(
     method: EvalMethod,
     spec: RolloutSpec,
     constraints: list[Any],
+    sensed_scene_points: np.ndarray | None = None,
     pending_spawn: PendingObstacleSpawn | None = None,
     action_mode: ActionMode,
     crop_config: PointCloudCropConfig,
@@ -1544,7 +1551,24 @@ def run_eval_episode(
     if rerun:
         rerun_path = output_dir / "rerun" / method / f"episode_{spec.output_index:03d}.rrd"
         with timer.time("rerun_write", method=method):
-            save_rerun_timeline(rerun_path, timeline, constraints=constraints, decisions=decisions)
+            # The obstacle cloud the constraint actually scores against, plus
+            # everything the sensing crop saw. Neither is in `timeline`: those
+            # entries carry the POLICY's cloud, which is robot-points-only, which
+            # is why an .rrd of an obstacle episode showed only the arm.
+            constraint_obstacle_points = None
+            for constraint in constraints:
+                candidate = getattr(constraint, "obstacle_points", None)
+                if candidate is not None and np.asarray(candidate).size:
+                    constraint_obstacle_points = np.asarray(candidate, dtype=np.float32)
+                    break
+            save_rerun_timeline(
+                rerun_path,
+                timeline,
+                constraints=constraints,
+                decisions=decisions,
+                obstacle_points=constraint_obstacle_points,
+                scene_points=sensed_scene_points,
+            )
     robot_clearance_points: np.ndarray | None = None
     if robot_clearance_metric and constraints and provider is not None:
         try:
@@ -2437,7 +2461,7 @@ def _constraints_for_episode(
     # Apply Farthest Point Sampling to get maximally spread representative points.
     # FPS ensures the collision checker sees the full spatial extent of the obstacle
     # rather than a cluster of nearby points from a single camera view.
-    max_obstacle_pts = 256
+    max_obstacle_pts = int(getattr(args, "obstacle_points", 256))
     if obstacle_points.shape[0] > max_obstacle_pts:
         obstacle_points = _farthest_point_sample(obstacle_points, max_obstacle_pts)
 
@@ -2452,6 +2476,19 @@ def _constraints_for_episode(
         flush=True,
     )
 
+    if obstacle_points.shape[0] == 0:
+        # PointCloudCollisionConstraint.cost() returns 0.0 for an empty cloud, so
+        # this would otherwise be a SILENT no-op: every candidate scores as
+        # collision-free and the method drives straight through the obstacle.
+        # Say so loudly -- the usual cause is a sensing crop that kept no scene
+        # points (e.g. the policy's robot-only crop being reused for sensing).
+        print(
+            f"[{spec.output_index}] WARNING: sensed ZERO obstacle points. The collision "
+            "constraint is inert and nothing will be avoided. Check the sensing crop's "
+            "robot_point_fraction (must be < 1.0) and z floor (--scene-z-min).",
+            flush=True,
+        )
+
     constraint = PointCloudCollisionConstraint(
         obstacle_points=obstacle_points,
         margin=float(args.avoid_margin),
@@ -2459,7 +2496,10 @@ def _constraints_for_episode(
         name="pointcloud_obstacle_avoid_region",
         target=args.constraint_target,
     )
-    return [constraint], None
+    # Third element: every scene point the sensing crop saw, before the
+    # farthest-point downsample. Used only for the .rrd, so what the constraint
+    # actually holds can be compared against what the camera actually saw.
+    return [constraint], None, env_points
 
 
 def _precomputed_constraint_path(constraints_dir: Path, spec: RolloutSpec) -> Path:

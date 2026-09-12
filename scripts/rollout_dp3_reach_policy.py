@@ -763,7 +763,18 @@ def save_rerun_timeline(
     *,
     constraints: list[object] | None = None,
     decisions: list[Any] | None = None,
+    obstacle_points: np.ndarray | None = None,
+    scene_points: np.ndarray | None = None,
 ) -> None:
+    """Write one episode's .rrd.
+
+    ``timeline`` entries carry the POLICY's point cloud. For a checkpoint whose
+    dataset crop is robot-points-only that contains no obstacle at all, so an
+    obstacle episode would render as a bare arm. ``obstacle_points`` (what the
+    collision constraint scores against) and ``scene_points`` (everything the
+    sensing crop saw, table already cropped out) are therefore logged separately,
+    once, as static entities -- the obstacles are kinematic and never move.
+    """
     try:
         import rerun as rr
     except Exception as exc:
@@ -775,6 +786,26 @@ def save_rerun_timeline(
     path.parent.mkdir(parents=True, exist_ok=True)
     rr.init("pg3d_dp3_reach_policy_rollout", spawn=False)
     rr.save(str(path))
+
+    rr.set_time_sequence("step", 0)
+    if scene_points is not None:
+        scene = np.asarray(scene_points, dtype=np.float32).reshape(-1, 3)
+        if scene.size:
+            rr.log(
+                "world/scene_points",
+                rr.Points3D(scene, colors=[120, 120, 120], radii=0.002),
+                static=True,
+            )
+    if obstacle_points is not None:
+        obstacles = np.asarray(obstacle_points, dtype=np.float32).reshape(-1, 3)
+        if obstacles.size:
+            # What the constraint is actually scored against -- if this is absent
+            # or sparse where the obstacle is, that explains a collision.
+            rr.log(
+                "world/obstacle_points",
+                rr.Points3D(obstacles, colors=[255, 140, 0], radii=0.005),
+                static=True,
+            )
     if constraints:
         from pg3d.viz.constraints import avoid_region_line_visuals, cartesian_pose_line_visuals
 
