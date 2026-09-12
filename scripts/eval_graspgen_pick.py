@@ -173,6 +173,11 @@ from pg3d.envs.xarm_adapter.agents import XArm7Gripper
 # on XArm7Gripper._GRIPPER_LIMIT_MARGIN (gripper |qvel| 0.2 -> 57 rad/s in 8
 # steps, jerking the arm). Use the agent's own backed-off constant instead.
 GRIPPER_CLOSED_TARGET = float(XArm7Gripper._GRIPPER_CLOSED)
+
+# Phase 2 place target for envs that define none of their own. Any env from the
+# frozen eval suite supplies its own, so this is only reached by the ad-hoc
+# kitchen / YCB envs.
+_DEFAULT_PLACE_GOAL = (-0.35, 0.25, 0.05)
 from pg3d.eval import (
     AvoidOverlayConfig,
     EpisodePath,
@@ -570,6 +575,11 @@ def _crop_object_pointcloud(
         target_xyz       : (3,)   world-frame centroid (from actor pose).
         radius           : sphere crop radius in metres (default 0.10 m).
 
+    The table is NOT filtered here: the scene cloud handed in has already had it
+    removed by the grasp crop's z floor (--grasp-scene-z-min), so the sphere only
+    ever sees object points. See the note in main() for why that has to happen at
+    the crop and not here.
+
     Returns:
         (M, 3) float32 object-only point cloud (may be empty).
     """
@@ -585,6 +595,37 @@ def _crop_object_pointcloud(
     env_cloud = env_cloud[dists < float(radius)]
 
     return env_cloud.astype(np.float32)
+
+
+def _segmented_object_points(env: Any, obs: Any, info: Any) -> tuple[np.ndarray | None, str]:
+    """Return the target object's points straight from the segmentation, if available.
+
+    This is exact where a radius crop is a guess: the simulator already knows
+    which pixels belong to which actor, so the object's cloud can be taken
+    directly instead of being carved out of the scene by a sphere that also
+    contains the table. Returns (points, source_name), or (None, reason).
+    """
+    try:
+        from pg3d.envs.maniskill_adapter.observation import adapt_observation
+
+        adapted = adapt_observation(obs, info=info, env=env)
+        masks = getattr(adapted, "object_masks", None) or {}
+        unwrapped = getattr(env, "unwrapped", env)
+        # Prefer the canonical handle, then the concrete actor names.
+        for name in ("pg3d_grasp_target", "cube", "target_object", "cheezit"):
+            if getattr(unwrapped, name, None) is None or name not in masks:
+                continue
+            mask = np.asarray(masks[name], dtype=bool).reshape(-1)
+            points = np.asarray(adapted.point_cloud, dtype=np.float32).reshape(-1, 3)
+            if mask.shape[0] != points.shape[0]:
+                continue
+            selected = points[mask]
+            selected = selected[np.linalg.norm(selected, axis=1) > 1e-3]
+            if selected.shape[0] >= 10:
+                return selected.astype(np.float32), f"segmentation[{name}]"
+        return None, "no segmentation mask for the grasp target"
+    except Exception as exc:  # pragma: no cover - diagnostics must never abort a run
+        return None, f"segmentation unavailable ({type(exc).__name__}: {exc})"
 
 
 def _run_graspgen(
@@ -1091,15 +1132,26 @@ def _build_graspgen_constraint(
     # so we DO NOT need to extract their positions and filter them out anymore.
     # Filtering around goal_site was accidentally deleting the actual object points!
     crop_radius = float(getattr(args, "grasp_object_crop_radius", 0.10))
-    object_crop = _crop_object_pointcloud(
-        scene_cloud, robot_mask, target_xyz, crop_radius
-    )
+    object_crop = None
+    crop_source = ""
+    if getattr(args, "grasp_object_source", "radius") == "segmentation":
+        object_crop, crop_source = _segmented_object_points(env, obs, info)
+        if object_crop is None:
+            print(
+                f"[GraspGen] Episode {spec.output_index}: segmentation requested but "
+                f"unavailable ({crop_source}); falling back to the radius crop.",
+                flush=True,
+            )
+    if object_crop is None:
+        object_crop = _crop_object_pointcloud(
+            scene_cloud, robot_mask, target_xyz, crop_radius
+        )
+        crop_source = f"radius crop r={crop_radius:.2f}m around {np.round(target_xyz, 3).tolist()}"
 
     print(
         f"[GraspGen] Episode {spec.output_index}: "
-        f"object_crop_points={object_crop.shape[0]}  "
-        f"(radius={crop_radius:.2f}m around {target_xyz.tolist()}; "
-        f"scene cloud {scene_cloud.shape[0]} pts @ robot_point_fraction="
+        f"object_crop_points={object_crop.shape[0]}  source={crop_source}  "
+        f"(scene cloud {scene_cloud.shape[0]} pts @ robot_point_fraction="
         f"{scene_crop_config.robot_point_fraction})",
         flush=True,
     )
@@ -2063,6 +2115,35 @@ def _grasp_signals(sim_env: Any, drive_target: float) -> tuple[bool, bool]:
     return stalled, pad_contact
 
 
+def _resolve_place_goal(env: Any, args: Any) -> tuple[np.ndarray, str]:
+    """Return (place_goal_xyz, source) for Phase 2.
+
+    Priority: an explicit --place-goal, then the env's own frozen place target,
+    then the generic CLI fallback. The env's target is where the run is GRADED
+    (its goal_site sits there), so carrying the object anywhere else guarantees
+    failure no matter how well the policy tracks.
+    """
+    if getattr(args, "place_goal", None) is not None:
+        return np.asarray(args.place_goal, dtype=np.float32), "--place-goal"
+
+    unwrapped = getattr(env, "unwrapped", env)
+    frozen = getattr(unwrapped, "GOAL_POS", None)
+    if frozen is None:
+        spec_obj = getattr(unwrapped, "pg3d_eval_spec", None)
+        frozen = getattr(spec_obj, "goal_position", None) if spec_obj is not None else None
+    if frozen is not None:
+        goal = np.asarray(frozen, dtype=np.float32).reshape(3).copy()
+        # The env's target is the object's RESTING pose, and Phase 2 drives the
+        # TCP (which sits roughly at the held object's centre) to this point, so
+        # releasing exactly there presses the object into the table. Lift by a
+        # small margin and let it drop; the placement predicate's 5 cm radius
+        # absorbs the difference.
+        goal[2] += float(getattr(args, "place_goal_z_margin", 0.02))
+        return goal, f"env {type(unwrapped).__name__}.GOAL_POS + z margin"
+
+    return np.asarray(_DEFAULT_PLACE_GOAL, dtype=np.float32), "CLI fallback default"
+
+
 def _execute_pick_and_place(
     sim_env: Any,
     video_env: Any,
@@ -2216,8 +2297,17 @@ def _execute_pick_and_place(
     # the "5 cm off the table" asked for and exactly the verified floor of the reach
     # box's dz range. Holding a 70 mm cube with the TCP at z=0.05 puts its underside
     # ~15 mm above the table, so the release drops it a short, safe distance.
-    new_goal_pos = np.asarray(args.place_goal, dtype=np.float32)
-    print(f"[Debug] New Goal Pos: {new_goal_pos.tolist()}", flush=True)
+    # An eval env FREEZES its own place target -- that is the whole point of the
+    # suite -- so it wins over the CLI default, which is a generic fallback for
+    # envs that define no target (and was a legacy M1-frame number besides,
+    # landing the object nowhere near where the env grades it). An explicitly
+    # passed --place-goal still overrides everything.
+    new_goal_pos, place_goal_source = _resolve_place_goal(sim_env, args)
+    print(
+        f"[Phase 2] place goal {np.round(new_goal_pos, 4).tolist()} "
+        f"(source: {place_goal_source})",
+        flush=True,
+    )
 
     # Reachability check. This warns rather than clamping: a goal you deliberately put
     # outside the box is a valid experiment, but silently burning a run on a goal the
@@ -2668,15 +2758,28 @@ def main(argv: list[str] | None = None) -> int:
     # Scene cloud for grasp sampling only -- same bounds, scene points instead of
     # robot points. See _build_graspgen_constraint for why this cannot share the
     # policy's crop.
+    # The table is removed HERE, once, at the crop -- not later inside the object
+    # crop. Everything downstream (the --grasp-object-crop-radius sphere, GraspGen,
+    # the grasp centroid that becomes goal #1) then works on a cloud that contains
+    # no table at all, so no step has to reason about it again.
+    #
+    # This floor is applied ONLY to this scene cloud. The policy's crop keeps the
+    # dataset's z floor: it is robot-points-only, so the table is already absent
+    # from it, and raising its floor would instead cut the robot's OWN fingertips
+    # exactly when they are down at the object -- while also putting the crop back
+    # off-contract with the checkpoint, which is what made the arm wander before.
+    grasp_bounds = np.asarray(crop_config.bounds, dtype=np.float32).copy()
+    grasp_bounds[2, 0] = max(float(grasp_bounds[2, 0]), float(args.grasp_scene_z_min))
     grasp_crop_config = PointCloudCropConfig(
-        bounds=crop_config.bounds,
+        bounds=grasp_bounds,
         num_points=int(args.grasp_scene_points),
         robot_point_fraction=0.0,
     )
     print(
-        f"grasp_crop_config (scene, GraspGen only): num_points="
-        f"{grasp_crop_config.num_points} robot_point_fraction="
-        f"{grasp_crop_config.robot_point_fraction}",
+        f"grasp_crop_config (scene, GraspGen only): bounds={grasp_bounds.tolist()} "
+        f"num_points={grasp_crop_config.num_points} robot_point_fraction="
+        f"{grasp_crop_config.robot_point_fraction} (table cut at z>"
+        f"{grasp_bounds[2, 0]:.3f})",
         flush=True,
     )
 
@@ -3062,8 +3165,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "top-down candidate by more than 2w on confidence to win. "
                         "Was hardcoded at 0.2. Raise it to insist harder on top-down, "
                         "lower it toward 0 to approach --grasp-selection graspgen.")
+    g.add_argument("--place-goal-z-margin", type=float, default=0.02,
+                   help="Metres added to an ENV-supplied place target's z before Phase 2 drives "
+                        "the TCP there. The env's target is the object's resting pose; releasing "
+                        "with the TCP exactly on it presses the object into the table. Ignored "
+                        "when --place-goal is given explicitly.")
     g.add_argument("--place-goal", type=float, nargs=3, metavar=("X", "Y", "Z"),
-                   default=[-0.35, 0.25, 0.05],
+                   default=None,
                    help="World-frame XYZ the object is carried to in Phase 2, in "
                         "metres. The table surface is z=0, so the default z=0.05 puts "
                         "the TCP 5 cm above it (a held 70 mm cube's underside ends up "
@@ -3074,7 +3182,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "point-cloud crop so the policy can actually see the marker. "
                         "Replaces a hardcoded [0.2, 0.2, 0.25] that was outside even "
                         "the maximum reach envelope and outside the crop box. A goal "
-                        "outside the IK-verified box warns but still runs.")
+                        "outside the IK-verified box warns but still runs. Default: unset, "
+                        "which means the ENV's own frozen place target is used when it has one "
+                        f"(the eval suite always does), else {_DEFAULT_PLACE_GOAL}.")
     g.add_argument("--goal-z-offset", type=float, default=-0.02,
                    help="Metres to bias the goal MARKER (goal_site) in world z, "
                         "relative to the GraspGen contact centroid. Negative is "
@@ -3112,6 +3222,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "this checkpoint family is robot-points-only (robot_point_fraction=1.0) "
                         "and therefore contains zero object points. Grasp sampling needs the "
                         "object, so it gets its own scene-only crop over the same bounds.")
+    g.add_argument("--grasp-scene-z-min", type=float, default=0.04,
+                   help="World z floor for the SCENE cloud GraspGen samples from: everything at "
+                        "or below it is table and is dropped at the crop, before any object "
+                        "cropping happens. The table surface is z=0. Does NOT touch the policy's "
+                        "cloud, which is robot-points-only and never contains the table. Lower "
+                        "this for short objects (a banana or gelatin box is only ~4-6 cm tall, "
+                        "so a 0.04 floor would remove most of it).")
+    g.add_argument("--grasp-object-source", choices=["radius", "segmentation"], default="radius",
+                   help="How the object's points are isolated for grasp sampling. 'radius' "
+                        "(default): sphere of --grasp-object-crop-radius around the object's "
+                        "actor pose, applied to the already table-free scene cloud. "
+                        "'segmentation': take the target actor's points straight from the "
+                        "simulator's segmentation, which needs no radius or z guess at all.")
     g.add_argument("--grasp-object-crop-radius", type=float, default=0.10,
                    help="Sphere radius (m) around the object actor centroid for the GraspGen crop.")
     g.add_argument("--grasp-object-index", type=int, default=-1,

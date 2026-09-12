@@ -50,12 +50,17 @@ from .pp_eval import PG3DEvalPickPlaceEnv
 Vec3 = tuple[float, float, float]
 
 
-class _SlalomObstacleMixin:
-    """Build and place the three frozen slalom bars.
+class _BarObstacleMixin:
+    """Build and place upright cuboid bars at frozen positions.
 
-    Subclasses implement :meth:`slalom_endpoints` to say which path the slalom
-    straddles: the TCP path for a reach, the carried-cube transport path for a
-    pick and place.
+    One bar shape for the whole suite -- 6 x 6 x 30 cm, matching the
+    real-obstacle reach env -- so every obstacle scene is the same primitive
+    repeated. Subclasses say WHERE via :meth:`obstacle_positions`; a slalom
+    computes them from a path, a wall or a U-trap lists them out.
+
+    Bars are collidable by default: an "avoidance" task whose obstacles are
+    ghosts cannot be failed. Pass ``obstacle_collision=False`` for the old
+    virtual-obstacle behaviour.
     """
 
     OBSTACLE_HALF_SIZES: Vec3 = OBSTACLE_HALF_SIZES
@@ -65,14 +70,9 @@ class _SlalomObstacleMixin:
         super().__init__(*args, **kwargs)  # type: ignore[call-arg]
 
     @classmethod
-    def slalom_endpoints(cls) -> tuple[Vec3, Vec3]:
-        raise NotImplementedError
-
-    @classmethod
     def obstacle_positions(cls) -> list[Vec3]:
-        """The three frozen bar centres, computable without building the env."""
-        start, goal = cls.slalom_endpoints()
-        return slalom_obstacle_positions(start, goal, obs_half_height=cls.OBSTACLE_HALF_SIZES[2])
+        """Frozen bar centres, computable without building the env."""
+        raise NotImplementedError
 
     def _load_scene(self, options: dict[str, Any]) -> None:
         super()._load_scene(options)  # type: ignore[misc]
@@ -98,6 +98,25 @@ class _SlalomObstacleMixin:
                 device=self.device,  # type: ignore[attr-defined]
             ).expand(batch, -1)
             actor.set_pose(Pose.create_from_pq(pose))
+
+
+class _SlalomObstacleMixin(_BarObstacleMixin):
+    """Bars placed as a slalom across a start->goal path.
+
+    Subclasses implement :meth:`slalom_endpoints` to say which path the slalom
+    straddles: the TCP path for a reach, the carried-cube transport path for a
+    pick and place.
+    """
+
+    @classmethod
+    def slalom_endpoints(cls) -> tuple[Vec3, Vec3]:
+        raise NotImplementedError
+
+    @classmethod
+    def obstacle_positions(cls) -> list[Vec3]:
+        """The three frozen bar centres for this variant's start->goal path."""
+        start, goal = cls.slalom_endpoints()
+        return slalom_obstacle_positions(start, goal, obs_half_height=cls.OBSTACLE_HALF_SIZES[2])
 
 
 # ---------------------------------------------------------------------------

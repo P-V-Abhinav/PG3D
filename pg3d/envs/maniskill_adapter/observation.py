@@ -107,7 +107,12 @@ def segmentation_context_from_env(env: Any) -> SegmentationContext:
     unwrapped = getattr(env, "unwrapped", env)
     robot_ids = _ids_from_links(getattr(getattr(unwrapped, "agent", None), "robot", None))
     object_ids: dict[str, frozenset[int]] = {}
-    for name in ("cube", "goal_site"):
+    # `pg3d_grasp_target` is the canonical handle an env exposes for the object a
+    # grasp generator should act on; `target_object` and `cheezit` are the names
+    # the cluttered and kitchen envs happen to use for the same actor. Without
+    # them a grasp generator has to guess the object's points out of a radius
+    # crop, which also sweeps up the table plane underneath it.
+    for name in ("cube", "goal_site", "pg3d_grasp_target", "target_object", "cheezit"):
         ids = _ids_from_actor(getattr(unwrapped, name, None))
         if ids:
             object_ids[name] = ids

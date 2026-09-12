@@ -440,6 +440,29 @@ def main(argv: list[str] | None = None) -> int:
         f"robot_point_fraction={crop_config.robot_point_fraction}",
         flush=True,
     )
+    # A SECOND crop, for obstacle sensing only -- never fed to the policy.
+    #
+    # The avoid constraint is derived from the scene point cloud, and under the
+    # dataset's crop (robot_point_fraction=1.0, robot points only) there are no
+    # scene points at all: the constraint comes out empty and the method has no
+    # idea an obstacle exists. Sensing therefore gets its own scene-only crop,
+    # with the table cut at a z floor so the tabletop plane is not mistaken for
+    # an obstacle. Obstacle bars stand 30 cm tall, so a 4 cm floor leaves them
+    # essentially intact.
+    scene_bounds = np.asarray(crop_config.bounds, dtype=np.float32).copy()
+    scene_bounds[2, 0] = max(float(scene_bounds[2, 0]), float(args.scene_z_min))
+    scene_crop_config = PointCloudCropConfig(
+        bounds=scene_bounds,
+        num_points=int(args.scene_points),
+        robot_point_fraction=0.0,
+    )
+    print(
+        f"scene_crop_config (obstacle sensing only): bounds={scene_bounds.tolist()} "
+        f"num_points={scene_crop_config.num_points} "
+        f"robot_point_fraction={scene_crop_config.robot_point_fraction} "
+        f"(table cut at z>{scene_bounds[2, 0]:.3f})",
+        flush=True,
+    )
     
     goal_thresh = (
         float(args.goal_thresh)
@@ -564,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
                     adapter=adapter,
                     action_mode=action_mode,
                     crop_config=crop_config,
+                    scene_crop_config=scene_crop_config,
                     goal_thresh=goal_thresh,
                     args=args,
                     zarr_context=zarr_context,
@@ -759,6 +783,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--scene-points", type=int, default=8192,
+                        help="Point budget for the obstacle-sensing scene cloud (never fed to "
+                             "the policy, which gets the dataset's robot-only crop).")
+    parser.add_argument("--scene-z-min", type=float, default=0.04,
+                        help="World z floor for the obstacle-sensing scene cloud: at or below "
+                             "it is table and is dropped. The table surface is z=0; obstacle "
+                             "bars are 30 cm tall so a 4 cm floor barely touches them.")
     parser.add_argument(
         "--crop-override",
         choices=["dataset", "legacy"],
@@ -2330,6 +2361,7 @@ def _constraints_for_episode(
     *,
     spec: RolloutSpec,
     crop_config: PointCloudCropConfig,
+    scene_crop_config: PointCloudCropConfig | None = None,
     args: argparse.Namespace,
     policy: SimpleDP3 | None = None,
     adapter: DP3ChunkPolicyAdapter | None = None,
@@ -2360,7 +2392,11 @@ def _constraints_for_episode(
         zero_action = za_flat.reshape(zero_action.shape)
     obs, _, _, _, info = env.step(zero_action)
 
-    entry = rollout_observation_entry(obs, info, env=env, crop_config=crop_config)
+    # Sensing crop, not the policy's: see the note in main(). Falls back to the
+    # policy crop only if a caller has not supplied one, which for a
+    # robot-only dataset crop yields no obstacle points at all.
+    sensing_crop = scene_crop_config or crop_config
+    entry = rollout_observation_entry(obs, info, env=env, crop_config=sensing_crop)
     scene_points = np.asarray(entry["point_cloud"], dtype=np.float32).reshape(-1, 3)
     robot_mask = np.asarray(entry["robot_mask"], dtype=bool).reshape(-1)
     valid_mask = np.asarray(
@@ -2406,7 +2442,9 @@ def _constraints_for_episode(
         obstacle_points = _farthest_point_sample(obstacle_points, max_obstacle_pts)
 
     print(
-        f"[{spec.output_index}] PointCloudCollisionConstraint diagnostics: "
+        f"[{spec.output_index}] PointCloudCollisionConstraint diagnostics "
+        f"(sensing crop robot_point_fraction={sensing_crop.robot_point_fraction}, "
+        f"z>{sensing_crop.bounds[2, 0]:.3f}): "
         f"total={n_total} valid={n_valid} valid_robot={n_robot} valid_env={n_env_valid} | "
         f"all_env(no robot_mask)={int(scene_points[~robot_mask].shape[0])} "
         f"after_zero_filter={int(env_points.shape[0])} "

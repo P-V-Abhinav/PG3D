@@ -23,6 +23,8 @@ Suite layout (5 variants each), mapped to docs/evaluation_tasks_scratchpad.md:
                                       T6  left/right pick-place with avoidance
     PG3DReach-Eval-Cluttered-v1..v5   T9  pick and place in clutter
                                       T10 place relative to another object
+    PG3DReach-Eval-UTrap-v1           T2  reach out of a U-shaped local minimum
+    PG3DReach-Eval-Gap-v1             T2  reach past a gap too narrow to pass
 
 The scene is what an env freezes; the task is that scene plus the constraints an
 eval script binds, which is why one env backs several tasks.
@@ -39,6 +41,10 @@ EVAL_ENV_IDS: dict[str, tuple[str, ...]] = {
     "pick_place": tuple(f"PG3DReach-Eval-PP-v{i}" for i in range(1, 6)),
     "obs_pick_place": tuple(f"PG3DReach-Eval-Obs-PP-v{i}" for i in range(1, 6)),
     "cluttered": tuple(f"PG3DReach-Eval-Cluttered-v{i}" for i in range(1, 6)),
+    # Local-minimum traps. Same task as T2 (reach with avoidance), but built to
+    # separate a greedy reacher from a world-model-guided one rather than to
+    # sample the workspace, so they are their own family.
+    "trap": ("PG3DReach-Eval-UTrap-v1", "PG3DReach-Eval-Gap-v1"),
 }
 
 #: Which env family serves which scratchpad task id.
@@ -56,8 +62,18 @@ TASK_ENV_FAMILIES: dict[str, str] = {
 }
 
 
+def trap_env_ids() -> tuple[str, ...]:
+    """Return the local-minimum trap env ids (not part of the 5-per-task grid)."""
+    return EVAL_ENV_IDS["trap"]
+
+
 def env_ids_for_task(task_id: str) -> tuple[str, ...]:
-    """Return the five env ids that serve one task id (``"T1"``..``"T10"``)."""
+    """Return the five env ids that serve one task id (``"T1"``..``"T10"``).
+
+    The trap envs also serve T2 but are deliberately not returned here: they are
+    a separate demonstration, not part of that task's five-variant population.
+    See :func:`trap_env_ids`.
+    """
     key = str(task_id).upper()
     if key not in TASK_ENV_FAMILIES:
         raise KeyError(f"unknown task id {task_id!r}; expected one of {sorted(TASK_ENV_FAMILIES)}")
@@ -78,6 +94,7 @@ def register_pg3d_eval_envs() -> None:
     from pg3d.envs.xarm_adapter.eval_envs import obs_eval  # noqa: F401
     from pg3d.envs.xarm_adapter.eval_envs import pp_eval  # noqa: F401
     from pg3d.envs.xarm_adapter.eval_envs import reach_eval  # noqa: F401
+    from pg3d.envs.xarm_adapter.eval_envs import trap_eval  # noqa: F401
 
     _REGISTERED = True
 
@@ -107,6 +124,7 @@ __all__ = [
     "EVAL_ENV_IDS",
     "TASK_ENV_FAMILIES",
     "all_eval_env_ids",
+    "trap_env_ids",
     "env_episode_context",
     "env_ids_for_task",
     "eval_spec_for_env",

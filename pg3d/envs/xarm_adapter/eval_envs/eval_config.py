@@ -505,67 +505,209 @@ def slalom_obstacle_positions(
 
 
 # ---------------------------------------------------------------------------
+# Local-minimum traps (T2 family): U-trap and narrow-gap wall
+#
+# Both exist to separate a greedy reacher from a world-model-guided one. Each is
+# built from the SAME 6 x 6 x 30 cm bar as the slalom obstacles, repeated and
+# butted together into a wall, so nothing new enters the scene vocabulary.
+#
+# Both start at the suite's default start (START_TCP, the rest-ish pose), and
+# both put the goal straight ahead at y = 0, so the straight line from start to
+# goal runs into the trap:
+#
+#   U-trap   the line ends inside a three-sided cup whose mouth faces the arm.
+#            Driving down the goal direction parks the gripper against the back
+#            wall with the goal a few cm beyond it. The way out is around a side
+#            wall or over the top -- both of which move AWAY from the goal first,
+#            which is exactly what a greedy step cannot do.
+#
+#   Gap      the line passes through a 6 cm slot between two blocks. The slot is
+#            wide enough to look like a route and far too narrow for the gripper
+#            (its jaws alone span ~8.5 cm, the knuckle body more), so a policy
+#            that aims through it wedges. The way out is around either block.
+#
+# Every bar centre below is stated outright rather than derived, and the derived
+# quantities (cup mouth, slot width, clearances) are asserted at import so a
+# typo cannot silently produce a trap that is not a trap.
+# ---------------------------------------------------------------------------
+
+#: Bar centres of the U, in the active frame. Five bars form the back wall
+#: (spanning y = -0.15..0.15 at x = 0.515..0.575); two bars per side run forward
+#: from it at y = +/-0.12, so the cup mouth opens toward the arm at x = 0.395.
+UTRAP_BAR_POSITIONS: tuple[Vec3, ...] = (
+    # back wall, x centre 0.545
+    (0.545, -0.120, 0.150),
+    (0.545, -0.060, 0.150),
+    (0.545, 0.000, 0.150),
+    (0.545, 0.060, 0.150),
+    (0.545, 0.120, 0.150),
+    # left side wall, y centre +0.12
+    (0.485, 0.120, 0.150),
+    (0.425, 0.120, 0.150),
+    # right side wall, y centre -0.12
+    (0.485, -0.120, 0.150),
+    (0.425, -0.120, 0.150),
+)
+#: TCP goal, 9 cm beyond the far face of the U's back wall. Kept inside the box
+#: the training dataset actually sampled goals from (x <= 0.689) and well inside
+#: the arm's physical envelope (x <= 0.725); pull it back toward 0.64 if IK
+#: around the wall proves awkward at this reach.
+UTRAP_GOAL: Vec3 = (0.665, 0.000, 0.120)
+
+#: Bar centres of the narrow-gap wall: two blocks of three bars at x = 0.455,
+#: leaving a slot at y = -0.03..0.03.
+GAP_BAR_POSITIONS: tuple[Vec3, ...] = (
+    (0.455, 0.060, 0.150),
+    (0.455, 0.120, 0.150),
+    (0.455, 0.180, 0.150),
+    (0.455, -0.060, 0.150),
+    (0.455, -0.120, 0.150),
+    (0.455, -0.180, 0.150),
+)
+#: TCP goal, 16 cm beyond the wall, straight through the slot from the start.
+GAP_GOAL: Vec3 = (0.645, 0.000, 0.150)
+
+#: Slot half-width. The gripper's jaws span ~0.085 m open and its knuckle body
+#: is wider still, so the slot is impassable by a wide margin while still
+#: reading as a gap to anything that only reasons about the TCP as a point.
+GAP_HALF_WIDTH_M: float = 0.030
+
+check_workspace(UTRAP_GOAL, "UTRAP_GOAL")
+check_workspace(GAP_GOAL, "GAP_GOAL")
+
+
+def _trap_self_check() -> None:
+    """Assert the two traps are actually traps, at import.
+
+    Each check is a property the demonstration depends on; if a bar centre is
+    edited and one of these stops holding, the env stops proving what it claims
+    and should fail loudly rather than quietly become a normal reach.
+    """
+    hx, hy, hz = OBSTACLE_HALF_SIZES
+
+    # -- U-trap -------------------------------------------------------------
+    back_x = {p[0] for p in UTRAP_BAR_POSITIONS if abs(p[1]) <= 0.12 + 1e-9 and p[0] > 0.5}
+    if len(back_x) != 1:
+        raise ValueError("U-trap back wall must sit at a single x")
+    back_face_far = max(back_x) + hx
+    if UTRAP_GOAL[0] <= back_face_far:
+        raise ValueError("U-trap goal must lie beyond the back wall's far face")
+    mouth_x = min(p[0] for p in UTRAP_BAR_POSITIONS) - hx
+    if mouth_x <= START_TCP[0]:
+        raise ValueError("U-trap mouth must be in front of the start TCP")
+    side_y = sorted({p[1] for p in UTRAP_BAR_POSITIONS if abs(p[1]) > 0.1})
+    if len(side_y) != 2:
+        raise ValueError("U-trap must have exactly two side walls")
+    cup_half_width = abs(side_y[1]) - hy
+    if cup_half_width <= 0.05:
+        raise ValueError("U-trap cup must be wide enough for the gripper to enter")
+
+    # The straight start->goal line must be BLOCKED by the back wall: that is
+    # the whole point. Interpolate to the wall plane and check the crossing
+    # height is inside the wall.
+    t = (max(back_x) - START_TCP[0]) / (UTRAP_GOAL[0] - START_TCP[0])
+    crossing_z = START_TCP[2] + t * (UTRAP_GOAL[2] - START_TCP[2])
+    if not (0.0 <= crossing_z <= 2 * hz):
+        raise ValueError("U-trap: straight start->goal line does not hit the back wall")
+
+    # -- Gap ----------------------------------------------------------------
+    gap_x = {p[0] for p in GAP_BAR_POSITIONS}
+    if len(gap_x) != 1:
+        raise ValueError("gap wall must sit at a single x")
+    inner_y = min(abs(p[1]) for p in GAP_BAR_POSITIONS) - hy
+    if abs(inner_y - GAP_HALF_WIDTH_M) > 1e-9:
+        raise ValueError(
+            f"gap half-width {inner_y} disagrees with GAP_HALF_WIDTH_M {GAP_HALF_WIDTH_M}"
+        )
+    if GAP_GOAL[0] <= max(gap_x) + hx:
+        raise ValueError("gap goal must lie beyond the wall")
+    # The straight line must pass THROUGH the slot -- otherwise the naive
+    # failure mode this env is built to show does not arise.
+    t = (max(gap_x) - START_TCP[0]) / (GAP_GOAL[0] - START_TCP[0])
+    crossing_y = START_TCP[1] + t * (GAP_GOAL[1] - START_TCP[1])
+    crossing_z = START_TCP[2] + t * (GAP_GOAL[2] - START_TCP[2])
+    if abs(crossing_y) > GAP_HALF_WIDTH_M:
+        raise ValueError("gap: straight start->goal line does not pass through the slot")
+    if not (0.0 <= crossing_z <= 2 * hz):
+        raise ValueError("gap: straight start->goal line clears the wall over the top")
+
+
+_trap_self_check()
+
+
+# ---------------------------------------------------------------------------
 # T9 / T10 -- Cluttered YCB layouts
 # All object z values are per-model resting heights; distances are hand-checked
 # to keep every pair >= 2 cm apart.
 # ---------------------------------------------------------------------------
+# Object spacing is solved, not eyeballed: the open jaws span 17.2 cm across the
+# fingers and reach 18 cm above the TCP, so every clutter object sits at least
+# `gripper envelope (8.6 cm) + its own footprint radius + 2 cm` from both the
+# grasp axis and the place goal, and at least 3 cm of clear air from every other
+# object. The 2026-09-11 re-space fixed v2-v5, where objects interpenetrated and
+# the place goal of v3/v5 sat inside a bowl / potted-meat can.
 _M1_CLUTTERED_LAYOUTS: dict[str, dict] = {
     "v1": {
-        "target": {"model": "025_mug", "pos": (-0.280, 0.050, 0.050), "yaw_deg": 0},
+        # loose, three neighbours well clear of both the mug and the place goal
+        "target": {"model": "025_mug", "pos": (-0.253, 0.054, 0.050), "yaw_deg": 0},
         "clutter": [
-            {"model": "024_bowl", "pos": (-0.190, 0.200, 0.040), "yaw_deg": 0},
+            {"model": "024_bowl", "pos": (-0.178, 0.228, 0.040), "yaw_deg": 0},
             {"model": "005_tomato_soup_can", "pos": (-0.360, 0.160, 0.040), "yaw_deg": 45},
             {"model": "009_gelatin_box", "pos": (-0.220, -0.150, 0.040), "yaw_deg": 30},
         ],
-        "place_goal": (-0.380, 0.000, 0.035),
+        "place_goal": (-0.368, -0.041, 0.035),
         "label": "loose_easy",
     },
     "v2": {
-        "target": {"model": "006_mustard_bottle", "pos": (-0.250, 0.000, 0.060), "yaw_deg": 0},
+        # dense cluster, spaced so the open jaws still fit around the bottle
+        "target": {"model": "006_mustard_bottle", "pos": (-0.215, -0.011, 0.060), "yaw_deg": 0},
         "clutter": [
-            {"model": "003_cracker_box", "pos": (-0.200, 0.090, 0.060), "yaw_deg": 90},
-            {"model": "004_sugar_box", "pos": (-0.200, -0.090, 0.050), "yaw_deg": 45},
-            {"model": "010_potted_meat_can", "pos": (-0.310, 0.090, 0.040), "yaw_deg": 0},
-            {"model": "009_gelatin_box", "pos": (-0.310, -0.090, 0.040), "yaw_deg": 60},
+            {"model": "003_cracker_box", "pos": (-0.144, 0.170, 0.060), "yaw_deg": 90},
+            {"model": "004_sugar_box", "pos": (-0.163, -0.159, 0.050), "yaw_deg": 45},
+            {"model": "010_potted_meat_can", "pos": (-0.314, 0.150, 0.040), "yaw_deg": 0},
+            {"model": "009_gelatin_box", "pos": (-0.300, -0.150, 0.040), "yaw_deg": 60},
         ],
-        "place_goal": (-0.390, 0.000, 0.035),
+        "place_goal": (-0.365, -0.000, 0.035),
         "label": "dense_cluster",
     },
     "v3": {
-        "target": {"model": "011_banana", "pos": (-0.300, -0.150, 0.040), "yaw_deg": 0},
+        # arc of clutter; the bowl no longer sits on the place goal
+        "target": {"model": "011_banana", "pos": (-0.252, -0.150, 0.040), "yaw_deg": 0},
         "clutter": [
-            {"model": "025_mug", "pos": (-0.220, 0.000, 0.050), "yaw_deg": 0},
-            {"model": "024_bowl", "pos": (-0.250, 0.150, 0.040), "yaw_deg": 0},
-            {"model": "004_sugar_box", "pos": (-0.350, 0.100, 0.050), "yaw_deg": 30},
-            {"model": "005_tomato_soup_can", "pos": (-0.380, -0.050, 0.040), "yaw_deg": 0},
-            {"model": "009_gelatin_box", "pos": (-0.360, -0.200, 0.040), "yaw_deg": 45},
+            {"model": "025_mug", "pos": (-0.223, 0.020, 0.050), "yaw_deg": 0},
+            {"model": "024_bowl", "pos": (-0.335, 0.214, 0.040), "yaw_deg": 0},
+            {"model": "004_sugar_box", "pos": (-0.371, 0.054, 0.050), "yaw_deg": 30},
+            {"model": "005_tomato_soup_can", "pos": (-0.372, -0.062, 0.040), "yaw_deg": 0},
+            {"model": "009_gelatin_box", "pos": (-0.385, -0.244, 0.040), "yaw_deg": 45},
         ],
-        "place_goal": (-0.180, 0.200, 0.035),
+        "place_goal": (-0.130, 0.187, 0.035),
         "label": "arc_of_clutter",
     },
     "v4": {
-        "target": {"model": "005_tomato_soup_can", "pos": (-0.230, 0.200, 0.040), "yaw_deg": 0},
+        # mixed sizes; the bowl and mustard no longer interpenetrate
+        "target": {"model": "005_tomato_soup_can", "pos": (-0.192, 0.230, 0.040), "yaw_deg": 0},
         "clutter": [
-            {"model": "024_bowl", "pos": (-0.280, 0.080, 0.040), "yaw_deg": 0},
-            {"model": "006_mustard_bottle", "pos": (-0.200, 0.060, 0.060), "yaw_deg": 0},
-            {"model": "003_cracker_box", "pos": (-0.340, 0.180, 0.060), "yaw_deg": 90},
+            {"model": "024_bowl", "pos": (-0.292, 0.069, 0.040), "yaw_deg": 0},
+            {"model": "006_mustard_bottle", "pos": (-0.129, 0.053, 0.060), "yaw_deg": 0},
+            {"model": "003_cracker_box", "pos": (-0.385, 0.248, 0.060), "yaw_deg": 90},
         ],
-        "place_goal": (-0.380, 0.000, 0.035),
+        "place_goal": (-0.384, -0.096, 0.035),
         "label": "mixed_sizes_path_blocked",
     },
     "v5": {
-        "target": {"model": "009_gelatin_box", "pos": (-0.280, 0.000, 0.040), "yaw_deg": 0},
+        # eight objects, every one clear of the gelatin box and the place goal
+        "target": {"model": "009_gelatin_box", "pos": (-0.319, 0.025, 0.040), "yaw_deg": 0},
         "clutter": [
-            {"model": "025_mug", "pos": (-0.200, 0.100, 0.050), "yaw_deg": 0},
-            {"model": "024_bowl", "pos": (-0.200, -0.100, 0.040), "yaw_deg": 0},
-            {"model": "006_mustard_bottle", "pos": (-0.360, 0.100, 0.060), "yaw_deg": 0},
-            {"model": "005_tomato_soup_can", "pos": (-0.360, -0.100, 0.040), "yaw_deg": 0},
-            {"model": "003_cracker_box", "pos": (-0.220, 0.220, 0.060), "yaw_deg": 90},
-            {"model": "004_sugar_box", "pos": (-0.220, -0.220, 0.050), "yaw_deg": 45},
-            {"model": "010_potted_meat_can", "pos": (-0.340, 0.000, 0.040), "yaw_deg": 0},
-            {"model": "011_banana", "pos": (-0.170, 0.000, 0.040), "yaw_deg": 0},
+            {"model": "025_mug", "pos": (-0.125, 0.174, 0.050), "yaw_deg": 0},
+            {"model": "024_bowl", "pos": (-0.241, -0.203, 0.040), "yaw_deg": 0},
+            {"model": "006_mustard_bottle", "pos": (-0.385, 0.316, 0.060), "yaw_deg": 0},
+            {"model": "005_tomato_soup_can", "pos": (-0.385, -0.238, 0.040), "yaw_deg": 0},
+            {"model": "003_cracker_box", "pos": (-0.217, 0.335, 0.060), "yaw_deg": 90},
+            {"model": "004_sugar_box", "pos": (-0.247, -0.367, 0.050), "yaw_deg": 45},
+            {"model": "010_potted_meat_can", "pos": (-0.385, -0.120, 0.040), "yaw_deg": 0},
+            {"model": "011_banana", "pos": (-0.115, -0.027, 0.040), "yaw_deg": 0},
         ],
-        "place_goal": (-0.400, 0.000, 0.035),
+        "place_goal": (-0.385, 0.159, 0.035),
         "label": "maximum_clutter",
     },
 }
